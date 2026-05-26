@@ -326,6 +326,12 @@ func (v *FirebaseValidator) ValidateForProjectID(tokenString string, expectedPro
 		return nil, ErrNoToken
 	}
 
+	// Fail closed: an ID token must always be pinned to a known project. An empty
+	// expected project ID means the project hasn't enabled Firebase auth tokens.
+	if expectedProjectID == "" {
+		return nil, fmt.Errorf("%w: no expected Firebase project configured", ErrInvalidIssuer)
+	}
+
 	// Parse without verification first to get the key ID and raw claims
 	token, _, err := jwt.NewParser().ParseUnverified(tokenString, jwt.MapClaims{})
 	if err != nil {
@@ -381,8 +387,10 @@ func (v *FirebaseValidator) ValidateForProjectID(tokenString string, expectedPro
 	}
 	projectIDFromIssuer := issuer[len(issuerPrefix):]
 
-	// Validate issuer matches the EXPECTED project ID (not a global list)
-	if expectedProjectID != "" && projectIDFromIssuer != expectedProjectID {
+	// Validate issuer matches the EXPECTED project ID (not a global list).
+	// expectedProjectID is guaranteed non-empty by the guard above, so this is
+	// an unconditional pin — the token's project must equal the configured one.
+	if projectIDFromIssuer != expectedProjectID {
 		return nil, fmt.Errorf("%w: expected %s, got %s", ErrInvalidIssuer, expectedProjectID, projectIDFromIssuer)
 	}
 
@@ -549,6 +557,15 @@ func (v *FirebaseValidator) Validate(tokenString string) (*Info, error) {
 func (v *FirebaseValidator) ValidateCustomToken(tokenString string, firebaseProjectID string) (*Info, error) {
 	if tokenString == "" {
 		return nil, ErrNoToken
+	}
+
+	// Fail closed: a custom token must be pinned to a known project. With an empty
+	// project ID the service-account suffix check below degenerates to
+	// "@.iam.gserviceaccount.com" (which no real account matches, so it's safe in
+	// practice) — but we reject explicitly so the guarantee doesn't depend on that
+	// accident and can't be weakened by a future refactor.
+	if firebaseProjectID == "" {
+		return nil, fmt.Errorf("%w: no expected Firebase project configured", ErrInvalidServiceAccount)
 	}
 
 	// Parse without verification first to get the header and claims
