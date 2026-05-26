@@ -5,6 +5,8 @@
 
 use super::codec::{FrameReader, FrameWriter};
 use super::messages::{ClientResponse, ServerMessage};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use std::io;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -82,16 +84,18 @@ impl ProxyClient {
             io::Error::new(io::ErrorKind::InvalidData, "failed to decode HELLO_ACK")
         })?;
 
-        match hello_ack {
+        let nonce = match hello_ack {
             ServerMessage::HelloAck {
                 core_id,
                 nr_cores,
                 server_version,
+                nonce,
             } => {
                 info!(
                     "Handshake complete: core_id={}, nr_cores={}, server_version={}",
                     core_id, nr_cores, server_version
                 );
+                nonce
             }
             other => {
                 return Err(io::Error::new(
@@ -99,7 +103,15 @@ impl ProxyClient {
                     format!("expected HELLO_ACK, got {:?}", other),
                 ));
             }
-        }
+        };
+
+        // Prove we're a trusted gateway: HMAC-SHA256(SERVER_SECRET, nonce).
+        let mut mac = <Hmac<Sha256>>::new_from_slice(crate::SERVER_SECRET.as_bytes())
+            .map_err(|e| io::Error::other(format!("hmac init: {e}")))?;
+        mac.update(&nonce);
+        let mac_bytes = mac.finalize().into_bytes();
+        writer.write_hello_auth(&mac_bytes).await?;
+        debug!("Sent HELLO_AUTH");
 
         // Spawn reader task
         let (event_tx, event_rx) = mpsc::channel(4096);

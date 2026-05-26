@@ -31,6 +31,12 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use report::{ChaosReport, CycleReport};
 use std::time::Instant;
+
+/// Shared secret for the edge↔server proxy handshake. chaos-monkey plays the role
+/// of the gateway, so it spawns lark-server with this `--server-secret` and proves
+/// the same value via the HELLO_AUTH HMAC. Any fixed value works — this is a local
+/// test harness, not a deployment.
+pub const SERVER_SECRET: &str = "chaos-monkey-secret";
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 

@@ -12,6 +12,7 @@ pub enum ServerMessage {
         core_id: u8,
         nr_cores: u8,
         server_version: u16,
+        nonce: [u8; 32],
     },
     ConfigRequest {
         project_id: String,
@@ -61,13 +62,16 @@ impl ServerMessage {
     }
 
     fn decode_hello_ack(data: &[u8]) -> Option<Self> {
-        if data.len() < 4 {
+        if data.len() < 36 {
             return None;
         }
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&data[4..36]);
         Some(ServerMessage::HelloAck {
             core_id: data[0],
             nr_cores: data[1],
             server_version: u16::from_be_bytes([data[2], data[3]]),
+            nonce,
         })
     }
 
