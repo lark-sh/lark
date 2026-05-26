@@ -84,6 +84,8 @@
 package backend
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -104,6 +106,7 @@ const (
 	MsgTypeConfigPush    byte = 0x07 // Push project configuration
 	MsgTypeEvictDatabase byte = 0x08 // Force database eviction
 	MsgTypeShutdown      byte = 0x09 // Graceful shutdown request
+	MsgTypeHelloAuth     byte = 0x0A // HMAC proof of SERVER_SECRET over HELLO_ACK nonce
 )
 
 // Message types from Server to Proxy
@@ -435,6 +438,7 @@ type HelloAckPayload struct {
 	CoreID        uint8
 	NrCores       uint8
 	ServerVersion uint16
+	Nonce         [32]byte // challenge to sign with SERVER_SECRET in HELLO_AUTH
 }
 
 // WriteHello writes a HELLO message to establish a connection
@@ -453,7 +457,7 @@ func WriteHello(w io.Writer, proxyVersion uint16) error {
 }
 
 // ReadHelloAck reads a HELLO_ACK message from the server
-// Format: [Length:4][Type:1][CoreID:1][NrCores:1][ServerVersion:2][Reserved:4]
+// Format: [Length:4][Type:1][CoreID:1][NrCores:1][ServerVersion:2][Nonce:32]
 func ReadHelloAck(r io.Reader) (*HelloAckPayload, error) {
 	// Read length
 	lenBuf := make([]byte, 4)
@@ -462,7 +466,7 @@ func ReadHelloAck(r io.Reader) (*HelloAckPayload, error) {
 	}
 	totalLen := binary.BigEndian.Uint32(lenBuf)
 
-	if totalLen != 9 { // type(1) + coreID(1) + nrCores(1) + serverVersion(2) + reserved(4)
+	if totalLen != 37 { // type(1) + coreID(1) + nrCores(1) + serverVersion(2) + nonce(32)
 		return nil, ErrInvalidMessage
 	}
 
@@ -476,11 +480,33 @@ func ReadHelloAck(r io.Reader) (*HelloAckPayload, error) {
 		return nil, ErrInvalidMessage
 	}
 
-	return &HelloAckPayload{
+	ack := &HelloAckPayload{
 		CoreID:        data[1],
 		NrCores:       data[2],
 		ServerVersion: binary.BigEndian.Uint16(data[3:5]),
-	}, nil
+	}
+	copy(ack.Nonce[:], data[5:37])
+	return ack, nil
+}
+
+// WriteHelloAuth proves knowledge of SERVER_SECRET by sending
+// HMAC-SHA256(secret, nonce) over the nonce from HELLO_ACK. The server rejects
+// the connection unless this verifies.
+// Format: [Length:4][Type:1][MAC:32]
+func WriteHelloAuth(w io.Writer, mac []byte) error {
+	buf := make([]byte, 4+1+len(mac))
+	binary.BigEndian.PutUint32(buf[0:4], uint32(1+len(mac)))
+	buf[4] = MsgTypeHelloAuth
+	copy(buf[5:], mac)
+	_, err := w.Write(buf)
+	return err
+}
+
+// ServerAuthMAC computes the HELLO_AUTH proof: HMAC-SHA256(secret, nonce).
+func ServerAuthMAC(secret string, nonce [32]byte) []byte {
+	m := hmac.New(sha256.New, []byte(secret))
+	m.Write(nonce[:])
+	return m.Sum(nil)
 }
 
 // CoreForDatabase computes which core owns a database using xxhash64

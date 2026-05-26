@@ -112,6 +112,7 @@ pub fn create_server_process(bin_path: &Path, data_dir: &Path, proxy_port: u16) 
         "--id=chaos-1".to_string(),
         "--hostname=localhost".to_string(),
         format!("--proxy-port={}", proxy_port),
+        format!("--server-secret={}", crate::SERVER_SECRET),
         "--emulator".to_string(),
         format!("--data-dir={}", data_dir.display()),
         "--nr-cores=1".to_string(),

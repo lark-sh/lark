@@ -103,7 +103,8 @@ If you'd rather Vector deliver metrics to the dashboard (e.g. for buffering acro
 `LARK_METRICS_PUSH=false` and have Vector POST the same payload to lark-edge's internal endpoint. The
 contract: keep stdout lines where `type == "db_metrics"`, batch them into a JSON **array**, and POST to
 `http://<edge-host>:<internal-port>/internal/metrics` (the internal listener — `:8081` in the bundled
-compose; keep it off the public internet). Here's an example Vector config:
+compose; keep it off the public internet) with an `Authorization: Bearer <SERVER_SECRET>` header — the
+endpoint is authenticated and rejects unauthenticated posts with `401`. Here's an example Vector config:
 
 ```toml
 [sources.lark]
@@ -125,6 +126,7 @@ inputs = ["db_metrics"]
 uri = "http://lark-edge:8081/internal/metrics"
 method = "post"
 encoding.codec = "json"           # sends a JSON array per batch
+request.headers.Authorization = "Bearer ${SERVER_SECRET}"  # required — /internal/* is authenticated
 batch.max_events = 100
 batch.timeout_secs = 5
 ```

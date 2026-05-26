@@ -11,8 +11,10 @@
 package api
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/lark-sh/lark/edge/config"
 	"github.com/lark-sh/lark/edge/db"
@@ -67,8 +69,11 @@ func (s *Server) registerRoutes() {
 	// Health check
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 
-	// Server-to-server endpoints (only accessible via internal HTTP server on port 8080)
-	s.mux.HandleFunc("POST /internal/register", s.handleRegisterServer)
+	// Server-to-server endpoints. Reachable only on the internal listener (the
+	// public listener 404s /internal/*), AND authenticated with SERVER_SECRET so
+	// network isolation isn't the only line of defense — an unauthenticated caller
+	// that reaches the internal port still can't register a rogue backend.
+	s.mux.HandleFunc("POST /internal/register", s.requireServerSecret(s.handleRegisterServer))
 
 	if s.config.AdminAPIEnabled {
 		s.registerAdminRoutes()
@@ -84,6 +89,22 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // Handler returns the HTTP handler
 func (s *Server) Handler() http.Handler {
 	return s
+}
+
+// requireServerSecret wraps an internal server-to-server handler so it only runs
+// for callers presenting `Authorization: Bearer <SERVER_SECRET>`. The compare is
+// constant-time. This is what stops an attacker who can merely reach the internal
+// listener from registering a rogue backend or poisoning metrics.
+func (s *Server) requireServerSecret(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		const prefix = "Bearer "
+		provided, ok := strings.CutPrefix(r.Header.Get("Authorization"), prefix)
+		if !ok || subtle.ConstantTimeCompare([]byte(provided), []byte(s.config.ServerSecret)) != 1 {
+			s.writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		next(w, r)
+	}
 }
 
 // Helper functions

@@ -45,6 +45,9 @@ services:
       # --emulator: accept the "owner" token (LOCAL_MODE sends it),
       # no coordinator registration, in-memory tree.
       LARK_EMULATOR: "true"
+      # Must match lark-edge-test's SERVER_SECRET — the edge authenticates the
+      # proxy handshake (HELLO_AUTH HMAC), and the server requires this to boot.
+      SERVER_SECRET: "test-secret"
     security_opt:
       - seccomp:unconfined
     networks:

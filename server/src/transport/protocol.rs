@@ -43,6 +43,9 @@ pub mod proxy_msg {
     pub const EVICT_DATABASE: u8 = 0x08;
     /// Graceful shutdown (sent on all connections)
     pub const SHUTDOWN: u8 = 0x09;
+    /// HMAC proof of SERVER_SECRET over the HELLO_ACK nonce. Sent by the proxy
+    /// after HELLO_ACK; the server rejects the connection unless it verifies.
+    pub const HELLO_AUTH: u8 = 0x0A;
 }
 
 // =============================================================================
@@ -156,32 +159,41 @@ impl HelloMessage {
     }
 }
 
-/// HELLO_ACK message (Server -> Proxy)
+/// HELLO_ACK message (Server -> Proxy).
+///
+/// Carries a per-connection random `nonce`; the proxy must reply with a
+/// HELLO_AUTH containing `HMAC-SHA256(SERVER_SECRET, nonce)` before the server
+/// will process any further messages. Wire layout: core_id(1) + nr_cores(1) +
+/// server_version(2) + nonce(32).
 #[derive(Debug, Clone)]
 pub struct HelloAckMessage {
     pub core_id: u8,
     pub nr_cores: u8,
     pub server_version: u16,
+    pub nonce: [u8; 32],
 }
 
 impl HelloAckMessage {
     pub fn encode(&self) -> BytesMut {
-        let mut buf = BytesMut::with_capacity(8);
+        let mut buf = BytesMut::with_capacity(36);
         buf.put_u8(self.core_id);
         buf.put_u8(self.nr_cores);
         buf.put_u16(self.server_version);
-        buf.put_slice(&[0u8; 4]); // Reserved
+        buf.put_slice(&self.nonce);
         buf
     }
 
     pub fn decode(data: &[u8]) -> Option<Self> {
-        if data.len() < 4 {
+        if data.len() < 36 {
             return None;
         }
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&data[4..36]);
         Some(Self {
             core_id: data[0],
             nr_cores: data[1],
             server_version: u16::from_be_bytes([data[2], data[3]]),
+            nonce,
         })
     }
 }
@@ -588,16 +600,23 @@ mod tests {
 
     #[test]
     fn test_hello_ack_encode_decode() {
+        let mut nonce = [0u8; 32];
+        for (i, b) in nonce.iter_mut().enumerate() {
+            *b = i as u8;
+        }
         let msg = HelloAckMessage {
             core_id: 3,
             nr_cores: 8,
             server_version: 1,
+            nonce,
         };
         let encoded = msg.encode();
+        assert_eq!(encoded.len(), 36);
         let decoded = HelloAckMessage::decode(&encoded).unwrap();
         assert_eq!(decoded.core_id, 3);
         assert_eq!(decoded.nr_cores, 8);
         assert_eq!(decoded.server_version, 1);
+        assert_eq!(decoded.nonce, nonce);
     }
 
     #[test]

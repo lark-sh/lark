@@ -26,6 +26,7 @@ pub mod proxy_msg {
     pub const HELLO: u8 = 0x04;
     pub const HEARTBEAT_ACK: u8 = 0x06;
     pub const CONFIG_PUSH: u8 = 0x07;
+    pub const HELLO_AUTH: u8 = 0x0A;
 }
 
 // =============================================================================
@@ -146,6 +147,12 @@ impl FrameWriter {
         payload.put_u16(PROTOCOL_VERSION);
         payload.put_slice(&[0u8; 5]); // Reserved
         self.write_frame(proxy_msg::HELLO, &payload).await
+    }
+
+    /// Write a HELLO_AUTH message: HMAC-SHA256(SERVER_SECRET, nonce) over the
+    /// nonce from HELLO_ACK, proving we're a trusted gateway.
+    pub async fn write_hello_auth(&mut self, mac: &[u8]) -> io::Result<()> {
+        self.write_frame(proxy_msg::HELLO_AUTH, mac).await
     }
 
     /// Write a CONNECT message for a virtual client

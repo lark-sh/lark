@@ -105,6 +105,20 @@ The two **private** rows are the critical firewall boundary: `lark-server`'s
 trusted network, never from the internet. Clients only ever talk to the public
 `lark-edge` listeners.
 
+Both server-to-server channels are also **authenticated** with the shared
+`SERVER_SECRET`, so network isolation isn't the only line of defense:
+
+- The `lark-server` proxy port (`2727`) requires a gateway to prove knowledge of
+  the secret via an HMAC over a per-connection nonce during the HELLO handshake;
+  a stray connection is rejected rather than trusted.
+- `lark-edge`'s internal HTTP endpoints (`/internal/register`, `/internal/metrics`)
+  require an `Authorization: Bearer <SERVER_SECRET>` header; without it they return
+  `401`, so a caller that reaches the internal port still can't register a rogue
+  backend or poison metrics.
+
+Treat this as defense-in-depth, not a license to expose these ports — keep them
+private *and* set a strong secret.
+
 ### DNS: clients connect to a per-database hostname
 
 Lark clients connect **directly to a per-database hostname**, not to a single shared 
@@ -296,6 +310,10 @@ Environment="LARK_CAPACITY=10000"
 Environment="LARK_DATA_DIR=/var/lib/lark/data"
 # Coordinator's INTERNAL endpoint (private network)
 Environment="LARK_COORDINATOR_URL=http://10.0.0.20:8080"
+# Shared secret authenticating the edge↔server channel — MUST match every
+# lark-edge's SERVER_SECRET. Passed via the environment (not a --flag) so it's
+# not exposed in `ps`; lark-server reads $SERVER_SECRET automatically.
+Environment="SERVER_SECRET=<same 32+ byte secret as the gateways>"
 Environment="RUST_LOG=info"
 
 ExecStart=/usr/local/bin/lark-server \
@@ -436,6 +454,7 @@ non-default values a real deployment needs.
 | Env | Flag | Default | Notes |
 |---|---|---|---|
 | `LARK_SERVER_ID` | `--id` | — | **Required.** Unique server identifier (e.g. `db-1`). |
+| `SERVER_SECRET` | `--server-secret` | — | **Required.** Shared secret authenticating the edge↔server proxy handshake (HMAC over a per-connection nonce); must match every gateway's `SERVER_SECRET`. Prefer setting it via the environment, not the flag, so it isn't exposed in `ps`. |
 | `LARK_HOSTNAME` | `--hostname` | — | **Required.** Public hostname label; not used for client routing in the Tier-2 topology. |
 | `LARK_PRIVATE_IP` | `--private-ip` | — | Address `lark-edge` dials back on — what the server registers as (`private_ip:proxy_port`). Set on any multi-host deploy. |
 | `LARK_COORDINATOR_URL` | `--coordinator` | — | `lark-edge`'s **internal** endpoint for registration + metrics push (e.g. `http://10.0.0.20:8080`). |
