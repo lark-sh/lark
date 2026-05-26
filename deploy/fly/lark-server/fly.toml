@@ -17,6 +17,7 @@ primary_region = "iad"          # ← must match the edge + volume region
   LARK_CAPACITY        = "10000"
   LARK_DATA_DIR        = "/data"
   LARK_COORDINATOR_URL = "http://lark-edge.internal:8081"
+  LARK_METRICS_PUSH    = "true"   # push metrics to lark-edge → dashboard works with no log shipper
   RUST_LOG             = "info"
 
 [mounts]

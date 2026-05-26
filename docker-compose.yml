@@ -65,6 +65,9 @@ services:
       # Registers with lark-edge's internal HTTP listener so the
       # discovery loop on the other side learns about us.
       LARK_COORDINATOR_URL: "http://lark-edge:8081"
+      # Push per-database metrics straight to lark-edge so the dashboard's
+      # Monitoring tab works out of the box — no external log shipper needed.
+      LARK_METRICS_PUSH: "true"
     volumes:
       - lark-server-data:/data
     # Glommio's io_uring needs the seccomp profile relaxed; this also

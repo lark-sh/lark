@@ -105,6 +105,10 @@ pub struct CoreHandler {
 
     /// Compaction channel sender for notifying the per-core storage worker
     compaction_tx: Rc<LocalSender<StorageWorkerMessage>>,
+
+    /// Optional metrics sink, injected into each database it creates. `None`
+    /// unless direct metrics push (`LARK_METRICS_PUSH`) is enabled.
+    metrics_tx: Option<std::sync::mpsc::SyncSender<String>>,
 }
 
 /// A buffered CONNECT waiting for project config.
@@ -125,6 +129,7 @@ impl CoreHandler {
     pub fn new(
         config: CoreHandlerConfig,
         compaction_tx: Rc<LocalSender<StorageWorkerMessage>>,
+        metrics_tx: Option<std::sync::mpsc::SyncSender<String>>,
     ) -> Rc<Self> {
         Rc::new(Self {
             config,
@@ -137,6 +142,7 @@ impl CoreHandler {
             shutting_down: RefCell::new(false),
             pending_unloads: RefCell::new(Vec::new()),
             compaction_tx,
+            metrics_tx,
         })
     }
 
@@ -222,6 +228,11 @@ impl CoreHandler {
 
         // Set compaction channel for WAL rotation notifications
         db.set_compaction_tx(self.compaction_tx.clone());
+
+        // Wire up direct metrics push if enabled (LARK_METRICS_PUSH)
+        if let Some(tx) = &self.metrics_tx {
+            db.set_metrics_tx(tx.clone());
+        }
 
         // Get handle before spawning
         let handle = db.handle();
@@ -1226,6 +1237,7 @@ mod tests {
                 template_path: None,
             },
             Rc::new(tx),
+            None,
         )
     }
 

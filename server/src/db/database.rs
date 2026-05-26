@@ -773,6 +773,14 @@ pub struct Database {
     /// Per-database metrics (writes, reads, CCU, latency, etc.)
     pub metrics: crate::metrics::DatabaseMetrics,
 
+    /// Optional sink for emitted metrics JSON, forwarded to a dedicated
+    /// shipper thread that POSTs them to the coordinator's `/internal/metrics`
+    /// (enabled by `LARK_METRICS_PUSH`). `None` means metrics are only written
+    /// to stdout (the default; e.g. when an external log shipper scrapes them).
+    /// `try_send` is non-blocking and drops on a full channel, so a slow or
+    /// dead shipper can never stall this core.
+    metrics_tx: Option<std::sync::mpsc::SyncSender<String>>,
+
     /// Promotion stats for the current metrics interval (reset on emit).
     promotion_stats: PromotionStats,
 }
@@ -949,6 +957,7 @@ impl Database {
             needs_startup_compaction: false,
             compaction_tx: None,
             metrics: crate::metrics::DatabaseMetrics::new(),
+            metrics_tx: None,
             promotion_stats: PromotionStats::new(),
         }
     }
@@ -1002,6 +1011,7 @@ impl Database {
             needs_startup_compaction: false, // Set by load_wal_entries() if many WAL files
             compaction_tx: None,     // Set via set_compaction_tx() after creation
             metrics: crate::metrics::DatabaseMetrics::new(),
+            metrics_tx: None, // Set via set_metrics_tx() after creation
             promotion_stats: PromotionStats::new(),
         }
     }
@@ -1014,6 +1024,13 @@ impl Database {
     /// Set the compaction channel sender for notifying the storage worker on WAL rotation.
     pub fn set_compaction_tx(&mut self, tx: Rc<LocalSender<StorageWorkerMessage>>) {
         self.compaction_tx = Some(tx);
+    }
+
+    /// Set the metrics sink: a non-blocking channel to the shipper thread that
+    /// POSTs emitted metrics to the coordinator. Only set when `LARK_METRICS_PUSH`
+    /// is enabled; otherwise metrics are stdout-only.
+    pub fn set_metrics_tx(&mut self, tx: std::sync::mpsc::SyncSender<String>) {
+        self.metrics_tx = Some(tx);
     }
 
     /// Set the project secret for token validation.
@@ -5199,6 +5216,16 @@ impl Database {
                 std::env::var("LARK_SERVER_ID").unwrap_or_else(|_| "localhost".to_string());
 
             let json = snapshot.to_json(&self.project_id, &database_name, &server_id, self.core_id);
+
+            // Forward to the shipper thread when direct push is enabled. Non-blocking:
+            // a full channel (slow/dead shipper) drops the sample rather than stalling
+            // this core.
+            if let Some(tx) = &self.metrics_tx {
+                let _ = tx.try_send(json.clone());
+            }
+
+            // Always emit to stdout: this is what an external log shipper (e.g. Vector)
+            // scrapes, and it keeps the line visible in logs regardless of push.
             println!("{}", json);
         }
     }
