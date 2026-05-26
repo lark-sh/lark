@@ -92,6 +92,15 @@ pub struct Args {
     /// Requires --coordinator.
     #[arg(long, default_value = "false", env = "LARK_METRICS_PUSH")]
     pub metrics_push: bool,
+
+    /// Shared secret authenticating the edge↔server proxy channel. **Required.**
+    /// Must match the `SERVER_SECRET` set on every lark-edge gateway. The proxy
+    /// proves knowledge of it via an HMAC over a per-connection nonce during the
+    /// HELLO handshake; connections that can't are rejected before any CONNECT is
+    /// processed. Generate with e.g. `openssl rand -hex 32` and set identically
+    /// on both sides.
+    #[arg(long, env = "SERVER_SECRET")]
+    pub server_secret: String,
 }
 
 impl Args {
@@ -164,7 +173,8 @@ fn main() {
     let metrics_tx = match (args.metrics_push, args.coordinator.clone()) {
         (true, Some(coordinator)) => {
             let (tx, rx) = std::sync::mpsc::sync_channel::<String>(METRICS_CHANNEL_CAPACITY);
-            std::thread::spawn(move || metrics_shipper(coordinator, rx));
+            let secret = args.server_secret.clone();
+            std::thread::spawn(move || metrics_shipper(coordinator, secret, rx));
             tracing::info!("Direct metrics push enabled (coordinator /internal/metrics)");
             Some(tx)
         }
@@ -241,6 +251,7 @@ fn register_with_coordinator(args: &Args, nr_cores: usize) {
         attempt += 1;
         let result = ureq::post(&url)
             .set("Content-Type", "application/json")
+            .set("Authorization", &format!("Bearer {}", args.server_secret))
             .send_json(ureq::json!({
                 "server_id": &args.id,
                 "address": &address,
@@ -310,13 +321,14 @@ fn register_with_coordinator(args: &Args, nr_cores: usize) {
 /// bounded, non-blocking channel; this side simply drains and ships. Failures are
 /// logged and the batch dropped (metrics are lossy-tolerant). Returns when the
 /// channel closes (all senders dropped, i.e. shutdown).
-fn metrics_shipper(coordinator: String, rx: std::sync::mpsc::Receiver<String>) {
+fn metrics_shipper(coordinator: String, secret: String, rx: std::sync::mpsc::Receiver<String>) {
     use std::sync::mpsc::RecvTimeoutError;
 
     const FLUSH_INTERVAL: Duration = Duration::from_secs(10);
     const MAX_BATCH: usize = 512;
 
     let url = format!("{}/internal/metrics", coordinator);
+    let auth = format!("Bearer {secret}");
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(10))
         .build();
@@ -344,6 +356,7 @@ fn metrics_shipper(coordinator: String, rx: std::sync::mpsc::Receiver<String>) {
         if let Err(e) = agent
             .post(&url)
             .set("Content-Type", "application/json")
+            .set("Authorization", &auth)
             .send_string(&body)
         {
             tracing::warn!(
@@ -407,6 +420,7 @@ async fn run_core(
         nr_cores,
         config.port,
         args.proxy_bind.clone(),
+        Rc::new(args.server_secret.clone()),
     );
 
     // Spawn the proxy listener

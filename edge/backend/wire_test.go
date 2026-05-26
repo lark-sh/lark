@@ -3,8 +3,52 @@ package backend
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"testing"
 )
+
+// TestServerAuthMACKnownAnswer locks the HELLO_AUTH HMAC to a fixed vector so
+// the Go edge and Rust server can't silently drift apart (the same vector is
+// asserted in the server's proxy.rs test). HMAC-SHA256(key, nonce) where
+// key="lark-test-secret" and nonce = bytes 0..31.
+func TestServerAuthMACKnownAnswer(t *testing.T) {
+	var nonce [32]byte
+	for i := range nonce {
+		nonce[i] = byte(i)
+	}
+	got := hex.EncodeToString(ServerAuthMAC("lark-test-secret", nonce))
+	const want = "d1e6900018c7d50930190b1577cc590f0821354b51afd79df6935cd08a82acbe"
+	if got != want {
+		t.Errorf("ServerAuthMAC mismatch:\n got  %s\n want %s", got, want)
+	}
+}
+
+// TestHelloAckNonceRoundTrip ensures ReadHelloAck recovers the 32-byte nonce
+// from a server-shaped HELLO_ACK frame.
+func TestHelloAckNonceRoundTrip(t *testing.T) {
+	var nonce [32]byte
+	for i := range nonce {
+		nonce[i] = byte(255 - i)
+	}
+	frame := make([]byte, 41)
+	binary.BigEndian.PutUint32(frame[0:4], 37)
+	frame[4] = MsgTypeHelloAck
+	frame[5] = 2 // coreID
+	frame[6] = 8 // nrCores
+	binary.BigEndian.PutUint16(frame[7:9], 1)
+	copy(frame[9:41], nonce[:])
+
+	ack, err := ReadHelloAck(bytes.NewReader(frame))
+	if err != nil {
+		t.Fatalf("ReadHelloAck: %v", err)
+	}
+	if ack.CoreID != 2 || ack.NrCores != 8 || ack.ServerVersion != 1 {
+		t.Errorf("header fields wrong: %+v", ack)
+	}
+	if ack.Nonce != nonce {
+		t.Errorf("nonce not preserved: got %x", ack.Nonce)
+	}
+}
 
 func TestEncodeDecodeConnectPayload(t *testing.T) {
 	tests := []struct {
@@ -1349,6 +1393,7 @@ func TestMessageTypeUniqueness(t *testing.T) {
 		MsgTypeConfigPush,
 		MsgTypeEvictDatabase,
 		MsgTypeShutdown,
+		MsgTypeHelloAuth,
 	}
 
 	seen := make(map[byte]bool)

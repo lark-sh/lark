@@ -2,13 +2,28 @@ package backend
 
 import (
 	"encoding/binary"
+	"io"
 	"net"
 	"testing"
 	"time"
 )
 
+// readFrame reads and discards one length-prefixed wire frame (used by the mock
+// servers to consume the HELLO_AUTH the pool sends after HELLO_ACK).
+func readFrame(c net.Conn) {
+	lenBuf := make([]byte, 4)
+	if _, err := io.ReadFull(c, lenBuf); err != nil {
+		return
+	}
+	n := binary.BigEndian.Uint32(lenBuf)
+	if n == 0 || n > 1<<20 {
+		return
+	}
+	_, _ = io.ReadFull(c, make([]byte, n))
+}
+
 func TestNewPool(t *testing.T) {
-	pool := NewPool(2)
+	pool := NewPool(2, "test-secret")
 	if pool == nil {
 		t.Fatal("NewPool returned nil")
 	}
@@ -22,7 +37,7 @@ func TestNewPool(t *testing.T) {
 }
 
 func TestNewPoolDefaultConnsPerCore(t *testing.T) {
-	pool := NewPool(0) // Should default to 2
+	pool := NewPool(0, "test-secret") // Should default to 2
 	if pool.connsPerCore != 2 {
 		t.Errorf("connsPerCore should default to 2, got %d", pool.connsPerCore)
 	}
@@ -30,7 +45,7 @@ func TestNewPoolDefaultConnsPerCore(t *testing.T) {
 }
 
 func TestPoolAddBackendFailsOnBadAddress(t *testing.T) {
-	pool := NewPool(2)
+	pool := NewPool(2, "test-secret")
 	defer pool.Close()
 
 	// Try to add backend with invalid address
@@ -41,7 +56,7 @@ func TestPoolAddBackendFailsOnBadAddress(t *testing.T) {
 }
 
 func TestPoolGetBackendNotFound(t *testing.T) {
-	pool := NewPool(2)
+	pool := NewPool(2, "test-secret")
 	defer pool.Close()
 
 	_, err := pool.GetBackend("nonexistent")
@@ -51,7 +66,7 @@ func TestPoolGetBackendNotFound(t *testing.T) {
 }
 
 func TestPoolClose(t *testing.T) {
-	pool := NewPool(2)
+	pool := NewPool(2, "test-secret")
 	pool.Close()
 
 	// Operations after close should fail
@@ -67,7 +82,7 @@ func TestPoolClose(t *testing.T) {
 }
 
 func TestPoolRemoveBackend(t *testing.T) {
-	pool := NewPool(2)
+	pool := NewPool(2, "test-secret")
 	defer pool.Close()
 
 	// Remove non-existent backend should not panic
@@ -112,17 +127,21 @@ func mockServer(t *testing.T, nrCores uint8) (net.Listener, func()) {
 			}
 
 			// Send HELLO_ACK
-			// Format: [Length:4][Type:1][CoreID:1][NrCores:1][ServerVersion:2][Reserved:4]
-			resp := make([]byte, 13)
-			binary.BigEndian.PutUint32(resp[0:4], 9) // length
+			// Format: [Length:4][Type:1][CoreID:1][NrCores:1][ServerVersion:2][Nonce:32]
+			resp := make([]byte, 41)
+			binary.BigEndian.PutUint32(resp[0:4], 37) // length = 1+1+1+2+32
 			resp[4] = MsgTypeHelloAck
 			resp[5] = coreCounter % nrCores // CoreID (round-robin)
 			resp[6] = nrCores               // NrCores
 			binary.BigEndian.PutUint16(resp[7:9], 1) // ServerVersion
-			// resp[9:13] reserved (zero)
+			// resp[9:41] nonce (zero is fine; this mock doesn't verify the auth reply)
 
 			coreCounter++
 			conn.Write(resp)
+
+			// Consume the HELLO_AUTH the pool sends back so it doesn't pollute
+			// any subsequent reads on this connection.
+			readFrame(conn)
 
 			// Keep connection open until done
 			go func(c net.Conn) {
@@ -144,7 +163,7 @@ func TestPoolWithMockBackend(t *testing.T) {
 	listener, cleanup := mockServer(t, 2)
 	defer cleanup()
 
-	pool := NewPool(1) // 1 connection per core
+	pool := NewPool(1, "test-secret") // 1 connection per core
 	defer pool.Close()
 
 	addr := listener.Addr().String()
@@ -184,7 +203,7 @@ func TestGetOrCreateBackendNew(t *testing.T) {
 	listener, cleanup := mockServer(t, 2)
 	defer cleanup()
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	defer pool.Close()
 
 	addr := listener.Addr().String()
@@ -210,7 +229,7 @@ func TestBackendMultipleConnectionsPerCore(t *testing.T) {
 	listener, cleanup := mockServer(t, 2)
 	defer cleanup()
 
-	pool := NewPool(2) // 2 connections per core
+	pool := NewPool(2, "test-secret") // 2 connections per core
 	defer pool.Close()
 
 	addr := listener.Addr().String()
@@ -241,7 +260,7 @@ func TestBackendMultipleConnectionsPerCore(t *testing.T) {
 }
 
 func TestPoolConcurrentAccess(t *testing.T) {
-	pool := NewPool(2)
+	pool := NewPool(2, "test-secret")
 	defer pool.Close()
 
 	// Concurrent access should not panic
@@ -262,7 +281,7 @@ func TestPoolConcurrentAccess(t *testing.T) {
 }
 
 func TestBackendRegisterClient(t *testing.T) {
-	pool := NewPool(2)
+	pool := NewPool(2, "test-secret")
 	defer pool.Close()
 
 	// Create a minimal backend for testing
@@ -305,7 +324,7 @@ func TestBackendRegisterClient(t *testing.T) {
 }
 
 func TestBackendSendMessageRequiresRegistration(t *testing.T) {
-	pool := NewPool(2)
+	pool := NewPool(2, "test-secret")
 	defer pool.Close()
 
 	backend := &Backend{
@@ -352,7 +371,7 @@ func TestBackendSendMessageRequiresRegistration(t *testing.T) {
 }
 
 func TestBackendSendConnect(t *testing.T) {
-	pool := NewPool(2)
+	pool := NewPool(2, "test-secret")
 	defer pool.Close()
 
 	backend := &Backend{
@@ -439,7 +458,7 @@ func TestBackendNrCores(t *testing.T) {
 	listener, cleanup := mockServer(t, 4)
 	defer cleanup()
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	defer pool.Close()
 
 	addr := listener.Addr().String()
@@ -459,7 +478,7 @@ func TestQueueStats(t *testing.T) {
 	listener, cleanup := mockServer(t, 2)
 	defer cleanup()
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	defer pool.Close()
 
 	addr := listener.Addr().String()

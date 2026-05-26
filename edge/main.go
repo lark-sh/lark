@@ -69,7 +69,7 @@ func main() {
 	}
 
 	// Create backend connection pool with per-core sharding
-	pool := backend.NewPool(cfg.ConnectionsPerCore)
+	pool := backend.NewPool(cfg.ConnectionsPerCore, cfg.ServerSecret)
 	defer pool.Close()
 
 	// Database and mode-specific setup

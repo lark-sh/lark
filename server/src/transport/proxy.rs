@@ -17,7 +17,9 @@ use futures::io::{AsyncReadExt, AsyncWriteExt};
 use glommio::channels::local_channel::{self, LocalReceiver, LocalSender};
 use glommio::net::TcpListener;
 use glommio::timer::Timer;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
@@ -393,7 +395,16 @@ pub struct ProxyConnection<H: ProxyHandler> {
     /// Connection address (for logging)
     remote_addr: String,
 
-    /// Whether HELLO handshake is complete
+    /// Shared secret (SERVER_SECRET) the proxy must prove knowledge of via the
+    /// HELLO_AUTH HMAC before this connection is trusted.
+    server_secret: Rc<String>,
+
+    /// Random nonce sent in HELLO_ACK; set in `handle_hello`, consumed by
+    /// `handle_hello_auth` to verify the proxy's HMAC.
+    hello_nonce: Option<[u8; 32]>,
+
+    /// Whether the HELLO/HELLO_AUTH handshake is complete. Until this is true,
+    /// every message type other than HELLO/HELLO_AUTH is rejected.
     handshake_complete: bool,
 
     /// Metrics
@@ -417,7 +428,13 @@ pub struct ProxyConnection<H: ProxyHandler> {
 }
 
 impl<H: ProxyHandler + 'static> ProxyConnection<H> {
-    pub fn new(handler: Rc<H>, core_id: usize, nr_cores: usize, remote_addr: String) -> Self {
+    pub fn new(
+        handler: Rc<H>,
+        core_id: usize,
+        nr_cores: usize,
+        remote_addr: String,
+        server_secret: Rc<String>,
+    ) -> Self {
         let (outbox_tx, outbox_rx) = local_channel::new_bounded(OUTBOX_SIZE);
 
         Self {
@@ -428,6 +445,8 @@ impl<H: ProxyHandler + 'static> ProxyConnection<H> {
             outbox_tx: Rc::new(outbox_tx),
             outbox_rx: Some(outbox_rx),
             remote_addr,
+            server_secret,
+            hello_nonce: None,
             handshake_complete: false,
             messages_received: 0,
             messages_sent: 0,
@@ -779,9 +798,31 @@ impl<H: ProxyHandler + 'static> ProxyConnection<H> {
             payload.len()
         );
 
+        // Fail closed: until the proxy has proven knowledge of SERVER_SECRET via
+        // HELLO → HELLO_AUTH, the only messages we accept are those two. Anything
+        // else (CONNECT, DATA, AUTH_CHANGED, …) from an unauthenticated peer is
+        // rejected, which closes the connection. This is what stops an attacker
+        // who can merely reach the port from impersonating a trusted gateway.
+        if !self.handshake_complete
+            && msg_type != proxy_msg::HELLO
+            && msg_type != proxy_msg::HELLO_AUTH
+        {
+            warn!(
+                "Rejecting message type 0x{:02x} from {} before authenticated handshake",
+                msg_type, self.remote_addr
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "message received before authenticated handshake",
+            ));
+        }
+
         match msg_type {
             proxy_msg::HELLO => {
                 self.handle_hello(payload).await?;
+            }
+            proxy_msg::HELLO_AUTH => {
+                self.handle_hello_auth(payload).await?;
             }
             proxy_msg::CONNECT => {
                 self.handle_connect(payload).await?;
@@ -823,11 +864,20 @@ impl<H: ProxyHandler + 'static> ProxyConnection<H> {
             hello.proxy_version, self.core_id
         );
 
-        // Send HELLO_ACK
+        // Generate a fresh per-connection nonce. The proxy must echo back
+        // HMAC-SHA256(SERVER_SECRET, nonce) in a HELLO_AUTH before we trust it.
+        let mut nonce = [0u8; 32];
+        getrandom::getrandom(&mut nonce)
+            .map_err(|e| io::Error::other(format!("nonce generation failed: {e}")))?;
+        self.hello_nonce = Some(nonce);
+
+        // Send HELLO_ACK (carrying the nonce). Handshake is NOT complete yet —
+        // it completes only after a valid HELLO_AUTH.
         let ack = HelloAckMessage {
             core_id: self.core_id as u8,
             nr_cores: self.nr_cores as u8,
             server_version: PROTOCOL_VERSION,
+            nonce,
         };
 
         let msg = OutgoingMessage {
@@ -838,7 +888,36 @@ impl<H: ProxyHandler + 'static> ProxyConnection<H> {
         };
         let _ = self.outbox_tx.try_send(msg);
 
+        Ok(())
+    }
+
+    /// Verify the proxy's HELLO_AUTH: `HMAC-SHA256(SERVER_SECRET, nonce)` over the
+    /// nonce we sent in HELLO_ACK. On success the handshake is complete and the
+    /// connection is trusted; on any mismatch we error, which closes the socket.
+    async fn handle_hello_auth(&mut self, payload: &[u8]) -> io::Result<()> {
+        let nonce = self
+            .hello_nonce
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "HELLO_AUTH before HELLO"))?;
+
+        let mut mac = <Hmac<Sha256>>::new_from_slice(self.server_secret.as_bytes())
+            .map_err(|e| io::Error::other(format!("hmac init: {e}")))?;
+        mac.update(&nonce);
+
+        // verify_slice is constant-time.
+        if mac.verify_slice(payload).is_err() {
+            warn!(
+                "Proxy handshake auth FAILED from {} — rejecting connection (bad SERVER_SECRET?)",
+                self.remote_addr
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "proxy handshake authentication failed",
+            ));
+        }
+
         self.handshake_complete = true;
+        self.hello_nonce = None; // single-use
+        trace!("Proxy handshake authenticated from {}", self.remote_addr);
         Ok(())
     }
 
@@ -1285,6 +1364,8 @@ pub struct ProxyListener<H: ProxyHandler + 'static> {
     port: u16,
     /// Host/interface to bind. "0.0.0.0" (IPv4) by default; "[::]" for IPv6.
     bind_host: String,
+    /// Shared secret the proxy must authenticate with (HELLO_AUTH HMAC).
+    server_secret: Rc<String>,
 }
 
 impl<H: ProxyHandler + 'static> ProxyListener<H> {
@@ -1294,6 +1375,7 @@ impl<H: ProxyHandler + 'static> ProxyListener<H> {
         nr_cores: usize,
         port: u16,
         bind_host: String,
+        server_secret: Rc<String>,
     ) -> Self {
         Self {
             handler,
@@ -1301,6 +1383,7 @@ impl<H: ProxyHandler + 'static> ProxyListener<H> {
             nr_cores,
             port,
             bind_host,
+            server_secret,
         }
     }
 
@@ -1334,6 +1417,7 @@ impl<H: ProxyHandler + 'static> ProxyListener<H> {
                         self.core_id,
                         self.nr_cores,
                         remote_addr,
+                        self.server_secret.clone(),
                     );
 
                     // Spawn connection handler
@@ -1380,6 +1464,37 @@ mod tests {
         assert!(auth.uid.is_empty());
         assert!(auth.provider.is_empty());
         assert!(!auth.is_admin);
+    }
+
+    /// Locks the HELLO_AUTH HMAC to the same fixed vector asserted on the Go edge
+    /// (`wire_test.go: TestServerAuthMACKnownAnswer`), so the two sides can't
+    /// silently drift. HMAC-SHA256("lark-test-secret", nonce=bytes 0..31).
+    #[test]
+    fn test_hello_auth_hmac_known_answer() {
+        let mut nonce = [0u8; 32];
+        for (i, b) in nonce.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let mut mac = <Hmac<Sha256>>::new_from_slice(b"lark-test-secret").unwrap();
+        mac.update(&nonce);
+        let got = hex::encode(mac.finalize().into_bytes());
+        assert_eq!(
+            got,
+            "d1e6900018c7d50930190b1577cc590f0821354b51afd79df6935cd08a82acbe"
+        );
+    }
+
+    /// A wrong secret must not verify against the expected MAC (constant-time check).
+    #[test]
+    fn test_hello_auth_rejects_wrong_secret() {
+        let nonce = [7u8; 32];
+        let mut good = <Hmac<Sha256>>::new_from_slice(b"correct-secret").unwrap();
+        good.update(&nonce);
+        let expected = good.finalize().into_bytes();
+
+        let mut bad = <Hmac<Sha256>>::new_from_slice(b"wrong-secret").unwrap();
+        bad.update(&nonce);
+        assert!(bad.verify_slice(&expected).is_err());
     }
 
     #[test]
