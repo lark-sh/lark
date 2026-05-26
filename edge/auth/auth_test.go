@@ -1,11 +1,71 @@
 package auth
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
 	"testing"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
+
+// mintRS256Token signs a Firebase-ID-token-shaped JWT with a throwaway RSA key.
+// The signature won't match Google's keys, but the fail-closed guards under test
+// reject before signature verification, so it exercises exactly the bypass path.
+func mintRS256Token(t *testing.T, issuer, aud, uid string, extra map[string]any) string {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey: %v", err)
+	}
+	claims := jwt.MapClaims{
+		"iss": issuer,
+		"aud": aud,
+		"sub": uid,
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"iat": time.Now().Unix(),
+	}
+	for k, v := range extra {
+		claims[k] = v
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	tok.Header["kid"] = "test-kid"
+	s, err := tok.SignedString(key)
+	if err != nil {
+		t.Fatalf("SignedString: %v", err)
+	}
+	return s
+}
+
+// TestMultiValidatorRejectsFirebaseTokenWhenNoProjectConfigured covers security
+// audit finding: a project with no Firebase project ID configured must reject
+// Firebase ID tokens outright.
+func TestMultiValidatorRejectsFirebaseTokenWhenNoProjectConfigured(t *testing.T) {
+	const attackerProject = "attacker-project"
+	token := mintRS256Token(t,
+		"https://securetoken.google.com/"+attackerProject,
+		attackerProject,
+		"attacker-uid",
+		map[string]any{"admin": true, "role": "gm"},
+	)
+
+	v := NewMultiValidator(nil) // no Firebase project IDs configured
+
+	// The per-connection path: ValidateForProject with no firebase project ID.
+	if _, err := v.ValidateForProject(token, "customer-secret", "admin-secret"); err == nil {
+		t.Fatal("expected rejection of Firebase ID token when no Firebase project ID is configured")
+	}
+
+	// Same with an explicitly-empty firebase project ID argument.
+	if _, err := v.ValidateForProject(token, "customer-secret", "admin-secret", ""); err == nil {
+		t.Fatal("expected rejection with empty firebase project ID")
+	}
+
+	// Defense-in-depth: the firebase validator itself must reject an empty pin.
+	if _, err := v.firebaseValidator.ValidateForProjectID(token, ""); err == nil {
+		t.Fatal("ValidateForProjectID must reject an empty expected project ID")
+	}
+}
 
 func TestGenerateAndValidateToken(t *testing.T) {
 	secret := []byte("test-secret-key")

@@ -415,6 +415,13 @@ func (v *MultiValidator) validateHS256Token(tokenString, secretKey, adminSecretK
 //   - iss starts with "https://securetoken.google.com/" → Firebase ID Token
 //   - aud = identitytoolkit URL → Firebase Custom Token
 func (v *MultiValidator) validateRS256Token(tokenString string, firebaseProjectID string) (*Info, error) {
+	// Fail closed: Firebase tokens (ID *or* custom) are only accepted when the
+	// project has a Firebase project ID configured.
+	// A project that hasn't opted into Firebase must reject all Firebase tokens.
+	if firebaseProjectID == "" {
+		return nil, fmt.Errorf("%w: Firebase tokens not accepted (no Firebase project ID configured)", ErrInvalidToken)
+	}
+
 	// Peek at payload to determine token type
 	payload, err := peekTokenPayload(tokenString)
 	if err != nil {
