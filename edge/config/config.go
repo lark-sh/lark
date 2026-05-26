@@ -114,6 +114,11 @@ type Config struct {
 	// Debug
 	Debug bool
 
+	// PprofEnabled starts the net/http/pprof debug server (loopback only).
+	// Off by default — pprof exposes heap dumps (which can contain secrets and
+	// tenant data) and an on-demand CPU profiler, so it must never be public.
+	PprofEnabled bool
+
 	// Local development mode (bypasses database)
 	LocalMode        bool   // If true, skip database and use local backend
 	LocalBackendAddr string // Address of local backend (e.g., "localhost:7779")
@@ -154,6 +159,7 @@ func Load() (*Config, error) {
 		AdminAPIEnabled:   getEnvBool("ADMIN_API_ENABLED", false),
 		DisableTLS:        getEnvBool("DISABLE_TLS", false),
 		Debug:             getEnvBool("DEBUG", false),
+		PprofEnabled:      getEnvBool("PPROF_ENABLED", false),
 
 		// Local development mode
 		LocalMode:        getEnvBool("LOCAL_MODE", false),

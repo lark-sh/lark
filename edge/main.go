@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	_ "net/http/pprof"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"runtime"
@@ -29,19 +29,33 @@ func main() {
 	logger.Info("Starting lark-edge (thick proxy mode)")
 	logger.Info("Runtime config", "GOMAXPROCS", runtime.GOMAXPROCS(0), "NumCPU", runtime.NumCPU())
 
-	// Start pprof server for profiling
-	go func() {
-		logger.Debug("pprof server listening", "addr", ":6060")
-		if err := http.ListenAndServe(":6060", nil); err != nil {
-			logger.Error("pprof server error", "error", err)
-		}
-	}()
-
 	// Load configuration
 	cfg, err := config.Load()
 	if err != nil {
 		logger.Error("Failed to load config", "error", err)
 		os.Exit(1)
+	}
+
+	// Debug profiler. OFF by default and bound to loopback only when enabled:
+	// pprof serves heap dumps (which can contain JWTs, project secrets, and
+	// tenant data) and an on-demand CPU profiler, so it must never be reachable
+	// off-host. To profile a remote node, enable PPROF_ENABLED and SSH-tunnel /
+	// `fly proxy` to 127.0.0.1:6060. Served on a dedicated mux, not the default
+	// one, so it's self-contained.
+	if cfg.PprofEnabled {
+		go func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/debug/pprof/", pprof.Index)
+			mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+			mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+			mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+			mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+			const addr = "127.0.0.1:6060"
+			logger.Info("pprof debug server listening (loopback only)", "addr", addr)
+			if err := http.ListenAndServe(addr, mux); err != nil {
+				logger.Error("pprof server error", "error", err)
+			}
+		}()
 	}
 
 	if cfg.Debug {
