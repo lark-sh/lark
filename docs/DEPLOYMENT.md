@@ -410,11 +410,82 @@ What makes this a different class of problem from Tier 2 is the
   separate `lark-compact` tool, run when a blob has accumulated significant wasted
   space; it coordinates with the server via the `.compacting` marker (see
   [BACKUP.md](BACKUP.md) and the README's [Storage section](../README.md#storage)).
-- **Observability** — `lark-server` instances ship metrics to `lark-edge`'s
-  internal endpoint; the admin dashboard surfaces per-database and per-server
-  stats. Enable `--debug-timing` / `LARK_DEBUG_TIMING` for latency breakdowns when
-  diagnosing.
+- **Observability** — with `LARK_METRICS_PUSH=true`, `lark-server` pushes
+  per-database metrics straight to `lark-edge`'s internal endpoint and the admin
+  dashboard's Monitoring tab works with no extra setup (this is set in the bundled
+  compose + Fly configs). Leave it off to rely on an external log shipper scraping
+  stdout instead. Either way, enable `--debug-timing` / `LARK_DEBUG_TIMING` for
+  latency breakdowns when diagnosing. Full details, including the Vector path for
+  bare-metal / off-site metrics, are in [OBSERVABILITY.md](OBSERVABILITY.md).
 - **Upgrades** — deploy node-by-node. The on-disk blob carries a
   `blob.generation`; a server restart re-opens its data and replays WAL forward
   (same path as restore). Roll `lark-server` nodes one at a time so the coordinator
   reroutes around each during its brief restart.
+
+---
+
+## Configuration reference
+
+Every setting is an environment variable; `lark-server` additionally accepts each
+as a CLI flag (shown below). Unless noted, defaults are production-safe. The
+bundled `docker-compose.yml` and [`deploy/fly/`](../deploy/fly/README.md) set the
+non-default values a real deployment needs.
+
+### `lark-server` (the engine)
+
+| Env | Flag | Default | Notes |
+|---|---|---|---|
+| `LARK_SERVER_ID` | `--id` | — | **Required.** Unique server identifier (e.g. `db-1`). |
+| `LARK_HOSTNAME` | `--hostname` | — | **Required.** Public hostname label; not used for client routing in the Tier-2 topology. |
+| `LARK_PRIVATE_IP` | `--private-ip` | — | Address `lark-edge` dials back on — what the server registers as (`private_ip:proxy_port`). Set on any multi-host deploy. |
+| `LARK_COORDINATOR_URL` | `--coordinator` | — | `lark-edge`'s **internal** endpoint for registration + metrics push (e.g. `http://10.0.0.20:8080`). |
+| `LARK_DATA_DIR` | `--data-dir` | — (in-memory) | Persistence directory. **Local NVMe only** — never a shared/network FS. Unset = ephemeral. |
+| `LARK_PROXY_PORT` | `--proxy-port` | `2727` | Wire-protocol TCP port (each core binds with `SO_REUSEPORT`). **Private.** |
+| `LARK_PROXY_BIND` | `--proxy-bind` | `0.0.0.0` | Bind host for the proxy listener. Use `[::]` on IPv6-only private nets (e.g. Fly 6PN). |
+| `LARK_PUBLIC_IP` | `--public-ip` | `127.0.0.1` | Public IP advertised for UDP clients. |
+| `LARK_PUBLIC_PORT` | `--public-port` | `8080` | Public port clients use to connect. |
+| `LARK_CAPACITY` | `--capacity` | `1000` | Max databases this server will host. |
+| `LARK_NR_CORES` | `--nr-cores` | all cores | Number of Glommio cores to run. |
+| `LARK_METRICS_PUSH` | `--metrics-push` | `false` | Push per-DB metrics to the coordinator (needs `--coordinator`). `true` in bundled deploys → dashboard works with no log shipper. See [OBSERVABILITY.md](OBSERVABILITY.md). |
+| `LARK_EVICTION_IDLE_SECS` | `--eviction-idle-secs` | `300` | Idle seconds before a promoted path is evicted back to Sentinel. |
+| `LARK_DEBUG_TIMING` | `--debug-timing` | `false` | Detailed message-latency tracking (diagnostics). |
+| `RUST_LOG` | — | `info` | Log filter (e.g. `debug`, `lark_server=debug`). |
+| `LARK_EMULATOR` | `--emulator` | `false` | **Dev/test only** — accepts the `owner` token. |
+| `LARK_TEMPLATE_PATH` | `--template` | — | **Dev/test only** — load-testing template directory. |
+
+### `lark-edge` (the gateway / coordinator)
+
+| Env | Default | Notes |
+|---|---|---|
+| `DATABASE_URL` | — | **Required** (unless `LOCAL_MODE`). Control-plane store: `sqlite:///data/lark.db` (single gateway) or `postgres://…` (**required for >1 gateway**). |
+| `SERVER_SECRET` | — | **Required.** Shared `lark-edge`↔`lark-server` secret; identical on every node. |
+| `LARKDB_DOMAIN` | `larkdb.net` | Per-database routing domain; drives `*.<domain>` client hostnames + CertMagic. |
+| `HTTPS_LISTEN_ADDR` | `:443` | **Public** client listener (REST + WebSocket + `/admin/`). |
+| `INTERNAL_LISTEN_ADDR` | `:8080` | **Private** listener: server registration + metrics ingest. Empty string disables it. |
+| `WT_LISTEN_ADDR` | `:8444` | **Public** WebTransport/QUIC base port (UDP). |
+| `WT_PORTS` | `1` | Number of parallel WebTransport listeners. |
+| `ADMIN_API_ENABLED` | `false` | Mount the `/admin/` dashboard + API. Set `true` on **exactly one** gateway. |
+| `DISABLE_TLS` | `false` | Serve plain HTTP (dev only; browsers exempt `*.localhost`). |
+| `CERTMAGIC_ENABLED` | `false` | Automatic Let's Encrypt wildcard certs (DNS-01). |
+| `CERTMAGIC_EMAIL` | — | Let's Encrypt account email (when CertMagic on). |
+| `CERTMAGIC_DOMAINS` | auto: `*.<domain>` + apex | Override managed domains. **Replaces** the auto list — include the wildcard + apex yourself. |
+| `CERTMAGIC_STORAGE` | `./certs` | Cert cache path — put on a persistent volume. |
+| `CERTMAGIC_STAGING` | `false` | Use LE staging (testing; avoids rate limits). |
+| `CERTMAGIC_RESOLVERS` | — | Custom DNS resolvers for the ACME challenge (e.g. `8.8.8.8:53,1.1.1.1:53`). |
+| `CLOUDFLARE_API_TOKEN` | — | **Required when `CERTMAGIC_ENABLED`** (DNS-01 via Cloudflare). |
+| `TLS_CERT_FILE` / `TLS_KEY_FILE` | `server.crt` / `server.key` | Static cert/key (when not using CertMagic). |
+| `METRICS_FLUSH_INTERVAL` | `3m` | How often the aggregator writes `database_metrics` (Go duration string, e.g. `90s`). |
+| `HEARTBEAT_TIMEOUT` | `30` | Seconds before a server is considered unhealthy. |
+| `DEATH_TIMEOUT` | `60` | Seconds before a server is marked offline. |
+| `CONNECTIONS_PER_CORE` | `2` | Backend connections opened per server core. |
+| `BATCH_FLUSH_INTERVAL` | `1` | Milliseconds between outbound batch flushes. |
+| `BATCH_MAX_SIZE` | `65536` | Bytes buffered before a forced flush. |
+| `BATCH_MAX_MESSAGES` | `100` | Messages buffered before a forced flush. |
+| `DEBUG` | `false` | Debug-level logging. |
+| `LOCAL_MODE` | `false` | **Dev only** — bypass the control-plane DB, use an in-memory backend (implies `DISABLE_TLS`). |
+| `LOCAL_BACKEND_ADDR` | `localhost:7779` | **Dev only** — backend address in `LOCAL_MODE`. |
+| `LOCAL_PROJECT_ID` | `test-project` | **Dev only** — project ID used in `LOCAL_MODE`. |
+
+> `BACKEND_ADDRS`, `COORDINATOR_ADDR`, and `IS_COORDINATOR` exist for advanced /
+> non-self-coordinator topologies and are left at their defaults in the standard
+> Tier 1–2 deployments described above.
