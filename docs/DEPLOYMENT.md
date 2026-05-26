@@ -501,6 +501,7 @@ non-default values a real deployment needs.
 | `BATCH_MAX_SIZE` | `65536` | Bytes buffered before a forced flush. |
 | `BATCH_MAX_MESSAGES` | `100` | Messages buffered before a forced flush. |
 | `DEBUG` | `false` | Debug-level logging. |
+| `PPROF_ENABLED` | `false` | Start the `net/http/pprof` debug profiler. **Loopback only** (`127.0.0.1:6060`) and off by default — it exposes heap dumps (which can hold secrets/tenant data) and an on-demand CPU profiler. To profile a remote node, enable it and SSH-tunnel / `fly proxy` to `6060`; never expose the port. |
 | `LOCAL_MODE` | `false` | **Dev only** — bypass the control-plane DB, use an in-memory backend (implies `DISABLE_TLS`). |
 | `LOCAL_BACKEND_ADDR` | `localhost:7779` | **Dev only** — backend address in `LOCAL_MODE`. |
 | `LOCAL_PROJECT_ID` | `test-project` | **Dev only** — project ID used in `LOCAL_MODE`. |
