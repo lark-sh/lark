@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS projects (
     ephemeral INTEGER NOT NULL DEFAULT 1,
     auth_required INTEGER NOT NULL DEFAULT 0,
     auto_create INTEGER NOT NULL DEFAULT 1,
-    firebase_compat_enabled INTEGER NOT NULL DEFAULT 0,
+    firebase_compat_enabled INTEGER NOT NULL DEFAULT 1,
     firebase_project_id TEXT NOT NULL DEFAULT '',
     use_first_path_segment_as_database INTEGER NOT NULL DEFAULT 0,
     config_version INTEGER NOT NULL DEFAULT 1,

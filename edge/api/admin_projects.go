@@ -47,7 +47,6 @@ type adminCreateProjectRequest struct {
 	RulesJSON                     string `json:"rules_json,omitempty"`
 	Ephemeral                     bool   `json:"ephemeral"`
 	AutoCreate                    bool   `json:"auto_create"`
-	FirebaseCompatEnabled         bool   `json:"firebase_compat_enabled"`
 	FirebaseProjectID             string `json:"firebase_project_id,omitempty"`
 	UseFirstPathSegmentAsDatabase bool   `json:"use_first_path_segment_as_database"`
 }
@@ -75,14 +74,16 @@ func (s *Server) handleAdminCreateProject(w http.ResponseWriter, r *http.Request
 	}
 
 	project := &db.Project{
-		ID:                            req.ID,
-		Name:                          req.Name,
-		SecretKey:                     randomToken(16),
-		AdminSecretKey:                randomToken(16),
-		RulesJSON:                     rules,
-		Ephemeral:                     req.Ephemeral,
-		AutoCreate:                    req.AutoCreate,
-		FirebaseCompatEnabled:         req.FirebaseCompatEnabled,
+		ID:             req.ID,
+		Name:           req.Name,
+		SecretKey:      randomToken(16),
+		AdminSecretKey: randomToken(16),
+		RulesJSON:      rules,
+		Ephemeral:      req.Ephemeral,
+		AutoCreate:     req.AutoCreate,
+		// Always on; no longer user-facing, but still plumbed through the DB/config
+		// in case we want to reintroduce the toggle later.
+		FirebaseCompatEnabled:         true,
 		FirebaseProjectID:             req.FirebaseProjectID,
 		UseFirstPathSegmentAsDatabase: req.UseFirstPathSegmentAsDatabase,
 	}

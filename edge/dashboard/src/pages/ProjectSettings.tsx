@@ -20,7 +20,6 @@ export function ProjectSettings() {
   const [ephemeral, setEphemeral] = useState(true);
   const [autoCreate, setAutoCreate] = useState(true);
   const [rulesJson, setRulesJson] = useState('');
-  const [firebaseCompatEnabled, setFirebaseCompatEnabled] = useState(false);
   const [firebaseProjectId, setFirebaseProjectId] = useState('');
   const [useFirstPathSegmentAsDatabase, setUseFirstPathSegmentAsDatabase] =
     useState(false);
@@ -51,7 +50,6 @@ export function ProjectSettings() {
         setEphemeral(data.ephemeral);
         setAutoCreate(data.auto_create);
         setRulesJson(data.rules_json || '');
-        setFirebaseCompatEnabled(data.firebase_compat_enabled);
         setFirebaseProjectId(data.firebase_project_id || '');
         setUseFirstPathSegmentAsDatabase(data.use_first_path_segment_as_database);
       } catch (err) {
@@ -91,7 +89,8 @@ export function ProjectSettings() {
         ephemeral,
         auto_create: autoCreate,
         rules_json: rulesJson || '',
-        firebase_compat_enabled: firebaseCompatEnabled,
+        // firebase_compat_enabled is intentionally omitted: it defaults to true on
+        // project creation and is no longer user-facing, so we leave it untouched here.
         firebase_project_id: firebaseProjectId || '',
         use_first_path_segment_as_database: useFirstPathSegmentAsDatabase,
       });
@@ -220,41 +219,31 @@ export function ProjectSettings() {
               />
 
               <Toggle
-                label="Allow legacy Firebase"
-                hint="Accept Firebase SDK clients on this project"
-                value={firebaseCompatEnabled}
-                onChange={setFirebaseCompatEnabled}
+                label="First path segment is database"
+                hint="Route by the first path segment (e.g. /room-123/...)"
+                value={useFirstPathSegmentAsDatabase}
+                onChange={setUseFirstPathSegmentAsDatabase}
               />
 
-              {firebaseCompatEnabled && (
-                <div className="ml-6 pl-4 border-l-2 border-gray-200 space-y-4 py-2">
-                  <Toggle
-                    label="First path segment is database"
-                    hint="Route by the first path segment (e.g. /room-123/...)"
-                    value={useFirstPathSegmentAsDatabase}
-                    onChange={setUseFirstPathSegmentAsDatabase}
-                  />
-                  <div>
-                    <label
-                      htmlFor="firebase_project_id"
-                      className="block text-sm font-medium text-gray-700 mb-1"
-                    >
-                      Firebase Auth project ID
-                    </label>
-                    <input
-                      id="firebase_project_id"
-                      type="text"
-                      value={firebaseProjectId}
-                      onChange={(e) => setFirebaseProjectId(e.target.value)}
-                      placeholder="my-firebase-project"
-                      className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                    />
-                    <p className="mt-1 text-xs text-gray-500">
-                      Used to validate Firebase ID tokens on incoming connections.
-                    </p>
-                  </div>
-                </div>
-              )}
+              <div className="pt-3 border-t border-gray-100">
+                <label
+                  htmlFor="firebase_project_id"
+                  className="block text-sm font-medium text-gray-700 mb-1"
+                >
+                  Firebase Auth project ID
+                </label>
+                <input
+                  id="firebase_project_id"
+                  type="text"
+                  value={firebaseProjectId}
+                  onChange={(e) => setFirebaseProjectId(e.target.value)}
+                  placeholder="my-firebase-project"
+                  className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                />
+                <p className="mt-1 text-xs text-gray-500">
+                  Used to validate Firebase ID tokens on incoming connections.
+                </p>
+              </div>
             </div>
 
             <div className="mt-6 pt-4 border-t border-gray-100">

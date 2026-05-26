@@ -1,31 +1,14 @@
 <!doctype html>
-<!--
-  Placeholder for the Lark admin dashboard.
-
-  This file is committed so the Go build's `//go:embed all:dist`
-  (edge/dashboard/embed.go) always has something to compile against, even on a
-  fresh clone where the SPA hasn't been built. The real, production dashboard
-  bundle is produced by Vite and overwrites this directory:
-
-      make build-spa            # from the repo root
-      # or:
-      cd edge/dashboard && npm ci && npm run build
-
-  `make up` / `make build-edge` run that build for you. If you're seeing this
-  page in a running lark-edge, the dashboard wasn't built before the binary was
-  compiled.
--->
 <html lang="en">
   <head>
-    <meta charset="utf-8" />
-    <title>Lark — dashboard not built</title>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/admin/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Lark</title>
+    <script type="module" crossorigin src="/admin/assets/index-DmCvCLLc.js"></script>
+    <link rel="stylesheet" crossorigin href="/admin/assets/index-Bybs35Nz.css">
   </head>
   <body>
-    <h1>Lark admin dashboard placeholder</h1>
-    <p>
-      This is a build-time placeholder. Build the dashboard with
-      <code>make build-spa</code> (or <code>cd edge/dashboard &amp;&amp; npm ci &amp;&amp; npm run build</code>),
-      then rebuild <code>lark-edge</code>.
-    </p>
+    <div id="root"></div>
   </body>
 </html>
