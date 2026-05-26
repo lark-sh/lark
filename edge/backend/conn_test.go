@@ -164,15 +164,19 @@ func mockBackendServer(t *testing.T, nrCores uint8, messagesToSend [][]byte) (ne
 				continue
 			}
 
-			// Send HELLO_ACK
+			// Send HELLO_ACK (37-byte content: + 32-byte nonce)
 			coreID := uint8(connectionCount.Add(1)-1) % nrCores
-			resp := make([]byte, 13)
-			binary.BigEndian.PutUint32(resp[0:4], 9)
+			resp := make([]byte, 41)
+			binary.BigEndian.PutUint32(resp[0:4], 37)
 			resp[4] = MsgTypeHelloAck
 			resp[5] = coreID
 			resp[6] = nrCores
 			binary.BigEndian.PutUint16(resp[7:9], 1)
+			// resp[9:41] nonce (zero; mock doesn't verify the auth reply)
 			conn.Write(resp)
+
+			// Consume the HELLO_AUTH the pool sends back before reading anything else.
+			readFrame(conn)
 
 			// Send the test messages
 			go func(c net.Conn) {
@@ -225,7 +229,7 @@ func TestCompressedMultiDispatch(t *testing.T) {
 	defer cleanup()
 
 	// Create pool and add backend
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	pool.SetClientRegistry(registry)
 	defer pool.Close()
 
@@ -278,7 +282,7 @@ func TestCompressedMultiUnreliable(t *testing.T) {
 	listener, cleanup, _ := mockBackendServer(t, 1, [][]byte{compressedMsg})
 	defer cleanup()
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	pool.SetClientRegistry(registry)
 	defer pool.Close()
 
@@ -313,7 +317,7 @@ func TestCompressedMultiMissingClient(t *testing.T) {
 	listener, cleanup, _ := mockBackendServer(t, 1, [][]byte{compressedMsg})
 	defer cleanup()
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	pool.SetClientRegistry(registry)
 	defer pool.Close()
 
@@ -345,7 +349,7 @@ func TestCompressedMultiClientFull(t *testing.T) {
 	listener, cleanup, _ := mockBackendServer(t, 1, [][]byte{compressedMsg})
 	defer cleanup()
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	pool.SetClientRegistry(registry)
 	defer pool.Close()
 
@@ -384,7 +388,7 @@ func TestCompressedMultiLargeBatch(t *testing.T) {
 	listener, cleanup, _ := mockBackendServer(t, 1, [][]byte{compressedMsg})
 	defer cleanup()
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	pool.SetClientRegistry(registry)
 	defer pool.Close()
 
@@ -426,7 +430,7 @@ func TestInlineDispatchSendDataCompressed(t *testing.T) {
 	listener, cleanup, _ := mockBackendServer(t, 1, [][]byte{wireMsg})
 	defer cleanup()
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	pool.SetClientRegistry(registry)
 	defer pool.Close()
 
@@ -469,7 +473,7 @@ func TestInlineDispatchSendDataCompressedUnreliable(t *testing.T) {
 	listener, cleanup, _ := mockBackendServer(t, 1, [][]byte{wireMsg})
 	defer cleanup()
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	pool.SetClientRegistry(registry)
 	defer pool.Close()
 
@@ -509,7 +513,7 @@ func TestInlineDispatchSendData(t *testing.T) {
 	listener, cleanup, _ := mockBackendServer(t, 1, [][]byte{wireMsg})
 	defer cleanup()
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	pool.SetClientRegistry(registry)
 	defer pool.Close()
 
@@ -546,7 +550,7 @@ func TestInlineDispatchClose(t *testing.T) {
 	listener, cleanup, _ := mockBackendServer(t, 1, [][]byte{wireMsg})
 	defer cleanup()
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	pool.SetClientRegistry(registry)
 	defer pool.Close()
 
@@ -768,7 +772,7 @@ func TestBroadcastDispatch(t *testing.T) {
 	listener, cleanup, _ := mockBackendServer(t, 1, [][]byte{broadcastMsg})
 	defer cleanup()
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	pool.SetClientRegistry(registry)
 	defer pool.Close()
 
@@ -811,7 +815,7 @@ func TestBroadcastUnreliable(t *testing.T) {
 	listener, cleanup, _ := mockBackendServer(t, 1, [][]byte{broadcastMsg})
 	defer cleanup()
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	pool.SetClientRegistry(registry)
 	defer pool.Close()
 
@@ -854,7 +858,7 @@ func TestBroadcastWithTagsLark(t *testing.T) {
 	listener, cleanup, _ := mockBackendServer(t, 1, [][]byte{broadcastMsg})
 	defer cleanup()
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	pool.SetClientRegistry(registry)
 	defer pool.Close()
 
@@ -919,7 +923,7 @@ func TestBroadcastWithTagsFirebase(t *testing.T) {
 	listener, cleanup, _ := mockBackendServer(t, 1, [][]byte{broadcastMsg})
 	defer cleanup()
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	pool.SetClientRegistry(registry)
 	defer pool.Close()
 
@@ -979,7 +983,7 @@ func TestBroadcastMissingClient(t *testing.T) {
 	listener, cleanup, _ := mockBackendServer(t, 1, [][]byte{broadcastMsg})
 	defer cleanup()
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	pool.SetClientRegistry(registry)
 	defer pool.Close()
 
@@ -1018,7 +1022,7 @@ func TestBroadcastLargeFanout(t *testing.T) {
 	listener, cleanup, _ := mockBackendServer(t, 1, [][]byte{broadcastMsg})
 	defer cleanup()
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	pool.SetClientRegistry(registry)
 	defer pool.Close()
 
@@ -1057,7 +1061,7 @@ func TestBroadcastCompressed(t *testing.T) {
 	listener, cleanup, _ := mockBackendServer(t, 1, [][]byte{broadcastMsg})
 	defer cleanup()
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	pool.SetClientRegistry(registry)
 	defer pool.Close()
 
@@ -1110,7 +1114,7 @@ func BenchmarkBroadcastDispatch(b *testing.B) {
 	wireData[1] = BroadcastFlagReliable
 	copy(wireData[2:], payload)
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	pool.SetClientRegistry(registry)
 
 	backend := &Backend{
@@ -1162,7 +1166,7 @@ func BenchmarkBroadcastDispatchWithTagsLark(b *testing.B) {
 	wireData[1] = BroadcastFlagReliable
 	copy(wireData[2:], payload)
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	pool.SetClientRegistry(registry)
 
 	backend := &Backend{
@@ -1214,7 +1218,7 @@ func BenchmarkBroadcastDispatchWithTagsFirebase(b *testing.B) {
 	wireData[1] = BroadcastFlagReliable | BroadcastFlagFirebase
 	copy(wireData[2:], payload)
 
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	pool.SetClientRegistry(registry)
 
 	backend := &Backend{
@@ -1270,7 +1274,7 @@ func BenchmarkCompressedMultiDispatch(b *testing.B) {
 	compressed := encoder.EncodeAll(inner, nil)
 
 	// Create mock pool and backend for the Conn
-	pool := NewPool(1)
+	pool := NewPool(1, "test-secret")
 	pool.SetClientRegistry(registry)
 
 	backend := &Backend{

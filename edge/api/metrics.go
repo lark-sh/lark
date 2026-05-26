@@ -14,8 +14,9 @@ func (s *Server) SetMetricsAggregator(aggregator *metrics.MetricsAggregator) {
 
 // RegisterMetricsRoutes registers metrics-related routes
 func (s *Server) RegisterMetricsRoutes() {
-	// Internal endpoint (only accessible via internal HTTP server on port 8080)
-	s.mux.HandleFunc("POST /internal/metrics", s.handleIngestMetrics)
+	// Internal endpoint (internal listener only) — authenticated with SERVER_SECRET
+	// so a caller that reaches the port can't poison dashboard/billing metrics.
+	s.mux.HandleFunc("POST /internal/metrics", s.requireServerSecret(s.handleIngestMetrics))
 }
 
 // handleIngestMetrics receives metrics from Vector

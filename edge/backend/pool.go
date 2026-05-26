@@ -208,11 +208,12 @@ type Pool struct {
 	connectTimeout time.Duration
 	writeTimeout   time.Duration
 	readTimeout    time.Duration
-	connsPerCore   int // Number of connections per core (default: 2)
+	connsPerCore   int    // Number of connections per core (default: 2)
+	serverSecret   string // Shared secret to authenticate the proxy→server handshake
 }
 
 // NewPool creates a new backend connection pool
-func NewPool(connsPerCore int) *Pool {
+func NewPool(connsPerCore int, serverSecret string) *Pool {
 	if connsPerCore <= 0 {
 		connsPerCore = 2 // default
 	}
@@ -222,6 +223,7 @@ func NewPool(connsPerCore int) *Pool {
 		writeTimeout:   10 * time.Second,
 		readTimeout:    30 * time.Second,
 		connsPerCore:   connsPerCore,
+		serverSecret:   serverSecret,
 	}
 }
 
@@ -275,6 +277,12 @@ func (p *Pool) AddBackend(serverID, address string) error {
 
 	helloAck, err := ReadHelloAck(netConn)
 	if err != nil {
+		netConn.Close()
+		return err
+	}
+
+	// Authenticate: prove knowledge of SERVER_SECRET over the server's nonce.
+	if err := WriteHelloAuth(netConn, ServerAuthMAC(p.serverSecret, helloAck.Nonce)); err != nil {
 		netConn.Close()
 		return err
 	}
@@ -519,6 +527,12 @@ func (b *Backend) connectWithHandshake() (*Conn, int, error) {
 	// Read HELLO_ACK
 	helloAck, err := ReadHelloAck(netConn)
 	if err != nil {
+		netConn.Close()
+		return nil, 0, err
+	}
+
+	// Authenticate: prove knowledge of SERVER_SECRET over the server's nonce.
+	if err := WriteHelloAuth(netConn, ServerAuthMAC(b.pool.serverSecret, helloAck.Nonce)); err != nil {
 		netConn.Close()
 		return nil, 0, err
 	}

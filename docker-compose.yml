@@ -68,6 +68,9 @@ services:
       # Push per-database metrics straight to lark-edge so the dashboard's
       # Monitoring tab works out of the box — no external log shipper needed.
       LARK_METRICS_PUSH: "true"
+      # Shared secret authenticating the edge↔server proxy channel. MUST match
+      # lark-edge's SERVER_SECRET — the server rejects gateways that can't prove it.
+      SERVER_SECRET: "${SERVER_SECRET:-dev-secret-change-me}"
     volumes:
       - lark-server-data:/data
     # Glommio's io_uring needs the seccomp profile relaxed; this also
