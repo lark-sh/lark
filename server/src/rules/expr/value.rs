@@ -234,14 +234,35 @@ impl Value {
         }
     }
 
-    /// Convert to number.
+    /// Convert to number, following JavaScript's `ToNumber` for the types that
+    /// appear in rules. Matching JS matters because rules are authored against
+    /// Firebase (a JS engine): a numeric string parses to its value, the empty
+    /// string is `0`, and anything non-numeric is `NaN`. `NaN` then makes every
+    /// comparison false (see `compare`), so a `.validate` like
+    /// `newData.val() <= MAX` correctly *denies* a non-numeric or oversized
+    /// string instead of silently coercing it to `0`.
     pub fn to_number(&self) -> f64 {
         match self {
             Value::Null => 0.0,
-            Value::Bool(b) if *b => 1.0,
+            Value::Bool(b) => {
+                if *b {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
             Value::Number(n) => *n,
-            Value::String(_) => 0.0, // Don't parse strings to numbers
-            _ => 0.0,
+            Value::String(s) => {
+                let t = s.trim();
+                if t.is_empty() {
+                    0.0 // JS: Number("") === 0
+                } else {
+                    // Rust's f64 parse covers JS numeric strings (sign, decimal,
+                    // exponent, Infinity/NaN); non-numeric → NaN, as in JS.
+                    t.parse::<f64>().unwrap_or(f64::NAN)
+                }
+            }
+            _ => f64::NAN,
         }
     }
 
@@ -256,7 +277,11 @@ impl Value {
                     "false".to_string()
                 }
             }
-            Value::Number(_) => String::new(), // Numbers don't convert meaningfully
+            // Rust's f64 Display matches JS for the values rules deal with:
+            // whole numbers render without a trailing ".0" (5.0 -> "5"), decimals
+            // normally (5.5 -> "5.5"). (Very large magnitudes differ from JS's
+            // exponential form, but those don't appear in rule string ops.)
+            Value::Number(n) => n.to_string(),
             Value::String(s) => s.clone(),
             _ => String::new(),
         }
@@ -488,38 +513,23 @@ pub fn loose_equals(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// Compare two values, returning -1, 0, or 1.
-pub fn compare(a: &Value, b: &Value) -> i32 {
-    // If both are numbers
-    if let (Value::Number(na), Value::Number(nb)) = (a, b) {
-        return if na < nb {
-            -1
-        } else if na > nb {
-            1
-        } else {
-            0
-        };
-    }
-
-    // If both are strings
+/// Compare two values for the relational operators (`< > <= >=`), following
+/// JavaScript's abstract relational comparison.
+///
+/// Returns `None` when the operands are *incomparable* — i.e. either coerces to
+/// `NaN` (a non-numeric string, an object, etc.). The caller maps `None` to
+/// `false` for every relational operator, matching JS, where any comparison
+/// involving `NaN` is false. This is what stops `newData.val() <= MAX` from
+/// passing when `val()` is a non-numeric string.
+pub fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    // Both strings: lexicographic, as in JS when neither side coerces.
     if let (Value::String(sa), Value::String(sb)) = (a, b) {
-        return match sa.cmp(sb) {
-            std::cmp::Ordering::Less => -1,
-            std::cmp::Ordering::Greater => 1,
-            std::cmp::Ordering::Equal => 0,
-        };
+        return Some(sa.cmp(sb));
     }
 
-    // Mixed types - convert to numbers
-    let an = a.to_number();
-    let bn = b.to_number();
-    if an < bn {
-        -1
-    } else if an > bn {
-        1
-    } else {
-        0
-    }
+    // Otherwise coerce both to numbers. `partial_cmp` is `None` if either is
+    // `NaN`, which is exactly the "comparison with NaN is false" semantics.
+    a.to_number().partial_cmp(&b.to_number())
 }
 
 /// Add two values (JavaScript + semantics).
@@ -622,9 +632,80 @@ mod tests {
 
     #[test]
     fn test_compare() {
-        assert_eq!(compare(&Value::Number(1.0), &Value::Number(2.0)), -1);
-        assert_eq!(compare(&Value::Number(2.0), &Value::Number(1.0)), 1);
-        assert_eq!(compare(&Value::Number(1.0), &Value::Number(1.0)), 0);
+        use std::cmp::Ordering;
+        assert_eq!(
+            compare(&Value::Number(1.0), &Value::Number(2.0)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare(&Value::Number(2.0), &Value::Number(1.0)),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare(&Value::Number(1.0), &Value::Number(1.0)),
+            Some(Ordering::Equal)
+        );
+        // Non-numeric string coerces to NaN → incomparable (None).
+        assert_eq!(
+            compare(&Value::String("abc".into()), &Value::Number(0.0)),
+            None
+        );
+    }
+
+    /// Differential table: assert Lark's operator coercion matches
+    /// JavaScript/Firebase across type pairs. This is the regression net for the
+    /// rules-evaluator coercion fix (the Firebase SDK compat suite does not
+    /// exercise the rule-engine coercion table). Each row's expected value is the
+    /// result a real JS engine produces.
+    #[test]
+    fn test_js_coercion_table() {
+        use std::cmp::Ordering;
+        fn n(x: f64) -> Value {
+            Value::Number(x)
+        }
+        fn s(x: &str) -> Value {
+            Value::String(x.to_string())
+        }
+        // Operator semantics, mirroring eval.rs.
+        let eq = loose_equals;
+        let lt = |a: &Value, b: &Value| compare(a, b) == Some(Ordering::Less);
+        let gt = |a: &Value, b: &Value| compare(a, b) == Some(Ordering::Greater);
+        let lte =
+            |a: &Value, b: &Value| matches!(compare(a, b), Some(Ordering::Less | Ordering::Equal));
+        let gte = |a: &Value, b: &Value| {
+            matches!(compare(a, b), Some(Ordering::Greater | Ordering::Equal))
+        };
+
+        // == (loose equality)
+        assert!(!eq(&n(0.0), &s("anything"))); // JS: false (was true in Lark)
+        assert!(eq(&n(0.0), &s("0"))); // JS: true
+        assert!(eq(&n(5.0), &s("5"))); // JS: true
+        assert!(eq(&n(0.0), &s(""))); // JS: Number("")==0 → true
+        assert!(eq(&Value::Bool(true), &n(1.0))); // JS: true
+        assert!(!eq(&Value::Null, &n(0.0))); // JS: null==0 is false
+        assert!(!eq(&n(5.0), &s("abc"))); // JS: 5==NaN → false
+
+        // Relational against a numeric upper bound — the .validate bypass.
+        assert!(!lte(&s("999999999999"), &n(1_000_000.0))); // JS: 1e11<=1e6 false (was true)
+        assert!(!gte(&s("abc"), &n(0.0))); // JS: NaN>=0 false (was true)
+        assert!(gt(&s("5"), &n(3.0))); // JS: "5">3 → 5>3 true (was false)
+        assert!(lt(&n(5.0), &s("10"))); // JS: 5<"10" → 5<10 true
+
+        // Both strings compare lexicographically (no numeric coercion).
+        assert!(!lt(&s("5"), &s("10"))); // JS: "5"<"10" lexicographic → false
+        assert!(lt(&s("10"), &s("9"))); // JS: "10"<"9" lexicographic → true
+
+        // NaN is incomparable for every relational operator.
+        assert!(!lt(&s("abc"), &n(0.0)));
+        assert!(!gt(&s("abc"), &n(0.0)));
+        assert!(!lte(&s("abc"), &n(0.0)));
+        assert!(!gte(&s("abc"), &n(0.0)));
+
+        // + : string concat if either side is a string (numbers stringify now),
+        // numeric addition otherwise.
+        assert!(matches!(add(&n(5.0), &s("x")), Value::String(t) if t == "5x"));
+        assert!(matches!(add(&s("5"), &n(3.0)), Value::String(t) if t == "53"));
+        assert!(matches!(add(&n(1.0), &n(2.0)), Value::Number(v) if v == 3.0));
     }
 
     #[test]

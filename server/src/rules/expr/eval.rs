@@ -1,5 +1,6 @@
 //! Expression evaluator.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -256,10 +257,18 @@ fn eval_binary(
         BinaryOp::StrictNotEq => Value::Bool(!strict_equals(&left_val, &right_val)),
         BinaryOp::Eq => Value::Bool(loose_equals(&left_val, &right_val)),
         BinaryOp::NotEq => Value::Bool(!loose_equals(&left_val, &right_val)),
-        BinaryOp::Lt => Value::Bool(compare(&left_val, &right_val) < 0),
-        BinaryOp::Gt => Value::Bool(compare(&left_val, &right_val) > 0),
-        BinaryOp::Lte => Value::Bool(compare(&left_val, &right_val) <= 0),
-        BinaryOp::Gte => Value::Bool(compare(&left_val, &right_val) >= 0),
+        // `compare` returns None when operands are incomparable (NaN, e.g. a
+        // non-numeric string) — every relational operator is false then, as in JS.
+        BinaryOp::Lt => Value::Bool(compare(&left_val, &right_val) == Some(Ordering::Less)),
+        BinaryOp::Gt => Value::Bool(compare(&left_val, &right_val) == Some(Ordering::Greater)),
+        BinaryOp::Lte => Value::Bool(matches!(
+            compare(&left_val, &right_val),
+            Some(Ordering::Less | Ordering::Equal)
+        )),
+        BinaryOp::Gte => Value::Bool(matches!(
+            compare(&left_val, &right_val),
+            Some(Ordering::Greater | Ordering::Equal)
+        )),
         BinaryOp::Add => add(&left_val, &right_val),
         BinaryOp::Sub => subtract(&left_val, &right_val),
         BinaryOp::Mul => multiply(&left_val, &right_val),
