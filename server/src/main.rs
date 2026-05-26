@@ -14,6 +14,11 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+/// Bound on the metrics-push channel. Each active database enqueues one small
+/// JSON line per emit (~60s); a few thousand slots is ample headroom while
+/// capping memory if the shipper stalls (excess samples are dropped, not queued).
+const METRICS_CHANNEL_CAPACITY: usize = 4096;
+
 /// Lark - Fast Multiplayer Database Server (Rust + Glommio)
 #[derive(Parser, Debug, Clone)]
 #[command(name = "lark")]
@@ -81,6 +86,12 @@ pub struct Args {
     /// Coordinator URL for server registration (internal endpoint, e.g., http://lark-edge:8080)
     #[arg(long, env = "LARK_COORDINATOR_URL")]
     pub coordinator: Option<String>,
+
+    /// Push per-database metrics directly to the coordinator's /internal/metrics
+    /// endpoint (instead of relying only on stdout + an external log shipper).
+    /// Requires --coordinator.
+    #[arg(long, default_value = "false", env = "LARK_METRICS_PUSH")]
+    pub metrics_push: bool,
 }
 
 impl Args {
@@ -146,12 +157,33 @@ fn main() {
         data_dir: args.data_dir.clone(),
     };
 
+    // Optional direct metrics push: spawn a single off-reactor shipper thread that
+    // batches emitted metrics and POSTs them to the coordinator. The cores feed it
+    // through a bounded, non-blocking channel (drop-on-full), so it can never stall
+    // a core.
+    let metrics_tx = match (args.metrics_push, args.coordinator.clone()) {
+        (true, Some(coordinator)) => {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<String>(METRICS_CHANNEL_CAPACITY);
+            std::thread::spawn(move || metrics_shipper(coordinator, rx));
+            tracing::info!("Direct metrics push enabled (coordinator /internal/metrics)");
+            Some(tx)
+        }
+        (true, None) => {
+            tracing::warn!(
+                "LARK_METRICS_PUSH is set but no coordinator URL configured; metrics push disabled"
+            );
+            None
+        }
+        (false, _) => None,
+    };
+
     // Run the executor pool
     let pool = ExecutorPool::new(pool_config);
     pool.run(move |core_id, nr_cores, config| {
         let args = args.clone();
+        let metrics_tx = metrics_tx.clone();
         async move {
-            run_core(core_id, nr_cores, config, args).await;
+            run_core(core_id, nr_cores, config, args, metrics_tx).await;
         }
     });
 
@@ -270,8 +302,67 @@ fn register_with_coordinator(args: &Args, nr_cores: usize) {
     }
 }
 
+/// Dedicated off-reactor thread that batches per-database metrics from all
+/// cores and POSTs them to the coordinator's `/internal/metrics`.
+///
+/// Runs blocking `ureq` on its own thread — exactly like `register_with_coordinator`
+/// — so it never touches a Glommio reactor. Cores hand it JSON lines through a
+/// bounded, non-blocking channel; this side simply drains and ships. Failures are
+/// logged and the batch dropped (metrics are lossy-tolerant). Returns when the
+/// channel closes (all senders dropped, i.e. shutdown).
+fn metrics_shipper(coordinator: String, rx: std::sync::mpsc::Receiver<String>) {
+    use std::sync::mpsc::RecvTimeoutError;
+
+    const FLUSH_INTERVAL: Duration = Duration::from_secs(10);
+    const MAX_BATCH: usize = 512;
+
+    let url = format!("{}/internal/metrics", coordinator);
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(10))
+        .build();
+
+    loop {
+        // Block until a line arrives (waking periodically so a closed channel is noticed).
+        let first = match rx.recv_timeout(FLUSH_INTERVAL) {
+            Ok(line) => line,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+
+        // Grab everything else currently queued, up to a cap, into one batch.
+        let mut batch = Vec::with_capacity(16);
+        batch.push(first);
+        while batch.len() < MAX_BATCH {
+            match rx.try_recv() {
+                Ok(line) => batch.push(line),
+                Err(_) => break,
+            }
+        }
+
+        // Each line is already a JSON object; wrap them in an array without re-parsing.
+        let body = format!("[{}]", batch.join(","));
+        if let Err(e) = agent
+            .post(&url)
+            .set("Content-Type", "application/json")
+            .send_string(&body)
+        {
+            tracing::warn!(
+                "metrics push failed ({} samples dropped): {}",
+                batch.len(),
+                e
+            );
+        }
+    }
+}
+
 /// Run the main loop for a single core.
-async fn run_core(core_id: usize, nr_cores: usize, config: ExecutorPoolConfig, args: Args) {
+async fn run_core(
+    core_id: usize,
+    nr_cores: usize,
+    config: ExecutorPoolConfig,
+    args: Args,
+    metrics_tx: Option<std::sync::mpsc::SyncSender<String>>,
+) {
     tracing::debug!("Core {} starting", core_id);
 
     // Create task queues
@@ -307,7 +398,7 @@ async fn run_core(core_id: usize, nr_cores: usize, config: ExecutorPoolConfig, a
         template_path: args.template.clone(),
     };
 
-    let handler = CoreHandler::new(handler_config, compaction_tx);
+    let handler = CoreHandler::new(handler_config, compaction_tx, metrics_tx);
 
     // Create and run proxy listener on TCP task queue
     let listener = ProxyListener::new(
