@@ -1,0 +1,15 @@
+[package]
+name = "lark-compact"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "One-shot blob compaction utility for Lark databases."
+
+[dependencies]
+lark-blob = { path = "../../blob" }
+
+[[bin]]
+name = "lark-compact"
+path = "src/main.rs"

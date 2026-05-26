@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust — fmt, clippy, build, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # GitHub's Linux runners have io_uring, so the Rust workspace builds
+      # natively (no dev container needed). These mirror Dockerfile.dev's deps.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev liburing-dev clang mold
+
+      # Pinned to match rust-toolchain.toml + Dockerfile.dev (bump all three together).
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The steps below mirror `make fmt` / `make lint` / `make check` / `make test`.
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test (lib)
+        run: cargo test --workspace --lib
+
+  go:
+    name: Go edge — vet, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: edge/go.mod
+          cache-dependency-path: edge/go.sum
+
+      # Note: edge/dashboard/embed.go does `//go:embed all:dist`; the committed
+      # placeholder edge/dashboard/dist/index.html satisfies it without a full
+      # SPA build. (`make build-edge` builds the real dashboard.)
+      - name: Vet
+        working-directory: edge
+        run: go vet ./...
+
+      - name: Test
+        working-directory: edge
+        run: go test ./...

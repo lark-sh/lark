@@ -1,0 +1,10 @@
+node_modules/
+
+# Vite produces dist/ — but we keep the placeholder index.html committed
+# so the Go embed always finds something to compile against.
+dist/*
+!dist/index.html
+
+# Vite caches
+.vite/
+*.local

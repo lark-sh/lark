@@ -1,0 +1,83 @@
+# Single-host Lark stack.
+#
+# Brings up lark-edge (Go: admin dashboard + wire-protocol proxy) and
+# lark-server (Rust: DB engine). SQLite persists per-deployment state in
+# a named volume; lark-server's per-database WAL + blob files persist in
+# another. Plain HTTP throughout — browsers exempt *.localhost from
+# mixed-content rules, so this works for local dev without TLS gymnastics.
+#
+# Usage (from the repo root):
+#
+#   make up
+#   # or:
+#   docker compose up --build
+#
+# On first boot, lark-edge prints the temp admin password to its logs.
+# Browse to http://localhost:8080/admin/ and change it.
+
+services:
+  lark-edge:
+    build:
+      context: .
+      dockerfile: edge/Dockerfile
+    image: lark-edge:dev
+    container_name: lark-edge
+    ports:
+      - "8080:8080"
+    environment:
+      DISABLE_TLS: "true"
+      HTTPS_LISTEN_ADDR: ":8080"
+      # Internal HTTP listener (server-to-server: /internal/register,
+      # /internal/metrics). Kept on a separate port from the main HTTP
+      # listener and not published to the host — only reachable from
+      # within the docker network.
+      INTERNAL_LISTEN_ADDR: ":8081"
+      # Single hostname; lark-edge routes by Host header against this.
+      # Browsers resolve *.localhost to loopback automatically.
+      LARKDB_DOMAIN: "localhost"
+      # SQLite is the default driver
+      DATABASE_URL: "sqlite:///data/lark.db"
+      # Bring up the dashboard + admin API + first-boot bootstrap.
+      ADMIN_API_ENABLED: "true"
+      # Shared secret for backend (lark-server) auth. Change this in
+      # any non-throwaway deploy.
+      SERVER_SECRET: "${SERVER_SECRET:-dev-secret-change-me}"
+    volumes:
+      - lark-edge-data:/data
+    networks:
+      - lark
+
+  lark-server:
+    build:
+      # Repo root is the build context; the Dockerfile pulls in
+      # both `server/` and `blob/` from the workspace.
+      context: .
+      dockerfile: server/Dockerfile
+    image: lark-server:dev
+    container_name: lark-server
+    environment:
+      LARK_SERVER_ID: "lark-server-1"
+      LARK_HOSTNAME: "lark-server"
+      LARK_PUBLIC_IP: "lark-server"
+      LARK_PRIVATE_IP: "lark-server"
+      LARK_PROXY_PORT: "2727"
+      LARK_DATA_DIR: "/data"
+      # Registers with lark-edge's internal HTTP listener so the
+      # discovery loop on the other side learns about us.
+      LARK_COORDINATOR_URL: "http://lark-edge:8081"
+    volumes:
+      - lark-server-data:/data
+    # Glommio's io_uring needs the seccomp profile relaxed; this also
+    # lets the kernel set CPU affinity on the worker threads.
+    security_opt:
+      - seccomp:unconfined
+    networks:
+      - lark
+
+volumes:
+  lark-edge-data:
+  lark-server-data:
+
+networks:
+  lark:
+    driver: bridge

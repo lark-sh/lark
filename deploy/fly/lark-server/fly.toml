@@ -1,0 +1,30 @@
+# ── Fly.io: lark-server (private database tier) ──────────────────────────────
+#
+#   fly apps create lark-server
+#   fly volume create lark_server_data -a lark-server --region <region> --size 10
+#   fly secrets set SERVER_SECRET="<same-as-edge>" -a lark-server
+#   fly deploy . --config deploy/fly/lark-server/fly.toml --dockerfile server/Dockerfile
+
+app            = "lark-server"
+primary_region = "iad"          # ← must match the edge + volume region
+
+[env]
+  LARK_SERVER_ID       = "db-1"
+  LARK_HOSTNAME        = "db-1"   # not used for client routing in this topology
+  LARK_PROXY_PORT      = "2727"
+  LARK_PROXY_BIND      = "[::]"   # listen on IPv6 — Fly's 6PN private net is IPv6
+  LARK_PRIVATE_IP      = "lark-server.internal"   # address lark-edge dials back (6PN DNS)
+  LARK_CAPACITY        = "10000"
+  LARK_DATA_DIR        = "/data"
+  LARK_COORDINATOR_URL = "http://lark-edge.internal:8081"
+  RUST_LOG             = "info"
+
+[mounts]
+  source      = "lark_server_data"
+  destination = "/data"
+
+# Private only: no [http_service], no public IP. 6PN allows all ports between
+# apps in the same org, so :2727 is reachable by lark-edge without a service def.
+[[vm]]
+  size   = "performance-1x"
+  memory = "2gb"

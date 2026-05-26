@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "blob",
+    "server",
+    "tools/chaos-monkey",
+    "tools/lark-compact",
+]
+
+[workspace.package]
+edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://github.com/lark-sh/lark"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1  # Line tables — small, useful for backtraces and profiling.
+
+# Smaller debug info for faster test/dev builds.
+[profile.test]
+debug = "line-tables-only"
+
+[profile.dev]
+debug = "line-tables-only"

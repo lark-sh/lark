@@ -1,0 +1,83 @@
+[package]
+name = "lark-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Lark database engine: realtime database server."
+
+[features]
+default = ["jemalloc"]
+jemalloc = ["tikv-jemallocator"]
+
+[dependencies]
+# Memory allocator (better multi-threaded performance than glibc)
+tikv-jemallocator = { version = "0.7", optional = true }
+
+# Async runtime (thread-per-core with io_uring)
+glommio = "0.9"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+json5 = "1.3"  # For rules (supports comments and trailing commas)
+
+# Blob storage engine
+lark-blob = { path = "../blob" }
+
+# Data structures
+indexmap = "2"
+smallvec = { version = "1", features = ["serde"] }
+
+# Utilities
+base64 = "0.22"
+bytes = "1"
+thiserror = "2"
+tracing = { version = "0.1", features = ["max_level_debug"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+once_cell = "1"
+async-trait = "0.1"
+chrono = "0.4"
+regex = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# HTTP client (blocking, for coordinator registration)
+ureq = { version = "2", features = ["json"] }
+
+# Auth
+# v10 needs an explicit crypto backend (no default provider). rust_crypto is
+# pure-Rust (no C build deps); `use_pem` (default) stays on for Firebase PEM keys.
+jsonwebtoken = { version = "10.3", default-features = true, features = ["rust_crypto"] }
+
+# Compression
+zstd = "0.13"
+
+# Crypto
+sha1 = "0.10"
+sha2 = "0.10"
+hex = "0.4"
+serde_json_canonicalizer = "0.3"
+
+# Hashing (for consistent database-to-core mapping)
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+# File locking
+fs2 = "0.4"
+
+futures = "0.3"
+libc = "0.2"
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3"
+serde_urlencoded = "0.7"
+
+[[bin]]
+name = "lark-server"
+path = "src/main.rs"
+
+[[bench]]
+name = "throughput"
+harness = false

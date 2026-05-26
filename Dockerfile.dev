@@ -1,0 +1,38 @@
+# Dev container for the Rust workflow on a non-Linux host.
+#
+# Glommio uses io_uring (Linux 5.15+), so cargo check/build/test for
+# `lark-server` and `lark-blob` has to run inside a Linux container when
+# you're on macOS. Image is invoked from the Makefile (`make check`,
+# `make test`, `make shell`).
+#
+# Source is bind-mounted at /work; cargo's registry/git/target dirs live
+# in named Docker volumes so rebuilds stay fast across container runs.
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    clang \
+    curl \
+    git \
+    liburing-dev \
+    libssl-dev \
+    mold \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Toolchain pinned to match rust-toolchain.toml + CI (keep all three in sync).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain 1.95.0 --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# rustfmt + clippy aren't in the minimal profile, but `make fmt` / `make lint`
+# need them. Without this, both targets fail with "component not installed".
+RUN rustup component add rustfmt clippy
+
+WORKDIR /work
+
+CMD ["/bin/bash"]

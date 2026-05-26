@@ -1,0 +1,55 @@
+# Ephemeral test stack for ./test/run-firebase-sdk.sh.
+#
+# Runs side-by-side with the normal `make up` dev stack on different
+# ports + a separate network so the two never collide. No persistent
+# volumes — every `up` brings up a fresh state, which is what the
+# Firebase SDK test suite expects.
+
+services:
+  lark-edge-test:
+    build:
+      context: .
+      dockerfile: edge/Dockerfile
+    image: lark-edge:dev
+    container_name: lark-edge-test
+    ports:
+      # Test edge is on 8090 so it doesn't collide with the dev stack
+      # on 8080. RTDB_EMULATOR_PORT in the test runner matches this.
+      - "8090:8080"
+    environment:
+      DISABLE_TLS: "true"
+      HTTPS_LISTEN_ADDR: ":8080"
+      LARKDB_DOMAIN: "localhost"
+      LOCAL_MODE: "true"
+      LOCAL_BACKEND_ADDR: "lark-server-test:2727"
+      LOCAL_PROJECT_ID: "test-project"
+      SERVER_SECRET: "test-secret"
+      SESSION_SECRET: "test-session"
+    depends_on:
+      - lark-server-test
+    networks:
+      - lark-test
+
+  lark-server-test:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: lark-server:dev
+    container_name: lark-server-test
+    environment:
+      LARK_SERVER_ID: "lark-server-test-1"
+      LARK_HOSTNAME: "lark-server-test"
+      LARK_PUBLIC_IP: "lark-server-test"
+      LARK_PRIVATE_IP: "lark-server-test"
+      LARK_PROXY_PORT: "2727"
+      # --emulator: accept the "owner" token (LOCAL_MODE sends it),
+      # no coordinator registration, in-memory tree.
+      LARK_EMULATOR: "true"
+    security_opt:
+      - seccomp:unconfined
+    networks:
+      - lark-test
+
+networks:
+  lark-test:
+    driver: bridge

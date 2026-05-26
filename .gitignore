@@ -1,0 +1,49 @@
+# Rust
+target/
+**/target/
+*.rs.bk
+Cargo.lock.bak
+
+# Node / TS
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+# ...except the dashboard embed placeholder. edge/dashboard/embed.go does
+# `//go:embed all:dist`, so dist/index.html must exist on a fresh clone for the
+# Go build to compile. Built SPA assets stay ignored via edge/dashboard/.gitignore.
+!edge/dashboard/dist/
+!edge/dashboard/dist/index.html
+.vite/
+
+# Go
+*.out
+edge/edge
+edge/lark-edge
+
+# Built binaries (release artifacts from the Makefile)
+/lark-server
+/lark-edge
+
+# Local data directories used by docker-compose
+/data/
+/tmp-data/
+
+# On-demand test fixtures (firebase-js-sdk clone, etc.)
+/.cache/
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Generated per-deployment Fly configs (deploy/fly/quickstart.sh)
+deploy/fly/.gen/

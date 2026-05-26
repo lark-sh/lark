@@ -1,0 +1,28 @@
+# Anything we don't want shipped into the Docker build context.
+# The build context is the repo root for all images (dev + prod).
+
+# Build outputs — biggest offenders for context bloat.
+**/target/
+**/node_modules/
+**/dist/
+
+# Git history is large and not needed by any build.
+.git/
+.gitignore
+
+# Local data
+/data/
+/tmp-data/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Env
+.env
+.env.*
+
+/lark-server
+/lark-edge

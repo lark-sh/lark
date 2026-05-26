@@ -1,0 +1,21 @@
+[package]
+name = "lark-chaos-monkey"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+rand = "0.8"
+zstd = "0.13"
+libc = "0.2"
+anyhow = "1"
+lark-blob = { path = "../../blob" }

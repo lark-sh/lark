@@ -1,0 +1,10 @@
+# Pinned toolchain so rustfmt and clippy behave identically across local dev, the
+# Makefile dev container, and CI — otherwise a new `stable` silently changes
+# formatting / adds lints and turns CI red (which is exactly what happened).
+#
+# Bump deliberately, and keep these in sync when you do:
+#   - CI:            .github/workflows/ci.yml  (dtolnay/rust-toolchain@<version>)
+#   - Dev container: Dockerfile.dev            (--default-toolchain <version>)
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

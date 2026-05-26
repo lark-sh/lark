@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/lark-sh/lark/security/advisories/new
+    about: Please report vulnerabilities privately — do not open a public issue. See SECURITY.md.
+  - name: 💬 Questions & discussion
+    url: https://github.com/lark-sh/lark/discussions
+    about: For usage questions, ideas, and general discussion.

@@ -1,0 +1,41 @@
+# ── Fly.io: lark-edge (public gateway) ───────────────────────────────────────
+# The public tier. Fly terminates TLS at its edge and forwards decrypted HTTP
+# to port 8080 (so lark-edge runs DISABLE_TLS=true). WebSocket upgrades pass through Fly's HTTP
+# handler. UDP / WebTransport is intentionally skipped. Deploy from REPO ROOT:
+#
+#   fly apps create lark-edge
+#   fly volume create lark_edge_data -a lark-edge --region <region> --size 1
+#   fly secrets set SERVER_SECRET="<same-as-server>" -a lark-edge
+#   fly ips allocate-v4 -a lark-edge            # dedicated v4 for your domain
+#   fly deploy . --config deploy/fly/lark-edge/fly.toml --dockerfile edge/Dockerfile
+#
+# Then TLS + DNS (see README):
+#   fly certs add "*.db.example.com" -a lark-edge      # wildcard — clients hit <project>.db.example.com
+#   # add the wildcard DNS record(s) Fly tells you to, pointing at the v4 above
+
+app            = "lark-edge"
+primary_region = "iad"          # ← must match the server + volume region
+
+[env]
+  HTTPS_LISTEN_ADDR    = ":8080"            # Fly routes public 443 → 8080
+  INTERNAL_LISTEN_ADDR = ":8081"            # private 6PN; lark-server registers here
+  LARKDB_DOMAIN        = "db.example.com"   # clients hit <project>.db.example.com; admin at db.example.com/admin/ (quickstart.sh substitutes this)
+  DATABASE_URL         = "sqlite:///data/lark.db"
+  ADMIN_API_ENABLED    = "true"
+  DISABLE_TLS          = "true"             # Fly terminates TLS; lark-edge speaks plain HTTP
+  # SERVER_SECRET is set via `fly secrets set` (above), not here.
+
+[mounts]
+  source      = "lark_edge_data"
+  destination = "/data"
+
+[http_service]
+  internal_port        = 8080
+  force_https          = true
+  auto_stop_machines   = false
+  auto_start_machines  = true
+  min_machines_running = 1
+
+[[vm]]
+  size   = "shared-cpu-1x"
+  memory = "512mb"

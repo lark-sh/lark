@@ -1,0 +1,54 @@
+[package]
+name = "lark-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.lark-server]
+path = ".."
+default-features = false  # Disable jemalloc for fuzzing
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_rules_parser"
+path = "fuzz_targets/fuzz_rules_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_rules_lexer"
+path = "fuzz_targets/fuzz_rules_lexer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_path_parser"
+path = "fuzz_targets/fuzz_path_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_firebase_adapter"
+path = "fuzz_targets/fuzz_firebase_adapter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_proxy_protocol"
+path = "fuzz_targets/fuzz_proxy_protocol.rs"
+test = false
+doc = false
+bench = false
