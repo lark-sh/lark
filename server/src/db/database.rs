@@ -3123,6 +3123,49 @@ impl Database {
             ));
         }
 
+        // Validate every operation's paths AND the keys inside its value before
+        // anything else. Both the op path and the object field-names in the value
+        // become storage keys, so the same key rules (validate_key: non-empty, no
+        // control chars / `$ # [ ] /`, `.` only as a leading char, ≤768 bytes)
+        // must hold for all of them. Rejecting up front means malformed keys can't
+        // reach the rules evaluator or the WAL/blob writers, and it closes the
+        // rules-vs-storage tokenizer divergence (e.g. `users//abc` has an empty
+        // segment → rejected here, before the two tokenizers can disagree about
+        // where the write lands).
+        for op in operations {
+            let check = || -> Result<(), crate::db::KeyError> {
+                crate::db::validate_path(&op.path)?;
+                match (op.op.as_str(), &op.value) {
+                    // SET: the value's object keys become storage keys.
+                    ("s" | "set", Some(value)) => validate_value_keys(value)?,
+                    // UPDATE: each map key is a relative path appended to op.path
+                    // (validate the full landing path), and each update value's
+                    // own object keys become storage keys too.
+                    ("u" | "update", Some(Value::Object(map))) => {
+                        for (key, val) in map {
+                            let full = format!("{}/{}", op.path.trim_end_matches('/'), key);
+                            crate::db::validate_path(&full)?;
+                            validate_value_keys(val)?;
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            };
+            if let Err(e) = check() {
+                debug!(
+                    "NACK {}: invalid path/key in op at {:?}: {}",
+                    self.id, op.path, e
+                );
+                self.record_nacked_write(client_id, request_id);
+                return Some(ServerMessage::nack(
+                    request_id,
+                    error::INVALID_DATA,
+                    "invalid path or key",
+                ));
+            }
+        }
+
         // First, check permissions for all write operations
         for op in operations {
             if op.op == "c" {
@@ -5257,6 +5300,34 @@ impl Database {
     }
 }
 
+/// Recursively validate every object key in a written value.
+///
+/// Object field-names become storage keys, so the same restrictions that apply
+/// to path segments (`validate_key`: non-empty, no control chars or
+/// `$ # [ ] /`, `.` only as a leading char, ≤768 bytes) must hold for them too.
+/// Without this, a SET/UPDATE value could plant keys that no path can address
+/// (e.g. a literal `a/b` key) and that the rules layer assumes can't exist.
+/// Server-value and priority sentinels (`.sv`, `.priority`, `.value`) pass
+/// because `validate_key` permits a leading dot. Arrays carry no string keys, so
+/// we just recurse into their elements.
+fn validate_value_keys(value: &Value) -> Result<(), crate::db::KeyError> {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map {
+                crate::db::validate_key(k)?;
+                validate_value_keys(v)?;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                validate_value_keys(item)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Validate an authentication token and extract auth info.
 ///
 /// Uses the actual JWT validation from our auth module.
@@ -5468,6 +5539,22 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::Mutex;
+
+    #[test]
+    fn test_validate_value_keys() {
+        // Plain nested data is fine.
+        assert!(validate_value_keys(&json!({"a": {"b": [1, 2, {"c": 3}]}})).is_ok());
+        // Server-value / priority sentinels pass (leading-dot keys allowed).
+        assert!(validate_value_keys(&json!({"createdAt": {".sv": "timestamp"}})).is_ok());
+        assert!(validate_value_keys(&json!({".priority": 5, "name": "x"})).is_ok());
+        // A literal slash in an object key would become an unaddressable storage
+        // key — reject it (Firebase rejects it too).
+        assert!(validate_value_keys(&json!({"a/b": 1})).is_err());
+        // Other forbidden key chars, nested, are caught by the recursion.
+        assert!(validate_value_keys(&json!({"ok": {"bad$key": 1}})).is_err());
+        assert!(validate_value_keys(&json!({"arr": [{"in.mid": 1}]})).is_err());
+        assert!(validate_value_keys(&json!({"": 1})).is_err());
+    }
 
     #[test]
     fn test_path_matches_pattern() {

@@ -552,6 +552,20 @@ mod tests {
         assert!(validate_path("/users/ab\x00c").is_err());
     }
 
+    #[test]
+    fn test_validate_path_rejects_internal_empty_segment() {
+        // Security: `users//abc` tokenizes to a real ""-keyed segment in storage
+        // (`Path::parse` keeps empties) but collapses to `users/abc` in the rules
+        // matcher (`find_rules_on_path` skips empties) — a confused-deputy shape.
+        // Enforcing validate_path at the write boundary rejects it before that
+        // divergence can matter.
+        assert!(validate_path("/users//abc").is_err());
+        assert!(validate_path("users//abc").is_err());
+        assert!(validate_path("a//b//c").is_err());
+        // Leading/trailing slashes are trimmed (not internal empties) → fine.
+        assert!(validate_path("//users/abc//").is_ok());
+    }
+
     // =========================================================================
     // Path operations tests (additional tests for join, parent, etc.)
     // =========================================================================
