@@ -2957,7 +2957,7 @@ impl Database {
             op::SUBSCRIBE => self.handle_subscribe(client_id, &msg).await,
             op::UNSUBSCRIBE => self.handle_unsubscribe(client_id, &msg),
             op::ONCE => self.handle_once(client_id, &msg).await,
-            op::ON_DISCONNECT => self.handle_on_disconnect(client_id, &msg),
+            op::ON_DISCONNECT => self.handle_on_disconnect(client_id, &msg).await,
             op::TRANSACTION => self.handle_transaction(client_id, &msg).await,
             op::LEAVE => {
                 // Leave is a graceful disconnect - trigger ondisconnect hooks
@@ -4110,6 +4110,17 @@ impl Database {
         let path_str = msg.path.as_deref().unwrap_or("/");
         let path = Path::parse(path_str);
 
+        // Reject malformed read paths so the rules matcher and the tree can't
+        // tokenize them differently. (No write impact, but keeps read-side auth
+        // consistent with the write paths.)
+        if crate::db::validate_path(path_str).is_err() {
+            return Some(ServerMessage::nack(
+                request_id,
+                error::INVALID_DATA,
+                "invalid path",
+            ));
+        }
+
         // Parse query parameters (only build rules query HashMap if rules use query.*)
         let query_params = QueryParams::from_message(msg);
         let rules_query = if self.rules_use_query() {
@@ -4302,6 +4313,15 @@ impl Database {
         let request_id = msg.request_id.as_deref().unwrap_or("");
         let path_str = msg.path.as_deref().unwrap_or("/");
         let path = Path::parse(path_str);
+
+        // Reject malformed read paths (see handle_subscribe).
+        if crate::db::validate_path(path_str).is_err() {
+            return Some(ServerMessage::nack(
+                request_id,
+                error::INVALID_DATA,
+                "invalid path",
+            ));
+        }
 
         // Only build query HashMap if rules reference query.*
         let rules_query = if self.rules_use_query() {
@@ -4756,7 +4776,7 @@ impl Database {
     // OnDisconnect
     // =========================================================================
 
-    fn handle_on_disconnect(
+    async fn handle_on_disconnect(
         &mut self,
         client_id: &str,
         msg: &ClientMessage,
@@ -4767,6 +4787,54 @@ impl Database {
 
         match action {
             "s" | "u" | "d" => {
+                // Deferred writes are applied directly to the tree + WAL on
+                // disconnect (handle_disconnect), bypassing the live write
+                // handlers — so the same checks must happen here, at registration:
+
+                // 1. Path/key validity (empty/odd segments, control chars,
+                //    `$ # [ ] /`, literal-slash value keys, >768-byte keys).
+                let keys_ok = crate::db::validate_path(path_str).is_ok()
+                    && match (action, &msg.value) {
+                        ("s", Some(v)) => validate_value_keys(v).is_ok(),
+                        ("u", Some(Value::Object(map))) => map.iter().all(|(k, val)| {
+                            crate::db::validate_path(&format!(
+                                "{}/{}",
+                                path_str.trim_end_matches('/'),
+                                k
+                            ))
+                            .is_ok()
+                                && validate_value_keys(val).is_ok()
+                        }),
+                        _ => true,
+                    };
+                if !keys_ok {
+                    return Some(ServerMessage::nack(
+                        request_id,
+                        error::INVALID_DATA,
+                        "invalid path or key",
+                    ));
+                }
+
+                // 2. Security rules. Evaluate onDisconnect writes
+                //    against rules when they're established, using the
+                //    registering client's auth — do the same so a deferred write
+                //    can't reach a path the client isn't allowed to write.
+                let new_data = match (action, msg.value.clone()) {
+                    ("s", Some(v)) => Some(NewData::from_set(path_str.to_string(), v)),
+                    ("u", Some(Value::Object(map))) => {
+                        Some(NewData::from_update(path_str.to_string(), map))
+                    }
+                    _ => None,
+                };
+                if !self.can_write(client_id, path_str, new_data).await {
+                    self.metrics.record_permission_denial();
+                    return Some(ServerMessage::nack(
+                        request_id,
+                        error::PERMISSION_DENIED,
+                        "write permission denied",
+                    ));
+                }
+
                 let disconnect_action = DisconnectAction {
                     path: path_str.to_string(),
                     action: action.to_string(),
@@ -5811,6 +5879,78 @@ mod tests {
                 db.tree.read().unwrap().get_value_str("/users/abc"),
                 Some(json!({"name": "Alice"}))
             );
+        })
+    }
+
+    #[test]
+    fn test_on_disconnect_enforces_rules_and_validation() {
+        // Security audit follow-up: onDisconnect deferred writes are applied
+        // directly to the tree/WAL on disconnect, so they must be rules-checked
+        // AND path/key-validated at registration — not left as a write-anywhere
+        // primitive that bypasses security rules.
+        block_on(async {
+            let mut db = Database::new("test".to_string(), "test-project".to_string(), true);
+            let (conn, _messages) = MockConnection::new();
+            db.add_client_internal("client1", None, "conn1", conn);
+
+            let rules = crate::rules::parse_rules(&json!({
+                "rules": {
+                    "locked": { ".write": false },
+                    "open":   { ".write": true }
+                }
+            }))
+            .unwrap();
+            db.set_rules(rules);
+
+            // 1. Deferred write to a rules-denied path → NACK, not registered.
+            let msg = ClientMessage {
+                path: Some("/locked".to_string()),
+                action: Some("s".to_string()),
+                value: Some(json!("x")),
+                request_id: Some("r1".to_string()),
+                ..Default::default()
+            };
+            let resp = db
+                .handle_on_disconnect("client1", &msg)
+                .await
+                .expect("resp");
+            assert_eq!(resp.error.as_deref(), Some(error::PERMISSION_DENIED));
+
+            // 2. Deferred write with a malformed path → NACK INVALID_DATA.
+            let msg = ClientMessage {
+                path: Some("/open//x".to_string()),
+                action: Some("s".to_string()),
+                value: Some(json!("x")),
+                request_id: Some("r2".to_string()),
+                ..Default::default()
+            };
+            let resp = db
+                .handle_on_disconnect("client1", &msg)
+                .await
+                .expect("resp");
+            assert_eq!(resp.error.as_deref(), Some(error::INVALID_DATA));
+
+            // 3. An allowed, well-formed deferred write → ACK, and it fires.
+            let msg = ClientMessage {
+                path: Some("/open/ok".to_string()),
+                action: Some("s".to_string()),
+                value: Some(json!("v")),
+                request_id: Some("r3".to_string()),
+                ..Default::default()
+            };
+            let resp = db
+                .handle_on_disconnect("client1", &msg)
+                .await
+                .expect("resp");
+            assert!(resp.nack.is_none(), "allowed onDisconnect should ack");
+
+            // Fire deferred actions; only the allowed one should have been kept.
+            db.handle_disconnect("client1").await;
+            assert_eq!(
+                db.tree.read().unwrap().get_value_str("/open/ok"),
+                Some(json!("v"))
+            );
+            assert_eq!(db.tree.read().unwrap().get_value_str("/locked"), None);
         })
     }
 
