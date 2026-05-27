@@ -62,7 +62,9 @@ help:
 	@echo "  make build-edge    Just lark-edge (Linux/amd64; also builds the SPA)."
 	@echo "  make build-spa     Just the dashboard SPA (Vite, into edge/dashboard/dist)."
 	@echo ""
-	@echo "  make up          docker compose up --build."
+	@echo "  make up          docker compose up --build (compiles from source)."
+	@echo "  make up-release  docker compose up using prebuilt GHCR images (fast; no toolchain)."
+	@echo "  make pull-release  Pull the latest published images without starting them."
 	@echo "  make down        docker compose down."
 	@echo "  make reset       docker compose down -v (also drops data volumes — wipes SQLite + per-DB blobs)."
 	@echo "  make logs        docker compose logs -f."
@@ -150,6 +152,16 @@ up: .env
 	@command -v openssl >/dev/null 2>&1 || { echo "openssl not found: create .env with SERVER_SECRET set to a 32+ byte random value (e.g. from another generator)"; exit 1; }
 	@printf 'SERVER_SECRET=%s\n' "$$(openssl rand -hex 32)" > .env
 	@echo "Generated .env with a random SERVER_SECRET."
+
+# Run the stack from prebuilt GHCR images (docker-compose.prod.yml) instead of
+# compiling. Reuses the same .env / SERVER_SECRET generation as `make up`.
+.PHONY: up-release
+up-release: .env
+	docker compose -f docker-compose.prod.yml up
+
+.PHONY: pull-release
+pull-release:
+	docker compose -f docker-compose.prod.yml pull
 
 .PHONY: down
 down:

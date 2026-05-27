@@ -1,0 +1,197 @@
+name: Release
+
+# Builds and publishes multi-arch (linux/amd64 + linux/arm64) container images
+# for lark-server and lark-edge to the GitHub Container Registry (GHCR).
+#
+# Each architecture is built on a NATIVE runner (amd64 on ubuntu-24.04, arm64 on
+# ubuntu-24.04-arm) — no QEMU emulation, so the Glommio Rust engine compiles at
+# full speed. The per-arch images are pushed by digest, then stitched into a
+# single multi-arch tag so `docker pull` resolves to the right arch automatically
+# (native on Apple Silicon Macs and amd64 cloud hosts alike).
+#
+# Two ways to run it:
+#   * push a semver tag (`v0.1.0`) — the real release path. Always builds both
+#     arches, publishes versioned tags (0.1.0, 0.1, latest), and cuts a Release.
+#   * trigger manually (Actions → Release → Run workflow) — for validating the
+#     pipeline. Images publish as PRIVATE packages tagged with branch + short SHA.
+#
+# WHILE THE REPO IS PRIVATE: the free `ubuntu-24.04-arm` runners are
+# public-repos-only, so the arm64 leg can't be scheduled yet. Use the manual
+# trigger with the `platforms` input set to `amd64` to exercise the full
+# build → push → manifest flow in CI. To validate the arm64 image before going
+# public, build it natively on an Apple Silicon Mac and push to your private GHCR:
+#
+#   docker buildx build --platform linux/arm64 \
+#     -f server/Dockerfile -t ghcr.io/lark-sh/lark-server:arm64-test --push .
+#
+# GOING PUBLIC: a one-time step, no workflow change needed — flip each package's
+# visibility to public (org → Packages → settings) so anonymous `docker pull`
+# works. After that, tag pushes build both arches automatically.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Architectures to build"
+        type: choice
+        default: amd64+arm64
+        options:
+          - amd64+arm64
+          - amd64
+
+permissions:
+  contents: write   # create the GitHub Release on tag pushes
+  packages: write   # push images to GHCR
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Resolve which architectures to build into a matrix. Tag pushes always build
+  # both; manual runs honor the `platforms` input (so amd64-only works while the
+  # arm64 runners are still out of reach on a private repo).
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      platforms: ${{ steps.set.outputs.platforms }}
+    steps:
+      - id: set
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.platforms }}" = "amd64" ]; then
+            echo 'platforms=[{"arch":"amd64","runner":"ubuntu-24.04"}]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'platforms=[{"arch":"amd64","runner":"ubuntu-24.04"},{"arch":"arm64","runner":"ubuntu-24.04-arm"}]' >> "$GITHUB_OUTPUT"
+          fi
+
+  # One job per (image × arch), each on its native runner. Pushes by digest only
+  # — tags are applied later in `merge` so both arches land under the same tag.
+  build:
+    needs: prepare
+    name: Build ${{ matrix.image.name }} (${{ matrix.platform.arch }})
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: lark-server
+            dockerfile: server/Dockerfile
+          - name: lark-edge
+            dockerfile: edge/Dockerfile
+        platform: ${{ fromJSON(needs.prepare.outputs.platforms) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image.name }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.image.dockerfile }}
+          platforms: linux/${{ matrix.platform.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Push by digest; the multi-arch tag is assembled in the merge job.
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.image.name }}-${{ matrix.platform.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}-${{ matrix.platform.arch }}
+
+      - name: Export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.image.name }}-${{ matrix.platform.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Combine the per-arch digests for each image into one multi-arch tag list.
+  merge:
+    needs: build
+    name: Publish ${{ matrix.image }} manifest
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - lark-server
+          - lark-edge
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.image }}-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          # latest=auto → `latest` is applied on semver tag builds only.
+          flavor: latest=auto
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+            type=sha,format=short
+
+      - name: Create and push manifest list
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}@sha256:%s ' *)
+
+      - name: Inspect
+        run: |
+          docker buildx imagetools inspect \
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ steps.meta.outputs.version }}
+
+  release:
+    name: GitHub Release
+    needs: merge
+    runs-on: ubuntu-latest
+    # Only when a version tag was pushed — manual runs just publish images.
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          # Pre-1.0: tag a prerelease if the version carries a suffix (e.g. -rc1).
+          prerelease: ${{ contains(github.ref_name, '-') }}
