@@ -196,9 +196,9 @@ fn test_blob_read_various_types() {
         assert_eq!(client.once("/bool_true").await.unwrap(), json!(true));
         assert_eq!(client.once("/bool_false").await.unwrap(), json!(false));
 
+        // Integer-keyed objects render as arrays on read.
         let nested = client.once("/nested/array_like").await.unwrap();
-        assert_eq!(nested["0"], json!("first"));
-        assert_eq!(nested["2"], json!("third"));
+        assert_eq!(nested, json!(["first", "second", "third"]));
 
         client.disconnect().await;
     });

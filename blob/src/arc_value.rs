@@ -41,9 +41,16 @@ impl ArcValue {
             Value::Bool(b) => ArcValue::Bool(b),
             Value::Number(n) => ArcValue::Number(n),
             Value::String(s) => ArcValue::String(Arc::from(s)),
+            // Arrays are stored as integer-keyed maps, keyed by element index;
+            // null elements are dropped, leaving their index as a gap.
             Value::Array(arr) => {
-                let converted: Vec<ArcValue> = arr.into_iter().map(ArcValue::from_value).collect();
-                ArcValue::Array(Arc::new(converted))
+                let converted: HashMap<String, ArcValue> = arr
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, v)| !v.is_null())
+                    .map(|(i, v)| (i.to_string(), ArcValue::from_value(v)))
+                    .collect();
+                ArcValue::Object(Arc::new(converted))
             }
             Value::Object(map) => {
                 let converted: HashMap<String, ArcValue> = map
@@ -65,11 +72,7 @@ impl ArcValue {
                 let converted: Vec<Value> = arr.iter().map(|v| v.to_value()).collect();
                 Value::Array(converted)
             }
-            ArcValue::Object(map) => {
-                let converted: Map<String, Value> =
-                    map.iter().map(|(k, v)| (k.clone(), v.to_value())).collect();
-                Value::Object(converted)
-            }
+            ArcValue::Object(map) => object_to_value(map),
         }
     }
 
@@ -588,19 +591,18 @@ impl ArcValue {
                     Some(ArcValue::Object(Arc::new(cleaned)))
                 }
             }
+            // Drop null/empty elements; surviving elements keep their original
+            // index as the map key, leaving gaps for the dropped ones.
             ArcValue::Array(arr) => {
-                if arr.is_empty() {
-                    return None;
-                }
-                let cleaned: Vec<ArcValue> = arr
+                let cleaned: HashMap<String, ArcValue> = arr
                     .iter()
-                    .map(|v| v.clone().clean().unwrap_or(ArcValue::Null))
+                    .enumerate()
+                    .filter_map(|(i, v)| v.clone().clean().map(|cv| (i.to_string(), cv)))
                     .collect();
-                let has_non_null = cleaned.iter().any(|v| !v.is_null());
-                if !has_non_null {
+                if cleaned.is_empty() {
                     None
                 } else {
-                    Some(ArcValue::Array(Arc::new(cleaned)))
+                    Some(ArcValue::Object(Arc::new(cleaned)))
                 }
             }
             ArcValue::Sentinel(_) => Some(self), // Sentinel is never cleaned away
@@ -614,19 +616,20 @@ impl ArcValue {
             Value::Bool(b) => Some(ArcValue::Bool(b)),
             Value::Number(n) => Some(ArcValue::Number(n)),
             Value::String(s) => Some(ArcValue::String(Arc::from(s))),
+            // Stored as an integer-keyed map; null/empty elements are dropped and
+            // their indices become gaps.
             Value::Array(arr) => {
-                if arr.is_empty() {
-                    return None;
-                }
-                let cleaned: Vec<ArcValue> = arr
+                let cleaned: HashMap<String, ArcValue> = arr
                     .into_iter()
-                    .map(|v| ArcValue::from_value_cleaned(v).unwrap_or(ArcValue::Null))
+                    .enumerate()
+                    .filter_map(|(i, v)| {
+                        ArcValue::from_value_cleaned(v).map(|cv| (i.to_string(), cv))
+                    })
                     .collect();
-                let has_non_null = cleaned.iter().any(|v| !v.is_null());
-                if !has_non_null {
+                if cleaned.is_empty() {
                     None
                 } else {
-                    Some(ArcValue::Array(Arc::new(cleaned)))
+                    Some(ArcValue::Object(Arc::new(cleaned)))
                 }
             }
             Value::Object(map) => {
@@ -769,13 +772,31 @@ impl Serialize for ArcValue {
                 }
                 seq.end()
             }
-            ArcValue::Object(map) => {
-                let mut obj = serializer.serialize_map(Some(map.len()))?;
-                for (k, v) in map.iter() {
-                    obj.serialize_entry(k, v)?;
+            ArcValue::Object(map) => match array_max_index(map) {
+                Some(max) => {
+                    let len = (max as usize) + 1;
+                    let mut slots: Vec<Option<&ArcValue>> = vec![None; len];
+                    for (k, v) in map.iter() {
+                        let i: usize = k.parse().expect("canonical integer key");
+                        slots[i] = Some(v);
+                    }
+                    let mut seq = serializer.serialize_seq(Some(len))?;
+                    for slot in slots {
+                        match slot {
+                            Some(v) => seq.serialize_element(v)?,
+                            None => seq.serialize_element(&Value::Null)?,
+                        }
+                    }
+                    seq.end()
                 }
-                obj.end()
-            }
+                None => {
+                    let mut obj = serializer.serialize_map(Some(map.len()))?;
+                    for (k, v) in map.iter() {
+                        obj.serialize_entry(k, v)?;
+                    }
+                    obj.end()
+                }
+            },
             ArcValue::Sentinel(_) => Err(S::Error::custom(
                 "attempted to serialize ArcValue::Sentinel — sentinels are in-memory only",
             )),
@@ -791,6 +812,47 @@ impl<'de> Deserialize<'de> for ArcValue {
         let value = Value::deserialize(deserializer)?;
         Ok(ArcValue::from_value(value))
     }
+}
+
+/// Convert a stored object map to JSON, rendering it as an array when it is
+/// non-empty, every key is a canonical non-negative integer, and
+/// `maxKey < 2 * numKeys`. Otherwise it renders as an object. When rendered as
+/// an array, absent indices in `[0, maxKey]` are filled with `null`.
+fn object_to_value(map: &HashMap<String, ArcValue>) -> Value {
+    match array_max_index(map) {
+        Some(max) => {
+            let mut arr = vec![Value::Null; (max as usize) + 1];
+            for (k, v) in map.iter() {
+                // array_max_index guarantees every key parses as an index.
+                let i: usize = k.parse().expect("canonical integer key");
+                arr[i] = v.to_value();
+            }
+            Value::Array(arr)
+        }
+        None => {
+            let converted: Map<String, Value> =
+                map.iter().map(|(k, v)| (k.clone(), v.to_value())).collect();
+            Value::Object(converted)
+        }
+    }
+}
+
+/// Returns `Some(maxKey)` when `map` should render as an array, else `None`.
+/// A key is a canonical integer only if it equals the plain decimal form of its
+/// value (rejects leading zeros, signs, non-numeric, and empty keys).
+fn array_max_index(map: &HashMap<String, ArcValue>) -> Option<u64> {
+    if map.is_empty() {
+        return None;
+    }
+    let mut max: u64 = 0;
+    for k in map.keys() {
+        let n: u64 = k.parse().ok()?;
+        if *k != n.to_string() {
+            return None;
+        }
+        max = max.max(n);
+    }
+    ((max as u128) < 2 * (map.len() as u128)).then_some(max)
 }
 
 impl From<Value> for ArcValue {
@@ -893,10 +955,12 @@ mod tests {
 
     #[test]
     fn test_from_value_array() {
+        // Arrays are stored as integer-keyed objects, and render back as arrays.
         let v = ArcValue::from_value(json!([1, 2, 3]));
-        assert!(v.is_array());
-        assert_eq!(v.len(), 3);
-        assert_eq!(v.get_index(0).unwrap().as_i64(), Some(1));
+        assert!(v.is_object());
+        assert_eq!(v.get("0").unwrap().as_i64(), Some(1));
+        assert_eq!(v.get("2").unwrap().as_i64(), Some(3));
+        assert_eq!(v.to_value(), json!([1, 2, 3]));
     }
 
     #[test]

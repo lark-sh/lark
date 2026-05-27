@@ -1669,16 +1669,12 @@ mod tests {
         });
     }
 
-    /// Null elements in arrays must survive structural_copy.
-    ///
-    /// In collections, TYPE_NULL means "deleted" and should be stripped.
-    /// In arrays, null is a valid positional element — stripping it shifts
-    /// later elements and corrupts the elem_count vs header_region_size
-    /// (the reader computes wrong offsets into the elements area).
+    /// Compaction round-trips integer-keyed objects exactly, including the gaps
+    /// left by dropped null elements, so nested arrays render back unchanged.
     #[test]
-    fn test_structural_copy_preserves_array_nulls() {
+    fn test_structural_copy_preserves_array_gaps() {
         block_on(async {
-            let tree = ArcValue::from_value(json!({
+            let original = json!({
                 "data": {
                     "root": [
                         [null, null, ["a", "b"], ["c", "d"]],
@@ -1687,7 +1683,8 @@ mod tests {
                         {"nested": [null, 1, null, 2]}
                     ]
                 }
-            }));
+            });
+            let tree = ArcValue::from_value(original.clone());
             let src = MemBlobIO::new();
             write_blob(&src, &tree).await.unwrap();
 
@@ -1695,31 +1692,39 @@ mod tests {
             full_compact(&src, &dst).await.unwrap();
 
             let result = read_root(&dst).await;
+            // Compaction round-trips the stored tree exactly,
             assert_eq!(result, tree);
+            // and it renders back to the original arrays, with nulls at the
+            // positions of the dropped (gap) elements.
+            assert_eq!(result.to_value(), original);
+        });
+    }
 
-            // Verify specific null positions survived
-            let root_arr = read_at_path(&dst, &["data", "root"]).await;
-            let arr = root_arr.as_array().unwrap();
-            assert_eq!(arr.len(), 4);
+    /// Legacy on-disk arrays (TYPE_ARRAY) decode to integer-keyed objects on
+    /// read, so existing blobs migrate transparently and still render as arrays.
+    #[test]
+    fn test_legacy_on_disk_array_migrates_to_object() {
+        block_on(async {
+            // A native array writes the legacy TYPE_ARRAY form on disk.
+            let legacy = ArcValue::Array(std::sync::Arc::new(vec![
+                ArcValue::String("a".into()),
+                ArcValue::Null,
+                ArcValue::String("c".into()),
+            ]));
+            let tree = ArcValue::Object(std::sync::Arc::new(
+                [("arr".to_string(), legacy)].into_iter().collect(),
+            ));
+            let io = MemBlobIO::new();
+            write_blob(&io, &tree).await.unwrap();
 
-            // arr[0] = [null, null, ["a","b"], ["c","d"]]
-            let inner = arr[0].as_array().unwrap();
-            assert_eq!(inner.len(), 4);
-            assert_eq!(inner[0], ArcValue::Null);
-            assert_eq!(inner[1], ArcValue::Null);
-            assert_eq!(inner[2].as_array().unwrap().len(), 2);
-            assert_eq!(inner[3].as_array().unwrap().len(), 2);
-
-            // arr[1] = null
-            assert_eq!(arr[1], ArcValue::Null);
-
-            // arr[2] = [null, "x", null, "y"]
-            let mixed = arr[2].as_array().unwrap();
-            assert_eq!(mixed.len(), 4);
-            assert_eq!(mixed[0], ArcValue::Null);
-            assert_eq!(mixed[1].as_str(), Some("x"));
-            assert_eq!(mixed[2], ArcValue::Null);
-            assert_eq!(mixed[3].as_str(), Some("y"));
+            // On read it is an integer-keyed object; the null became a gap.
+            let arr = read_at_path(&io, &["arr"]).await;
+            assert!(arr.is_object());
+            assert_eq!(arr.get("0").unwrap().as_str(), Some("a"));
+            assert!(arr.get("1").is_none());
+            assert_eq!(arr.get("2").unwrap().as_str(), Some("c"));
+            // ...and it renders back as the array with the gap as null.
+            assert_eq!(arr.to_value(), json!(["a", null, "c"]));
         });
     }
 }
