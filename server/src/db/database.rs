@@ -2513,8 +2513,20 @@ impl Database {
             token.insert(k.clone(), v.clone());
         }
 
+        // Normalize an empty uid to absent. Firebase Legacy Tokens authenticate
+        // with uid == "" (identity lives in the `d` claims), so the principal is
+        // still authenticated via its token, but `auth.uid` must read as null —
+        // otherwise a rule like `auth.uid === $uid` would spuriously match an
+        // empty captured path segment. See convert_auth (truly anonymous users
+        // are already dropped there).
+        let uid = if auth.uid.is_empty() {
+            None
+        } else {
+            Some(auth.uid.clone())
+        };
+
         Arc::new(RulesAuthInfo::new(
-            Some(auth.uid.clone()),
+            uid,
             Some(auth.provider.clone()),
             if token.is_empty() { None } else { Some(token) },
             auth.is_admin,
@@ -5671,6 +5683,54 @@ mod tests {
         assert!(validate_value_keys(&json!({"ok": {"bad$key": 1}})).is_err());
         assert!(validate_value_keys(&json!({"arr": [{"in.mid": 1}]})).is_err());
         assert!(validate_value_keys(&json!({"": 1})).is_err());
+    }
+
+    #[test]
+    fn test_convert_auth_to_rules_normalizes_empty_uid() {
+        // Firebase Legacy Tokens authenticate with uid == "" and carry identity
+        // in their claims. The principal must stay authenticated (auth != null),
+        // but auth.uid must read as absent so `auth.uid === $uid` can't match an
+        // empty captured path segment.
+        let legacy = AuthInfo {
+            uid: String::new(),
+            provider: "custom".to_string(),
+            token: HashMap::from([("role".to_string(), json!("editor"))]),
+            is_admin: false,
+        };
+        let rules_auth = Database::convert_auth_to_rules(&legacy);
+        let map = rules_auth
+            .to_json()
+            .expect("legacy token with claims must be authenticated (auth != null)");
+        assert!(
+            !map.contains_key("uid"),
+            "empty uid must not appear as auth.uid"
+        );
+        assert_eq!(map.get("role"), Some(&json!("editor")));
+
+        // A normal authenticated user keeps its uid verbatim.
+        let normal = AuthInfo {
+            uid: "user-123".to_string(),
+            provider: "google".to_string(),
+            token: HashMap::new(),
+            is_admin: false,
+        };
+        let rules_auth = Database::convert_auth_to_rules(&normal);
+        let map = rules_auth.to_json().expect("auth != null");
+        assert_eq!(map.get("uid"), Some(&json!("user-123")));
+
+        // A claimless empty-uid token has no identity at all → auth == null.
+        let identityless = AuthInfo {
+            uid: String::new(),
+            provider: "custom".to_string(),
+            token: HashMap::new(),
+            is_admin: false,
+        };
+        assert!(
+            Database::convert_auth_to_rules(&identityless)
+                .to_json()
+                .is_none(),
+            "an empty-uid, claimless token carries no identity and must be auth == null"
+        );
     }
 
     #[test]
