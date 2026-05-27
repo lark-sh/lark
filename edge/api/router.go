@@ -35,6 +35,9 @@ type Server struct {
 	// updates, evictions) to the proxy caches and backends. Admin write
 	// handlers call into this directly after committing their DB write.
 	notifyHandler notify.Handler
+
+	// loginThrottle slows repeated failed admin logins per account (audit L-2).
+	loginThrottle *loginThrottle
 }
 
 // BackendPool is the interface for checking backend health
@@ -45,9 +48,10 @@ type BackendPool interface {
 // New creates a new API server
 func New(cfg *config.Config, database db.Store) *Server {
 	s := &Server{
-		config: cfg,
-		db:     database,
-		mux:    http.NewServeMux(),
+		config:        cfg,
+		db:            database,
+		mux:           http.NewServeMux(),
+		loginThrottle: newLoginThrottle(),
 	}
 
 	s.registerRoutes()
