@@ -184,6 +184,12 @@ pub mod error {
     pub const RESPONSE_TOO_LARGE: &str = "response_too_large";
     pub const CONDITION_FAILED: &str = "condition_failed";
     pub const TOO_MANY_CONNECTIONS: &str = "too_many_connections";
+    /// Client exceeded the per-connection subscription cap.
+    pub const TOO_MANY_SUBSCRIPTIONS: &str = "too_many_subscriptions";
+    /// Database is at its maximum size; growth writes are rejected (deletes still allowed).
+    pub const DATABASE_FULL: &str = "database_full";
+    /// Per-database durable-write rate exceeded; retryable.
+    pub const RATE_LIMITED: &str = "rate_limited";
     /// Segment or storage unavailable - client should retry
     pub const UNAVAILABLE: &str = "unavailable";
 }

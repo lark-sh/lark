@@ -181,6 +181,14 @@ impl DatabaseMetrics {
         self.data_size_bytes.store(bytes, Ordering::Relaxed);
     }
 
+    /// Current on-disk data size in bytes. Refreshed periodically (every ~60s
+    /// via `refresh_data_size`), so this is an approximate, slightly-stale view
+    /// — fine for a coarse size cap, not for exact accounting.
+    #[inline]
+    pub fn data_size(&self) -> u64 {
+        self.data_size_bytes.load(Ordering::Relaxed)
+    }
+
     // =========================================================================
     // Emission (called periodically - every 60s for active databases)
     // =========================================================================

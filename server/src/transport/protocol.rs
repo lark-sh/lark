@@ -17,8 +17,13 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// Header size: [Length:4][Type:1][ClientID:4]
 pub const HEADER_SIZE: usize = 9;
 
-/// Maximum message size (17MB: 16MB data + overhead)
-pub const MAX_MESSAGE_SIZE: usize = 17 << 20;
+/// Maximum proxy↔server message size (257MB: 256MB data + overhead).
+///
+/// This must accommodate the largest write the edge will forward. SDK/WebSocket
+/// writes are capped at `MAX_WRITE_SIZE` (16MB), but REST writes are allowed up
+/// to 256MB (matching Firebase's REST limit; enforced by the edge's
+/// `http.MaxBytesReader` and the Go side's `MaxMessageSize = 256MB`).
+pub const MAX_MESSAGE_SIZE: usize = 257 << 20;
 
 // =============================================================================
 // Proxy -> Server Message Types

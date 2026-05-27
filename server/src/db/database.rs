@@ -48,7 +48,7 @@ use lark_blob::{BlobError, BlobIO, BlobSession, CachedIO, ReadStats, ShallowValu
 
 use crate::db::firebase_hash::{compute_firebase_hash, is_firebase_hash};
 use crate::db::query::{QueryError, QueryParams};
-use crate::db::subscription::{MutationEvent, ViewManager};
+use crate::db::subscription::{MutationEvent, SubscribeError, ViewManager};
 use crate::db::value::ArcValueSortExt;
 use crate::db::{ArcValue, Path, Tree};
 use crate::protocol::{ClientMessage, ServerMessage, error, op};
@@ -435,6 +435,100 @@ pub fn set_eviction_idle_secs(secs: u64) {
     EVICTION_IDLE_SECS.store(secs, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Maximum on-disk size of a single database. Growth writes (set/update/
+/// transaction) are rejected once the database reaches this; deletes are still
+/// allowed so the owner can recover under the cap. Enforcement is approximate —
+/// it reads the periodically-refreshed `data_size` gauge (~60s cadence), so a
+/// burst can overshoot slightly, which is fine for a 1 TB runaway-cost backstop.
+const MAX_DATABASE_SIZE_BYTES: u64 = 1024 * 1024 * 1024 * 1024; // 1 TiB
+
+/// Maximum number of operations in a single transaction. Each condition op
+/// triggers a `promote_path_deep` (blob read + WAL replay) on the database's
+/// single-threaded inbox, so an unbounded count lets one ~16 MB request serialize
+/// many disk round trips and stall every client on the database. This is a generous DoS rail well
+/// under the 16 MB message ceiling (audit M-2).
+const MAX_TRANSACTION_OPS: usize = 1_000;
+
+/// Maximum number of onDisconnect actions a single client connection may have
+/// registered at once. They accumulate in memory until the client disconnects,
+/// so an unbounded count is an asymmetric per-connection memory sink whose OOM
+/// would abort the whole core (every tenant on the node). See audit M-3.
+const MAX_ON_DISCONNECT_ACTIONS_PER_CLIENT: usize = 100;
+
+/// Maximum aggregate payload bytes across a single client's registered
+/// onDisconnect actions. Mirrors Firebase's documented 1 MB event-size limit and
+/// bounds the memory one connection can pin. See audit M-3.
+const MAX_ON_DISCONNECT_BYTES_PER_CLIENT: usize = 1024 * 1024;
+
+/// Rough in-memory byte estimate for a JSON value. Used only to bound aggregate
+/// onDisconnect payload per client — approximate is fine, it just needs to be
+/// monotonic in actual size so a large value can't slip under the cap.
+fn estimate_value_bytes(v: &Value) -> usize {
+    match v {
+        Value::Null | Value::Bool(_) => 4,
+        Value::Number(_) => 8,
+        Value::String(s) => s.len(),
+        Value::Array(a) => 8 + a.iter().map(estimate_value_bytes).sum::<usize>(),
+        Value::Object(m) => {
+            8 + m
+                .iter()
+                .map(|(k, val)| k.len() + estimate_value_bytes(val))
+                .sum::<usize>()
+        }
+    }
+}
+
+/// Token-bucket capacity (burst) for the per-database durable-write rate
+/// limiter: 512 MB. Must exceed the largest single write (256 MB REST) so one
+/// big write can never overflow the bucket and deadlock. Deliberately generous —
+/// only sustained abuse should ever hit it. This is a runaway-cost / abuse
+/// backstop, not a fairness mechanism (fairness is handled by the thread-per-core
+/// batch+yield scheduling).
+const WRITE_RATE_BURST_BYTES: f64 = 512.0 * 1024.0 * 1024.0;
+
+/// Sustained refill for the durable-write rate limiter: 64 MB per 15 s
+/// (= 256 MB/min). The long-run ceiling a single database's durable writes are
+/// held to once the burst budget is spent.
+const WRITE_RATE_REFILL_BYTES_PER_SEC: f64 = 64.0 * 1024.0 * 1024.0 / 15.0;
+
+/// Per-database token-bucket limiter for durable write *bytes*. Each database is
+/// single-threaded, so no synchronization is needed. See `WRITE_RATE_*`.
+struct WriteRateLimiter {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl WriteRateLimiter {
+    fn new() -> Self {
+        Self {
+            tokens: WRITE_RATE_BURST_BYTES, // start full so a fresh DB can burst
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Refill by elapsed time (capped at burst), then consume `bytes` if enough
+    /// tokens remain. Returns whether the write is allowed. `now` is injected for
+    /// deterministic testing; the public `try_consume` passes `Instant::now()`.
+    fn try_consume_at(&mut self, bytes: usize, now: Instant) -> bool {
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
+        self.last_refill = now;
+        self.tokens =
+            (self.tokens + elapsed * WRITE_RATE_REFILL_BYTES_PER_SEC).min(WRITE_RATE_BURST_BYTES);
+        if self.tokens >= bytes as f64 {
+            self.tokens -= bytes as f64;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn try_consume(&mut self, bytes: usize) -> bool {
+        self.try_consume_at(bytes, Instant::now())
+    }
+}
+
 /// Database state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatabaseState {
@@ -783,6 +877,9 @@ pub struct Database {
 
     /// Promotion stats for the current metrics interval (reset on emit).
     promotion_stats: PromotionStats,
+
+    /// Per-database durable-write byte rate limiter (runaway-cost backstop).
+    write_rate_limiter: WriteRateLimiter,
 }
 
 /// Handle to interact with a database.
@@ -959,6 +1056,7 @@ impl Database {
             metrics: crate::metrics::DatabaseMetrics::new(),
             metrics_tx: None,
             promotion_stats: PromotionStats::new(),
+            write_rate_limiter: WriteRateLimiter::new(),
         }
     }
 
@@ -1013,6 +1111,7 @@ impl Database {
             metrics: crate::metrics::DatabaseMetrics::new(),
             metrics_tx: None, // Set via set_metrics_tx() after creation
             promotion_stats: PromotionStats::new(),
+            write_rate_limiter: WriteRateLimiter::new(),
         }
     }
 
@@ -3135,6 +3234,36 @@ impl Database {
             ));
         }
 
+        // Cap operations per transaction. Each condition op below promotes a
+        // path (blob read + WAL replay) on this database's single inbox, so an
+        // oversized transaction would serialize many disk round trips and stall
+        // every client on the database. See audit M-2.
+        if operations.len() > MAX_TRANSACTION_OPS {
+            debug!(
+                "NACK {}: transaction has {} ops, exceeds cap {}",
+                self.id,
+                operations.len(),
+                MAX_TRANSACTION_OPS
+            );
+            self.record_nacked_write(client_id, request_id);
+            return Some(ServerMessage::nack(
+                request_id,
+                error::PAYLOAD_TOO_LARGE,
+                &format!("transaction exceeds {} operations", MAX_TRANSACTION_OPS),
+            ));
+        }
+
+        // Reject transactions at the size cap. Deletes still go through
+        // handle_remove for recovery. See MAX_DATABASE_SIZE_BYTES.
+        if self.is_at_size_cap() {
+            self.record_nacked_write(client_id, request_id);
+            return Some(ServerMessage::nack(
+                request_id,
+                error::DATABASE_FULL,
+                "database is at its size limit",
+            ));
+        }
+
         // Validate every operation's paths AND the keys inside its value before
         // anything else. Both the op path and the object field-names in the value
         // become storage keys, so the same key rules (validate_key: non-empty, no
@@ -3208,14 +3337,19 @@ impl Database {
             }
         }
 
-        // Validate all conditions
+        // Validate all conditions. Promotion is idempotent, so dedup repeated
+        // condition paths within the transaction — promoting a path twice is
+        // wasted disk work and an avoidable amplification vector (audit M-2).
+        let mut promoted: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for op in operations {
             if op.op == "c" {
                 // Promote from blob if needed for accurate condition check.
                 // Use deep promotion so container values are fully loaded —
                 // shallow promotion leaves Sentinel children which would
                 // serialize to null and break value/hash comparisons.
-                if let Err(e) = self.promote_path_deep(&op.path).await {
+                if promoted.insert(op.path.as_str())
+                    && let Err(e) = self.promote_path_deep(&op.path).await
+                {
                     warn!(
                         "NACK TRANSACTION: promotion failed for condition at {}: {}",
                         op.path, e
@@ -3300,6 +3434,12 @@ impl Database {
             Option<Value>,
             Option<serde_json::Map<String, Value>>,
         )> = Vec::new();
+
+        // Charge the whole transaction's bytes against the write-rate limiter
+        // before applying any op, so a reject leaves the tree untouched.
+        if let Some(nack) = self.check_write_rate(msg.payload_size, client_id, request_id) {
+            return Some(nack);
+        }
 
         // Apply all operations
         // Note: We need to collect WAL entries separately because we can't hold the tree lock while writing to WAL.
@@ -3653,6 +3793,19 @@ impl Database {
             ));
         }
 
+        // Reject this write once the database is at its size cap — including
+        // volatile writes (we don't exempt them; keeps the check trivial). Deletes
+        // still go through handle_remove so the owner can recover by freeing
+        // space. Should never happen in practice. See MAX_DATABASE_SIZE_BYTES.
+        if self.is_at_size_cap() {
+            self.record_nacked_write(client_id, request_id);
+            return Some(ServerMessage::nack(
+                request_id,
+                error::DATABASE_FULL,
+                "database is at its size limit",
+            ));
+        }
+
         let value = match &msg.value {
             Some(v) => v.clone(),
             None => Value::Null,
@@ -3786,6 +3939,12 @@ impl Database {
             return None;
         }
 
+        // Durable write: charge the per-database write-rate limiter before
+        // committing (volatile writes returned above; ephemeral DBs are exempt).
+        if let Some(nack) = self.check_write_rate(msg.payload_size, client_id, request_id) {
+            return Some(nack);
+        }
+
         // Regular write path
         let path = Path::parse(path_str);
 
@@ -3880,6 +4039,18 @@ impl Database {
             ));
         }
 
+        // Reject this write at the size cap, including volatile writes (not
+        // exempt). Deletes still go through handle_remove for recovery.
+        // See MAX_DATABASE_SIZE_BYTES.
+        if self.is_at_size_cap() {
+            self.record_nacked_write(client_id, request_id);
+            return Some(ServerMessage::nack(
+                request_id,
+                error::DATABASE_FULL,
+                "database is at its size limit",
+            ));
+        }
+
         let updates = match &msg.value {
             Some(Value::Object(map)) => map.clone(),
             _ => {
@@ -3959,6 +4130,15 @@ impl Database {
                     ));
                 }
             }
+        }
+
+        // Durable update: charge the rate limiter before mutating the tree so a
+        // reject leaves it untouched. Volatile updates skip the WAL (below), so
+        // they skip the charge too; ephemeral DBs are exempt (in check_write_rate).
+        if !volatile
+            && let Some(nack) = self.check_write_rate(msg.payload_size, client_id, request_id)
+        {
+            return Some(nack);
         }
 
         // Perform update (shallow merge at path).
@@ -4199,11 +4379,22 @@ impl Database {
                 .subscribe(client_id, path_str, query_params.as_ref(), conn)
             {
                 Ok(id) => id,
-                Err(QueryError::LimitTooLarge(n)) => {
+                Err(SubscribeError::Query(QueryError::LimitTooLarge(n))) => {
                     return Some(ServerMessage::nack(
                         request_id,
                         error::INVALID_DATA,
                         &format!("Query limit {} exceeds maximum allowed (10000)", n),
+                    ));
+                }
+                Err(SubscribeError::TooManySubscriptions { limit }) => {
+                    debug!(
+                        "NACK {}: SUBSCRIBE rejected for client {} — at subscription cap ({})",
+                        self.id, client_id, limit
+                    );
+                    return Some(ServerMessage::nack(
+                        request_id,
+                        error::TOO_MANY_SUBSCRIPTIONS,
+                        &format!("subscription limit reached ({} per connection)", limit),
                     ));
                 }
             };
@@ -4847,6 +5038,43 @@ impl Database {
                     ));
                 }
 
+                // Bound the per-client onDisconnect state — both action count
+                // and aggregate payload bytes. These live in memory until the
+                // client disconnects, so an unbounded client is an asymmetric
+                // memory sink whose OOM aborts the whole core (audit M-3).
+                let new_bytes = path_str.len()
+                    + action.len()
+                    + msg.value.as_ref().map_or(0, estimate_value_bytes);
+                let (existing_count, existing_bytes) =
+                    self.on_disconnect.get(client_id).map_or((0, 0), |actions| {
+                        let bytes: usize = actions
+                            .iter()
+                            .map(|a| {
+                                a.path.len()
+                                    + a.action.len()
+                                    + a.value.as_ref().map_or(0, estimate_value_bytes)
+                            })
+                            .sum();
+                        (actions.len(), bytes)
+                    });
+                if existing_count >= MAX_ON_DISCONNECT_ACTIONS_PER_CLIENT
+                    || existing_bytes + new_bytes > MAX_ON_DISCONNECT_BYTES_PER_CLIENT
+                {
+                    debug!(
+                        "NACK {}: onDisconnect rejected for client {} — at cap ({} actions / {} bytes)",
+                        self.id, client_id, existing_count, existing_bytes
+                    );
+                    return Some(ServerMessage::nack(
+                        request_id,
+                        error::PAYLOAD_TOO_LARGE,
+                        &format!(
+                            "onDisconnect limit reached ({} actions or {} bytes per connection)",
+                            MAX_ON_DISCONNECT_ACTIONS_PER_CLIENT,
+                            MAX_ON_DISCONNECT_BYTES_PER_CLIENT
+                        ),
+                    ));
+                }
+
                 let disconnect_action = DisconnectAction {
                     path: path_str.to_string(),
                     action: action.to_string(),
@@ -5374,6 +5602,34 @@ impl Database {
         if let Ok(size) = lark_blob::BlobIO::size(session.io()).await {
             self.metrics.set_data_size(size);
         }
+    }
+
+    /// Whether the database has reached its size cap and should reject growth
+    /// writes. Reads the periodically-refreshed `data_size` gauge, so it's an
+    /// approximate (slightly-stale) check — appropriate for a 1 TB backstop.
+    fn is_at_size_cap(&self) -> bool {
+        self.metrics.data_size() >= MAX_DATABASE_SIZE_BYTES
+    }
+
+    /// Charge `bytes` against the durable-write rate limiter, returning a NACK to
+    /// send if the write must be rejected (rate exceeded), else `None`. Ephemeral
+    /// (in-memory) databases are exempt — they incur no durable storage cost, so
+    /// this also leaves tests/emulator/benchmarks on ephemeral DBs unthrottled.
+    fn check_write_rate(
+        &mut self,
+        bytes: usize,
+        client_id: &str,
+        request_id: &str,
+    ) -> Option<ServerMessage> {
+        if self.ephemeral || self.write_rate_limiter.try_consume(bytes) {
+            return None;
+        }
+        self.record_nacked_write(client_id, request_id);
+        Some(ServerMessage::nack(
+            request_id,
+            error::RATE_LIMITED,
+            "write rate limit exceeded; retry shortly",
+        ))
     }
 
     /// Emit metrics to stdout in JSON format (for Vector to pick up).
@@ -6015,6 +6271,66 @@ mod tests {
     }
 
     #[test]
+    fn test_on_disconnect_caps_per_client() {
+        block_on(async {
+            let mut db = Database::new("test".to_string(), "test-project".to_string(), true);
+            let (conn, _messages) = MockConnection::new();
+            db.add_client_internal("client1", None, "conn1", conn);
+            db.set_rules(
+                crate::rules::parse_rules(&json!({"rules": {".write": true, ".read": true}}))
+                    .unwrap(),
+            );
+
+            // Register up to the per-client action-count cap — all accepted.
+            for i in 0..MAX_ON_DISCONNECT_ACTIONS_PER_CLIENT {
+                let msg = ClientMessage {
+                    path: Some(format!("/p{}", i)),
+                    action: Some("s".to_string()),
+                    value: Some(json!("v")),
+                    request_id: Some(format!("r{}", i)),
+                    ..Default::default()
+                };
+                let resp = db
+                    .handle_on_disconnect("client1", &msg)
+                    .await
+                    .expect("resp");
+                assert!(resp.nack.is_none(), "action {} within cap should ack", i);
+            }
+
+            // One more action exceeds the count cap → NACK PAYLOAD_TOO_LARGE.
+            let msg = ClientMessage {
+                path: Some("/overflow".to_string()),
+                action: Some("s".to_string()),
+                value: Some(json!("v")),
+                request_id: Some("rovf".to_string()),
+                ..Default::default()
+            };
+            let resp = db
+                .handle_on_disconnect("client1", &msg)
+                .await
+                .expect("resp");
+            assert_eq!(resp.error.as_deref(), Some(error::PAYLOAD_TOO_LARGE));
+
+            // A fresh client with a single oversized value trips the byte cap.
+            let (conn2, _m2) = MockConnection::new();
+            db.add_client_internal("client2", None, "conn2", conn2);
+            let big = "x".repeat(MAX_ON_DISCONNECT_BYTES_PER_CLIENT + 1);
+            let msg = ClientMessage {
+                path: Some("/big".to_string()),
+                action: Some("s".to_string()),
+                value: Some(json!(big)),
+                request_id: Some("rbig".to_string()),
+                ..Default::default()
+            };
+            let resp = db
+                .handle_on_disconnect("client2", &msg)
+                .await
+                .expect("resp");
+            assert_eq!(resp.error.as_deref(), Some(error::PAYLOAD_TOO_LARGE));
+        })
+    }
+
+    #[test]
     fn test_handle_subscribe() {
         block_on(async {
             let mut db = Database::new("test".to_string(), "test-project".to_string(), true);
@@ -6314,6 +6630,189 @@ mod tests {
             let resp = response.expect("Expected a NACK response");
             assert!(resp.nack.is_some(), "Expected NACK, got: {:?}", resp);
             assert_eq!(resp.error.as_deref(), Some("unavailable"));
+        })
+    }
+
+    #[test]
+    fn test_transaction_op_count_cap() {
+        block_on(async {
+            let mut db = Database::new("test".to_string(), "test-project".to_string(), true);
+            let (conn, _messages) = MockConnection::new();
+            db.add_client_internal("client1", None, "conn1", conn);
+
+            // A transaction at the cap is accepted (open rules by default).
+            let ops_at_cap: Vec<_> = (0..MAX_TRANSACTION_OPS)
+                .map(|i| crate::protocol::TransactionOp {
+                    op: "s".to_string(),
+                    path: format!("/k{}", i),
+                    value: Some(json!(i)),
+                    hash: None,
+                })
+                .collect();
+            let msg = ClientMessage {
+                op: "t".to_string(),
+                request_id: Some("r1".to_string()),
+                operations: Some(ops_at_cap),
+                ..Default::default()
+            };
+            let resp = db.handle_transaction("client1", &msg).await.expect("resp");
+            assert!(
+                resp.nack.is_none(),
+                "transaction at the cap should not be rejected for size, got: {:?}",
+                resp
+            );
+
+            // One more op exceeds the cap → NACK PAYLOAD_TOO_LARGE.
+            let too_many: Vec<_> = (0..=MAX_TRANSACTION_OPS)
+                .map(|i| crate::protocol::TransactionOp {
+                    op: "s".to_string(),
+                    path: format!("/k{}", i),
+                    value: Some(json!(i)),
+                    hash: None,
+                })
+                .collect();
+            let msg = ClientMessage {
+                op: "t".to_string(),
+                request_id: Some("r2".to_string()),
+                operations: Some(too_many),
+                ..Default::default()
+            };
+            let resp = db.handle_transaction("client1", &msg).await.expect("resp");
+            assert_eq!(resp.error.as_deref(), Some(error::PAYLOAD_TOO_LARGE));
+        })
+    }
+
+    #[test]
+    fn test_write_rate_limiter_burst_and_refill() {
+        let t0 = Instant::now();
+        let mut rl = WriteRateLimiter {
+            tokens: WRITE_RATE_BURST_BYTES,
+            last_refill: t0,
+        };
+
+        let mb = 1024 * 1024;
+
+        // Can spend the full burst capacity immediately.
+        assert!(rl.try_consume_at(512 * mb, t0));
+        // Bucket now empty: a 1-byte write is rejected at the same instant.
+        assert!(!rl.try_consume_at(1, t0));
+
+        // After 15s, ~64MB has refilled: a 64MB write succeeds, a hair more fails.
+        let t1 = t0 + Duration::from_secs(15);
+        assert!(rl.try_consume_at(64 * mb, t1));
+        assert!(!rl.try_consume_at(mb, t1));
+
+        // Refill is capped at burst capacity: idling a long time can't exceed 512MB.
+        let t2 = t1 + Duration::from_secs(3600);
+        assert!(rl.try_consume_at(512 * mb, t2));
+        assert!(!rl.try_consume_at(1, t2));
+    }
+
+    #[test]
+    fn test_database_size_cap_rejects_growth_allows_delete() {
+        block_on(async {
+            let mut db = Database::new("test".to_string(), "test-project".to_string(), true);
+            let (conn, _messages) = MockConnection::new();
+            db.add_client_internal("client1", None, "conn1", conn);
+
+            // Drive the (normally periodically-refreshed) size gauge to the cap.
+            db.metrics.set_data_size(MAX_DATABASE_SIZE_BYTES);
+
+            // SET (growth) → DATABASE_FULL.
+            let resp = db
+                .handle_set(
+                    "client1",
+                    &ClientMessage {
+                        op: "s".to_string(),
+                        path: Some("/a".to_string()),
+                        value: Some(json!("v")),
+                        request_id: Some("r1".to_string()),
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .await
+                .expect("resp");
+            assert_eq!(resp.error.as_deref(), Some(error::DATABASE_FULL));
+
+            // UPDATE (growth) → DATABASE_FULL.
+            let resp = db
+                .handle_update(
+                    "client1",
+                    &ClientMessage {
+                        op: "u".to_string(),
+                        path: Some("/a".to_string()),
+                        value: Some(json!({"k": "v"})),
+                        request_id: Some("r2".to_string()),
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .await
+                .expect("resp");
+            assert_eq!(resp.error.as_deref(), Some(error::DATABASE_FULL));
+
+            // TRANSACTION → DATABASE_FULL.
+            let resp = db
+                .handle_transaction(
+                    "client1",
+                    &ClientMessage {
+                        op: "t".to_string(),
+                        request_id: Some("r3".to_string()),
+                        operations: Some(vec![crate::protocol::TransactionOp {
+                            op: "s".to_string(),
+                            path: "/a".to_string(),
+                            value: Some(json!(1)),
+                            hash: None,
+                        }]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("resp");
+            assert_eq!(resp.error.as_deref(), Some(error::DATABASE_FULL));
+
+            // REMOVE is still allowed at the cap so the owner can recover.
+            let resp = db
+                .handle_remove(
+                    "client1",
+                    &ClientMessage {
+                        op: "d".to_string(),
+                        path: Some("/a".to_string()),
+                        request_id: Some("r4".to_string()),
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .await;
+            if let Some(r) = resp {
+                assert_ne!(
+                    r.error.as_deref(),
+                    Some(error::DATABASE_FULL),
+                    "remove must not be size-rejected: {:?}",
+                    r
+                );
+            }
+
+            // Volatile writes are NOT exempt — they're rejected at the cap too
+            // (we intentionally don't carve them out).
+            db.set_volatile_paths(vec!["cursors/*".to_string()]);
+            let resp = db
+                .handle_set(
+                    "client1",
+                    &ClientMessage {
+                        op: "s".to_string(),
+                        path: Some("/cursors/p1".to_string()),
+                        value: Some(json!({"x": 1})),
+                        request_id: Some("r5".to_string()),
+                        volatile: Some(true),
+                        ..Default::default()
+                    },
+                    true,
+                )
+                .await
+                .expect("resp");
+            assert_eq!(resp.error.as_deref(), Some(error::DATABASE_FULL));
         })
     }
 

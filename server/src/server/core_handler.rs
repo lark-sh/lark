@@ -13,7 +13,7 @@ use glommio::channels::local_channel::LocalSender;
 /// Prevents a single database from monopolizing all server connections.
 pub const MAX_CLIENTS_PER_DATABASE: usize = 200_000;
 use crate::executor::core_for_database;
-use crate::protocol::{ClientMessage, op};
+use crate::protocol::{ClientMessage, ServerMessage, error, op};
 use crate::rules::{Evaluator, parse_rules};
 use crate::transport::firebase_adapter::FIREBASE_MAX_FRAME_SIZE;
 use crate::transport::protocol::ProjectConfig;
@@ -620,7 +620,19 @@ impl CoreHandler {
                 "Rejecting client {} - database {} at connection limit ({}/{})",
                 client.id, database_id, current_count, MAX_CLIENTS_PER_DATABASE
             );
-            // Close the connection
+            // Tell the client *why* before dropping it, rather than a bare close.
+            // The NACK is enqueued while the connection is still open; close()
+            // then enqueues the CLOSE behind it, so the writer drains the reason
+            // first. (No request_id — this is a connect-time rejection.)
+            if let Ok(data) = ServerMessage::nack(
+                "",
+                error::TOO_MANY_CONNECTIONS,
+                "database is at its connection limit",
+            )
+            .encode()
+            {
+                let _ = client.try_send(data.into(), false);
+            }
             client.close();
             return None;
         }
