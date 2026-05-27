@@ -46,6 +46,11 @@
 //
 // LongPollSession uses mutex for all state access. The transport wraps the
 // session and delegates thread safety to it.
+//
+// # Goal
+// 
+// The goal of this package is just to implement enough LongPolling support to get a legacy Firebase client to switch from LP->WS
+// We aren't really trying to support Long Polling as a first-class transport option.
 package proxy
 
 import (

@@ -8,10 +8,10 @@
 // Firebase-compatible URLs follow this pattern:
 //
 //	https://{project}.larkdb.net/.ws              → WebSocket (Lark protocol)
-//	https://{project}.larkdb.net/.wss             → WebSocket (Firebase protocol)
-//	https://{project}.larkdb.net/.lp              → Long Polling
-//	https://{project}.larkdb.net/{db}/{path}.json → REST API
-//	https://{project}.larkdb.net/{db}/{path}.json → SSE (if Accept: text/event-stream)
+//	https://{databaseid}--{project}.larkdb.net/.wss             → WebSocket (Firebase protocol)
+//	https://{databaseid}--{project}.larkdb.net/.lp              → Long Polling
+//	https://{databaseid}--{project}.larkdb.net/{path}.json → REST API
+//	https://{databaseid}--{project}.larkdb.net/{path}.json → SSE (if Accept: text/event-stream)
 //
 // # Request Routing
 //
@@ -273,7 +273,7 @@ func (s *Server) handleLarkDB(w http.ResponseWriter, r *http.Request) {
 //   - DELETE → remove
 //
 // URL patterns:
-//   - project.larkdb.net/database/path.json (standard - first segment is database)
+//   - database--project.larkdb.net/path.json (standard - first part of subdomain is database)
 //   - project.larkdb.net/path.json (Firebase legacy without path-segment → "default" database)
 //
 // SSE Streaming:
