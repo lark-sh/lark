@@ -18,7 +18,10 @@ function wireProtocolURLs(projectId: string, larkdbDomain: string) {
   const domainWithPort = `${larkdbDomain}${portSuffix}`;
   const sub = projectId.toLowerCase();
   return {
-    restBase: `${httpScheme}://${sub}.${domainWithPort}`,
+    // REST base for a specific database, addressed via the `<database>--<project>`
+    // subdomain. (Database selection is by subdomain, not a path segment.)
+    restBaseFor: (databaseId: string) =>
+      `${httpScheme}://${databaseId.toLowerCase()}--${sub}.${domainWithPort}`,
     sdkDomain: domainWithPort,
     sdkSecure: isSecure,
   };
@@ -71,13 +74,12 @@ function findChangedPaths(
 // at the given path via the REST API. Used to bail out into the
 // "shallow keys" view when the subtree is too big to render in one go.
 async function fetchShallowKeys(
-  databaseId: string,
   path: string,
   authToken: string,
-  restBase: string,
+  dbRestBase: string,
 ): Promise<{ keys: string[]; totalSize: number } | null> {
   try {
-    const url = `${restBase}/${databaseId}${path}/.json?v=2&shallow=true&auth=${encodeURIComponent(authToken)}`;
+    const url = `${dbRestBase}${path}/.json?v=2&shallow=true&auth=${encodeURIComponent(authToken)}`;
     const response = await fetch(url);
     if (!response.ok) return null;
     const data = await response.json();
@@ -252,10 +254,9 @@ export function DatabaseEditor() {
 
     (async () => {
       const result = await fetchShallowKeys(
-        databaseId,
         currentRefPath,
         authToken,
-        urls.restBase,
+        urls.restBaseFor(databaseId),
       );
       if (cancelled) return;
 
@@ -344,7 +345,7 @@ export function DatabaseEditor() {
     if (!projectId || !databaseId || !authToken || !urls) return;
     try {
       const pathSuffix = currentPath ? `/${currentPath}` : '';
-      const url = `${urls.restBase}/${databaseId}${pathSuffix}/.json?v=2&auth=${encodeURIComponent(authToken)}`;
+      const url = `${urls.restBaseFor(databaseId)}${pathSuffix}/.json?v=2&auth=${encodeURIComponent(authToken)}`;
       const response = await fetch(url);
       if (!response.ok) throw new Error(`Export failed: ${response.statusText}`);
       const exported = await response.json();
@@ -378,7 +379,7 @@ export function DatabaseEditor() {
       }
 
       const pathSuffix = currentPath ? `/${currentPath}` : '';
-      const url = `${urls.restBase}/${databaseId}${pathSuffix}/.json?v=2&auth=${encodeURIComponent(authToken)}`;
+      const url = `${urls.restBaseFor(databaseId)}${pathSuffix}/.json?v=2&auth=${encodeURIComponent(authToken)}`;
       const response = await fetch(url, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -388,10 +389,9 @@ export function DatabaseEditor() {
 
       if (viewMode === 'shallow') {
         const result = await fetchShallowKeys(
-          databaseId,
           currentRefPath,
           authToken,
-          urls.restBase,
+          urls.restBaseFor(databaseId),
         );
         if (result) setShallowKeys(result.keys);
       }
