@@ -188,6 +188,8 @@ pub mod error {
     pub const TOO_MANY_SUBSCRIPTIONS: &str = "too_many_subscriptions";
     /// Database is at its maximum size; growth writes are rejected (deletes still allowed).
     pub const DATABASE_FULL: &str = "database_full";
+    /// Per-database durable-write rate exceeded; retryable.
+    pub const RATE_LIMITED: &str = "rate_limited";
     /// Segment or storage unavailable - client should retry
     pub const UNAVAILABLE: &str = "unavailable";
 }

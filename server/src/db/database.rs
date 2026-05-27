@@ -478,6 +478,57 @@ fn estimate_value_bytes(v: &Value) -> usize {
     }
 }
 
+/// Token-bucket capacity (burst) for the per-database durable-write rate
+/// limiter: 512 MB. Must exceed the largest single write (256 MB REST) so one
+/// big write can never overflow the bucket and deadlock. Deliberately generous —
+/// only sustained abuse should ever hit it. This is a runaway-cost / abuse
+/// backstop, not a fairness mechanism (fairness is handled by the thread-per-core
+/// batch+yield scheduling).
+const WRITE_RATE_BURST_BYTES: f64 = 512.0 * 1024.0 * 1024.0;
+
+/// Sustained refill for the durable-write rate limiter: 64 MB per 15 s
+/// (= 256 MB/min). The long-run ceiling a single database's durable writes are
+/// held to once the burst budget is spent.
+const WRITE_RATE_REFILL_BYTES_PER_SEC: f64 = 64.0 * 1024.0 * 1024.0 / 15.0;
+
+/// Per-database token-bucket limiter for durable write *bytes*. Each database is
+/// single-threaded, so no synchronization is needed. See `WRITE_RATE_*`.
+struct WriteRateLimiter {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl WriteRateLimiter {
+    fn new() -> Self {
+        Self {
+            tokens: WRITE_RATE_BURST_BYTES, // start full so a fresh DB can burst
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Refill by elapsed time (capped at burst), then consume `bytes` if enough
+    /// tokens remain. Returns whether the write is allowed. `now` is injected for
+    /// deterministic testing; the public `try_consume` passes `Instant::now()`.
+    fn try_consume_at(&mut self, bytes: usize, now: Instant) -> bool {
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
+        self.last_refill = now;
+        self.tokens =
+            (self.tokens + elapsed * WRITE_RATE_REFILL_BYTES_PER_SEC).min(WRITE_RATE_BURST_BYTES);
+        if self.tokens >= bytes as f64 {
+            self.tokens -= bytes as f64;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn try_consume(&mut self, bytes: usize) -> bool {
+        self.try_consume_at(bytes, Instant::now())
+    }
+}
+
 /// Database state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatabaseState {
@@ -826,6 +877,9 @@ pub struct Database {
 
     /// Promotion stats for the current metrics interval (reset on emit).
     promotion_stats: PromotionStats,
+
+    /// Per-database durable-write byte rate limiter (runaway-cost backstop).
+    write_rate_limiter: WriteRateLimiter,
 }
 
 /// Handle to interact with a database.
@@ -1002,6 +1056,7 @@ impl Database {
             metrics: crate::metrics::DatabaseMetrics::new(),
             metrics_tx: None,
             promotion_stats: PromotionStats::new(),
+            write_rate_limiter: WriteRateLimiter::new(),
         }
     }
 
@@ -1056,6 +1111,7 @@ impl Database {
             metrics: crate::metrics::DatabaseMetrics::new(),
             metrics_tx: None, // Set via set_metrics_tx() after creation
             promotion_stats: PromotionStats::new(),
+            write_rate_limiter: WriteRateLimiter::new(),
         }
     }
 
@@ -3379,6 +3435,12 @@ impl Database {
             Option<serde_json::Map<String, Value>>,
         )> = Vec::new();
 
+        // Charge the whole transaction's bytes against the write-rate limiter
+        // before applying any op, so a reject leaves the tree untouched.
+        if let Some(nack) = self.check_write_rate(msg.payload_size, client_id, request_id) {
+            return Some(nack);
+        }
+
         // Apply all operations
         // Note: We need to collect WAL entries separately because we can't hold the tree lock while writing to WAL.
         // Each arm acquires/releases the tree lock as needed so we can call &mut self
@@ -3877,6 +3939,12 @@ impl Database {
             return None;
         }
 
+        // Durable write: charge the per-database write-rate limiter before
+        // committing (volatile writes returned above; ephemeral DBs are exempt).
+        if let Some(nack) = self.check_write_rate(msg.payload_size, client_id, request_id) {
+            return Some(nack);
+        }
+
         // Regular write path
         let path = Path::parse(path_str);
 
@@ -4062,6 +4130,15 @@ impl Database {
                     ));
                 }
             }
+        }
+
+        // Durable update: charge the rate limiter before mutating the tree so a
+        // reject leaves it untouched. Volatile updates skip the WAL (below), so
+        // they skip the charge too; ephemeral DBs are exempt (in check_write_rate).
+        if !volatile
+            && let Some(nack) = self.check_write_rate(msg.payload_size, client_id, request_id)
+        {
+            return Some(nack);
         }
 
         // Perform update (shallow merge at path).
@@ -5534,6 +5611,27 @@ impl Database {
         self.metrics.data_size() >= MAX_DATABASE_SIZE_BYTES
     }
 
+    /// Charge `bytes` against the durable-write rate limiter, returning a NACK to
+    /// send if the write must be rejected (rate exceeded), else `None`. Ephemeral
+    /// (in-memory) databases are exempt — they incur no durable storage cost, so
+    /// this also leaves tests/emulator/benchmarks on ephemeral DBs unthrottled.
+    fn check_write_rate(
+        &mut self,
+        bytes: usize,
+        client_id: &str,
+        request_id: &str,
+    ) -> Option<ServerMessage> {
+        if self.ephemeral || self.write_rate_limiter.try_consume(bytes) {
+            return None;
+        }
+        self.record_nacked_write(client_id, request_id);
+        Some(ServerMessage::nack(
+            request_id,
+            error::RATE_LIMITED,
+            "write rate limit exceeded; retry shortly",
+        ))
+    }
+
     /// Emit metrics to stdout in JSON format (for Vector to pick up).
     /// Only emits if there was activity since the last emission.
     fn emit_metrics(&mut self) {
@@ -6582,6 +6680,32 @@ mod tests {
             let resp = db.handle_transaction("client1", &msg).await.expect("resp");
             assert_eq!(resp.error.as_deref(), Some(error::PAYLOAD_TOO_LARGE));
         })
+    }
+
+    #[test]
+    fn test_write_rate_limiter_burst_and_refill() {
+        let t0 = Instant::now();
+        let mut rl = WriteRateLimiter {
+            tokens: WRITE_RATE_BURST_BYTES,
+            last_refill: t0,
+        };
+
+        let mb = 1024 * 1024;
+
+        // Can spend the full burst capacity immediately.
+        assert!(rl.try_consume_at(512 * mb, t0));
+        // Bucket now empty: a 1-byte write is rejected at the same instant.
+        assert!(!rl.try_consume_at(1, t0));
+
+        // After 15s, ~64MB has refilled: a 64MB write succeeds, a hair more fails.
+        let t1 = t0 + Duration::from_secs(15);
+        assert!(rl.try_consume_at(64 * mb, t1));
+        assert!(!rl.try_consume_at(mb, t1));
+
+        // Refill is capped at burst capacity: idling a long time can't exceed 512MB.
+        let t2 = t1 + Duration::from_secs(3600);
+        assert!(rl.try_consume_at(512 * mb, t2));
+        assert!(!rl.try_consume_at(1, t2));
     }
 
     #[test]
