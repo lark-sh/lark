@@ -48,7 +48,7 @@ use lark_blob::{BlobError, BlobIO, BlobSession, CachedIO, ReadStats, ShallowValu
 
 use crate::db::firebase_hash::{compute_firebase_hash, is_firebase_hash};
 use crate::db::query::{QueryError, QueryParams};
-use crate::db::subscription::{MutationEvent, ViewManager};
+use crate::db::subscription::{MutationEvent, SubscribeError, ViewManager};
 use crate::db::value::ArcValueSortExt;
 use crate::db::{ArcValue, Path, Tree};
 use crate::protocol::{ClientMessage, ServerMessage, error, op};
@@ -433,6 +433,43 @@ pub static EVICTION_IDLE_SECS: std::sync::atomic::AtomicU64 =
 
 pub fn set_eviction_idle_secs(secs: u64) {
     EVICTION_IDLE_SECS.store(secs, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Maximum number of operations in a single transaction. Each condition op
+/// triggers a `promote_path_deep` (blob read + WAL replay) on the database's
+/// single-threaded inbox, so an unbounded count lets one ~16 MB request serialize
+/// many disk round trips and stall every client on the database. Firebase
+/// documents no transaction op-count limit; this is a generous DoS rail well
+/// under the 16 MB message ceiling (audit M-2).
+const MAX_TRANSACTION_OPS: usize = 1_000;
+
+/// Maximum number of onDisconnect actions a single client connection may have
+/// registered at once. They accumulate in memory until the client disconnects,
+/// so an unbounded count is an asymmetric per-connection memory sink whose OOM
+/// would abort the whole core (every tenant on the node). See audit M-3.
+const MAX_ON_DISCONNECT_ACTIONS_PER_CLIENT: usize = 100;
+
+/// Maximum aggregate payload bytes across a single client's registered
+/// onDisconnect actions. Mirrors Firebase's documented 1 MB event-size limit and
+/// bounds the memory one connection can pin. See audit M-3.
+const MAX_ON_DISCONNECT_BYTES_PER_CLIENT: usize = 1024 * 1024;
+
+/// Rough in-memory byte estimate for a JSON value. Used only to bound aggregate
+/// onDisconnect payload per client — approximate is fine, it just needs to be
+/// monotonic in actual size so a large value can't slip under the cap.
+fn estimate_value_bytes(v: &Value) -> usize {
+    match v {
+        Value::Null | Value::Bool(_) => 4,
+        Value::Number(_) => 8,
+        Value::String(s) => s.len(),
+        Value::Array(a) => 8 + a.iter().map(estimate_value_bytes).sum::<usize>(),
+        Value::Object(m) => {
+            8 + m
+                .iter()
+                .map(|(k, val)| k.len() + estimate_value_bytes(val))
+                .sum::<usize>()
+        }
+    }
 }
 
 /// Database state
@@ -3135,6 +3172,25 @@ impl Database {
             ));
         }
 
+        // Cap operations per transaction. Each condition op below promotes a
+        // path (blob read + WAL replay) on this database's single inbox, so an
+        // oversized transaction would serialize many disk round trips and stall
+        // every client on the database. See audit M-2.
+        if operations.len() > MAX_TRANSACTION_OPS {
+            debug!(
+                "NACK {}: transaction has {} ops, exceeds cap {}",
+                self.id,
+                operations.len(),
+                MAX_TRANSACTION_OPS
+            );
+            self.record_nacked_write(client_id, request_id);
+            return Some(ServerMessage::nack(
+                request_id,
+                error::PAYLOAD_TOO_LARGE,
+                &format!("transaction exceeds {} operations", MAX_TRANSACTION_OPS),
+            ));
+        }
+
         // Validate every operation's paths AND the keys inside its value before
         // anything else. Both the op path and the object field-names in the value
         // become storage keys, so the same key rules (validate_key: non-empty, no
@@ -3208,14 +3264,19 @@ impl Database {
             }
         }
 
-        // Validate all conditions
+        // Validate all conditions. Promotion is idempotent, so dedup repeated
+        // condition paths within the transaction — promoting a path twice is
+        // wasted disk work and an avoidable amplification vector (audit M-2).
+        let mut promoted: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for op in operations {
             if op.op == "c" {
                 // Promote from blob if needed for accurate condition check.
                 // Use deep promotion so container values are fully loaded —
                 // shallow promotion leaves Sentinel children which would
                 // serialize to null and break value/hash comparisons.
-                if let Err(e) = self.promote_path_deep(&op.path).await {
+                if promoted.insert(op.path.as_str())
+                    && let Err(e) = self.promote_path_deep(&op.path).await
+                {
                     warn!(
                         "NACK TRANSACTION: promotion failed for condition at {}: {}",
                         op.path, e
@@ -4199,11 +4260,22 @@ impl Database {
                 .subscribe(client_id, path_str, query_params.as_ref(), conn)
             {
                 Ok(id) => id,
-                Err(QueryError::LimitTooLarge(n)) => {
+                Err(SubscribeError::Query(QueryError::LimitTooLarge(n))) => {
                     return Some(ServerMessage::nack(
                         request_id,
                         error::INVALID_DATA,
                         &format!("Query limit {} exceeds maximum allowed (10000)", n),
+                    ));
+                }
+                Err(SubscribeError::TooManySubscriptions { limit }) => {
+                    debug!(
+                        "NACK {}: SUBSCRIBE rejected for client {} — at subscription cap ({})",
+                        self.id, client_id, limit
+                    );
+                    return Some(ServerMessage::nack(
+                        request_id,
+                        error::TOO_MANY_SUBSCRIPTIONS,
+                        &format!("subscription limit reached ({} per connection)", limit),
                     ));
                 }
             };
@@ -4844,6 +4916,43 @@ impl Database {
                         request_id,
                         error::PERMISSION_DENIED,
                         "write permission denied",
+                    ));
+                }
+
+                // Bound the per-client onDisconnect state — both action count
+                // and aggregate payload bytes. These live in memory until the
+                // client disconnects, so an unbounded client is an asymmetric
+                // memory sink whose OOM aborts the whole core (audit M-3).
+                let new_bytes = path_str.len()
+                    + action.len()
+                    + msg.value.as_ref().map_or(0, estimate_value_bytes);
+                let (existing_count, existing_bytes) =
+                    self.on_disconnect.get(client_id).map_or((0, 0), |actions| {
+                        let bytes: usize = actions
+                            .iter()
+                            .map(|a| {
+                                a.path.len()
+                                    + a.action.len()
+                                    + a.value.as_ref().map_or(0, estimate_value_bytes)
+                            })
+                            .sum();
+                        (actions.len(), bytes)
+                    });
+                if existing_count >= MAX_ON_DISCONNECT_ACTIONS_PER_CLIENT
+                    || existing_bytes + new_bytes > MAX_ON_DISCONNECT_BYTES_PER_CLIENT
+                {
+                    debug!(
+                        "NACK {}: onDisconnect rejected for client {} — at cap ({} actions / {} bytes)",
+                        self.id, client_id, existing_count, existing_bytes
+                    );
+                    return Some(ServerMessage::nack(
+                        request_id,
+                        error::PAYLOAD_TOO_LARGE,
+                        &format!(
+                            "onDisconnect limit reached ({} actions or {} bytes per connection)",
+                            MAX_ON_DISCONNECT_ACTIONS_PER_CLIENT,
+                            MAX_ON_DISCONNECT_BYTES_PER_CLIENT
+                        ),
                     ));
                 }
 
@@ -6015,6 +6124,66 @@ mod tests {
     }
 
     #[test]
+    fn test_on_disconnect_caps_per_client() {
+        block_on(async {
+            let mut db = Database::new("test".to_string(), "test-project".to_string(), true);
+            let (conn, _messages) = MockConnection::new();
+            db.add_client_internal("client1", None, "conn1", conn);
+            db.set_rules(
+                crate::rules::parse_rules(&json!({"rules": {".write": true, ".read": true}}))
+                    .unwrap(),
+            );
+
+            // Register up to the per-client action-count cap — all accepted.
+            for i in 0..MAX_ON_DISCONNECT_ACTIONS_PER_CLIENT {
+                let msg = ClientMessage {
+                    path: Some(format!("/p{}", i)),
+                    action: Some("s".to_string()),
+                    value: Some(json!("v")),
+                    request_id: Some(format!("r{}", i)),
+                    ..Default::default()
+                };
+                let resp = db
+                    .handle_on_disconnect("client1", &msg)
+                    .await
+                    .expect("resp");
+                assert!(resp.nack.is_none(), "action {} within cap should ack", i);
+            }
+
+            // One more action exceeds the count cap → NACK PAYLOAD_TOO_LARGE.
+            let msg = ClientMessage {
+                path: Some("/overflow".to_string()),
+                action: Some("s".to_string()),
+                value: Some(json!("v")),
+                request_id: Some("rovf".to_string()),
+                ..Default::default()
+            };
+            let resp = db
+                .handle_on_disconnect("client1", &msg)
+                .await
+                .expect("resp");
+            assert_eq!(resp.error.as_deref(), Some(error::PAYLOAD_TOO_LARGE));
+
+            // A fresh client with a single oversized value trips the byte cap.
+            let (conn2, _m2) = MockConnection::new();
+            db.add_client_internal("client2", None, "conn2", conn2);
+            let big = "x".repeat(MAX_ON_DISCONNECT_BYTES_PER_CLIENT + 1);
+            let msg = ClientMessage {
+                path: Some("/big".to_string()),
+                action: Some("s".to_string()),
+                value: Some(json!(big)),
+                request_id: Some("rbig".to_string()),
+                ..Default::default()
+            };
+            let resp = db
+                .handle_on_disconnect("client2", &msg)
+                .await
+                .expect("resp");
+            assert_eq!(resp.error.as_deref(), Some(error::PAYLOAD_TOO_LARGE));
+        })
+    }
+
+    #[test]
     fn test_handle_subscribe() {
         block_on(async {
             let mut db = Database::new("test".to_string(), "test-project".to_string(), true);
@@ -6314,6 +6483,55 @@ mod tests {
             let resp = response.expect("Expected a NACK response");
             assert!(resp.nack.is_some(), "Expected NACK, got: {:?}", resp);
             assert_eq!(resp.error.as_deref(), Some("unavailable"));
+        })
+    }
+
+    #[test]
+    fn test_transaction_op_count_cap() {
+        block_on(async {
+            let mut db = Database::new("test".to_string(), "test-project".to_string(), true);
+            let (conn, _messages) = MockConnection::new();
+            db.add_client_internal("client1", None, "conn1", conn);
+
+            // A transaction at the cap is accepted (open rules by default).
+            let ops_at_cap: Vec<_> = (0..MAX_TRANSACTION_OPS)
+                .map(|i| crate::protocol::TransactionOp {
+                    op: "s".to_string(),
+                    path: format!("/k{}", i),
+                    value: Some(json!(i)),
+                    hash: None,
+                })
+                .collect();
+            let msg = ClientMessage {
+                op: "t".to_string(),
+                request_id: Some("r1".to_string()),
+                operations: Some(ops_at_cap),
+                ..Default::default()
+            };
+            let resp = db.handle_transaction("client1", &msg).await.expect("resp");
+            assert!(
+                resp.nack.is_none(),
+                "transaction at the cap should not be rejected for size, got: {:?}",
+                resp
+            );
+
+            // One more op exceeds the cap → NACK PAYLOAD_TOO_LARGE.
+            let too_many: Vec<_> = (0..=MAX_TRANSACTION_OPS)
+                .map(|i| crate::protocol::TransactionOp {
+                    op: "s".to_string(),
+                    path: format!("/k{}", i),
+                    value: Some(json!(i)),
+                    hash: None,
+                })
+                .collect();
+            let msg = ClientMessage {
+                op: "t".to_string(),
+                request_id: Some("r2".to_string()),
+                operations: Some(too_many),
+                ..Default::default()
+            };
+            let resp = db.handle_transaction("client1", &msg).await.expect("resp");
+            assert_eq!(resp.error.as_deref(), Some(error::PAYLOAD_TOO_LARGE));
         })
     }
 

@@ -626,6 +626,31 @@ impl View {
     }
 }
 
+/// Maximum number of distinct subscriptions (views) a single client connection
+/// may hold on one database. A subscription amplifies every matching write's
+/// fan-out, so an unbounded count lets one cheap connection inflate per-write
+/// work for the whole database. Firebase documents no per-connection listener
+/// limit; this is a generous DoS rail (audit M-3). Re-subscribing to a view the
+/// client already holds is idempotent and does not count against this.
+const MAX_SUBSCRIPTIONS_PER_CLIENT: usize = 1_000;
+
+/// Why a `subscribe` call was rejected. Distinct from [`QueryError`] (a
+/// query-*parsing* failure) so unrelated query-parsing call sites don't have to
+/// reason about subscription limits.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SubscribeError {
+    /// The query parameters themselves were invalid.
+    Query(QueryError),
+    /// The client already holds [`MAX_SUBSCRIPTIONS_PER_CLIENT`] subscriptions.
+    TooManySubscriptions { limit: usize },
+}
+
+impl From<QueryError> for SubscribeError {
+    fn from(e: QueryError) -> Self {
+        SubscribeError::Query(e)
+    }
+}
+
 /// Manages all active views and generates events.
 ///
 /// Uses shared views internally to optimize event generation for high-fanout scenarios.
@@ -712,7 +737,7 @@ impl ViewManager {
         path: &str,
         query_params: Option<&QueryParams>,
         conn: Arc<dyn ConnectionSender>,
-    ) -> Result<String, QueryError> {
+    ) -> Result<String, SubscribeError> {
         let query = match query_params {
             Some(p) => p.to_query()?,
             None => Query::default(),
@@ -729,6 +754,16 @@ impl ViewManager {
             .is_some_and(|keys| keys.contains(&view_key));
 
         if !already_subscribed {
+            // Enforce the per-client subscription cap before registering a new
+            // view. Idempotent re-subscribes (already_subscribed) are exempt so
+            // a client at the cap can still refresh an existing listener.
+            let current = self.by_client.get(client_id).map_or(0, |keys| keys.len());
+            if current >= MAX_SUBSCRIPTIONS_PER_CLIENT {
+                return Err(SubscribeError::TooManySubscriptions {
+                    limit: MAX_SUBSCRIPTIONS_PER_CLIENT,
+                });
+            }
+
             // Get or create the shared view
             let shared_view = self
                 .shared_views
@@ -3349,6 +3384,38 @@ mod tests {
         // After unsubscribe: 1 view (/a still has client2)
         assert_eq!(vm.view_count(), 1);
         assert_eq!(vm.subscription_count(), 1);
+    }
+
+    #[test]
+    fn test_subscription_cap_per_client() {
+        let mut vm = ViewManager::new();
+
+        // Fill client1 to the cap with distinct paths.
+        for i in 0..MAX_SUBSCRIPTIONS_PER_CLIENT {
+            let path = format!("/p{}", i);
+            assert!(vm.subscribe("client1", &path, None, mock_conn()).is_ok());
+        }
+
+        // One more distinct path is rejected.
+        let err = vm
+            .subscribe("client1", "/overflow", None, mock_conn())
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SubscribeError::TooManySubscriptions {
+                limit: MAX_SUBSCRIPTIONS_PER_CLIENT
+            }
+        );
+
+        // Re-subscribing to a view the client already holds is idempotent and
+        // must still succeed even at the cap.
+        assert!(vm.subscribe("client1", "/p0", None, mock_conn()).is_ok());
+
+        // The cap is per-client: a different connection is unaffected.
+        assert!(
+            vm.subscribe("client2", "/overflow", None, mock_conn())
+                .is_ok()
+        );
     }
 
     // ==========================================================================

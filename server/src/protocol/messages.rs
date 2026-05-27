@@ -184,6 +184,8 @@ pub mod error {
     pub const RESPONSE_TOO_LARGE: &str = "response_too_large";
     pub const CONDITION_FAILED: &str = "condition_failed";
     pub const TOO_MANY_CONNECTIONS: &str = "too_many_connections";
+    /// Client exceeded the per-connection subscription cap.
+    pub const TOO_MANY_SUBSCRIPTIONS: &str = "too_many_subscriptions";
     /// Segment or storage unavailable - client should retry
     pub const UNAVAILABLE: &str = "unavailable";
 }
