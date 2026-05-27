@@ -140,8 +140,16 @@ build-edge: build-spa
 # ---------------------------------------------------------------------------
 
 .PHONY: up
-up:
+up: .env
 	docker compose up --build
+
+# First `make up` writes a .env with a unique, strong SERVER_SECRET so the stack
+# never boots with the publicly-known compose default (security audit H-1). An
+# existing .env is left untouched.
+.env:
+	@command -v openssl >/dev/null 2>&1 || { echo "openssl not found: create .env with SERVER_SECRET set to a 32+ byte random value (e.g. from another generator)"; exit 1; }
+	@printf 'SERVER_SECRET=%s\n' "$$(openssl rand -hex 32)" > .env
+	@echo "Generated .env with a random SERVER_SECRET."
 
 .PHONY: down
 down:
