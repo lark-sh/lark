@@ -215,8 +215,9 @@ fn eval_call(callee: &Expr, args: &[Expr], ctx: &EvalContext) -> Result<Value, E
     // Check if callee is a member expression (method call)
     if let Expr::Member { object, property } = callee {
         let obj = eval(object, ctx)?;
-        // call_method now returns Result to propagate NeedsPromotion
-        return Ok(obj.call_method(property, &arg_values)?);
+        // call_method returns Result to propagate both NeedsPromotion and
+        // evaluation errors (e.g. an invalid runtime regex in matches() — see L-4).
+        return obj.call_method(property, &arg_values);
     }
 
     // Otherwise it's a direct function call - not supported in rules
@@ -375,6 +376,18 @@ mod tests {
             Value::String(s) => assert_eq!(s, "hello"),
             _ => panic!("expected string"),
         }
+    }
+
+    #[test]
+    fn test_matches_invalid_regex_denies_even_negated() {
+        // Audit L-4: a dynamically-constructed regex that fails to compile must
+        // surface as an evaluation error (which the evaluator maps to deny),
+        // both directly and — critically — under negation, where returning a
+        // bare `false` used to flip to `true` and grant.
+        assert!(eval_expr_bool("'x'.matches('[bad')").is_err());
+        assert!(eval_expr_bool("!'x'.matches('[bad')").is_err());
+        // A valid dynamic pattern still evaluates normally.
+        assert!(eval_expr_bool("'x'.matches('[a-z]')").unwrap());
     }
 
     #[test]
