@@ -39,9 +39,9 @@ func (db *LocalDB) GetAccountByID(ctx context.Context, id string) (*Account, err
 func (db *LocalDB) GetAccountByEmail(ctx context.Context, email string) (*Account, error) {
 	return nil, ErrNotFound
 }
-func (db *LocalDB) ListAccounts(ctx context.Context) ([]*Account, error)             { return nil, nil }
-func (db *LocalDB) CreateAccount(ctx context.Context, a *Account) error              { return ErrUnsupported }
-func (db *LocalDB) DeleteAccount(ctx context.Context, accountID string) error        { return ErrUnsupported }
+func (db *LocalDB) ListAccounts(ctx context.Context) ([]*Account, error)      { return nil, nil }
+func (db *LocalDB) CreateAccount(ctx context.Context, a *Account) error       { return ErrUnsupported }
+func (db *LocalDB) DeleteAccount(ctx context.Context, accountID string) error { return ErrUnsupported }
 func (db *LocalDB) UpdateAccountPassword(ctx context.Context, accountID, passwordHash string, mustChangePassword bool) error {
 	return ErrUnsupported
 }
@@ -59,16 +59,15 @@ func (db *LocalDB) DeleteSession(ctx context.Context, id string) error { return 
 
 func (db *LocalDB) GetProjectByID(ctx context.Context, projectID string) (*Project, error) {
 	return &Project{
-		ID:                            db.projectID,
-		Name:                          "Local Project",
-		SecretKey:                     "local-secret-key",
-		AdminSecretKey:                "local-admin-secret",
-		RulesJSON:                     `{"rules":{".read":true,".write":true}}`,
-		Ephemeral:                     true,
-		AutoCreate:                    true,
-		FirebaseCompatEnabled:         true,
-		UseFirstPathSegmentAsDatabase: false,
-		ConfigVersion:                 1,
+		ID:                    db.projectID,
+		Name:                  "Local Project",
+		SecretKey:             "local-secret-key",
+		AdminSecretKey:        "local-admin-secret",
+		RulesJSON:             `{"rules":{".read":true,".write":true}}`,
+		Ephemeral:             true,
+		AutoCreate:            true,
+		FirebaseCompatEnabled: true,
+		ConfigVersion:         1,
 	}, nil
 }
 

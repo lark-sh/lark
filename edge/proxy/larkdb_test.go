@@ -93,15 +93,14 @@ func TestResolveHTTPMethod(t *testing.T) {
 // TestBuildProjectConfig tests that buildProjectConfig correctly converts db.Project to backend.ProjectConfig
 func TestBuildProjectConfig(t *testing.T) {
 	project := &db.Project{
-		ID:                            "test-project",
-		RulesJSON:                     `{"rules": {".read": true}}`,
-		SecretKey:                     "secret-key-123",
-		AdminSecretKey:                "admin-secret-456",
-		FirebaseProjectID:             "firebase-proj",
-		Ephemeral:                     true,
-		AutoCreate:                    true,
-		FirebaseCompatEnabled:         true,
-		UseFirstPathSegmentAsDatabase: false,
+		ID:                    "test-project",
+		RulesJSON:             `{"rules": {".read": true}}`,
+		SecretKey:             "secret-key-123",
+		AdminSecretKey:        "admin-secret-456",
+		FirebaseProjectID:     "firebase-proj",
+		Ephemeral:             true,
+		AutoCreate:            true,
+		FirebaseCompatEnabled: true,
 	}
 
 	config := buildProjectConfig(project)
@@ -128,9 +127,6 @@ func TestBuildProjectConfig(t *testing.T) {
 	}
 	if config.Settings["firebase_compat_enabled"] != true {
 		t.Errorf("firebase_compat_enabled setting: got %v, want true", config.Settings["firebase_compat_enabled"])
-	}
-	if config.Settings["use_first_path_segment_as_database"] != false {
-		t.Errorf("use_first_path_segment_as_database setting: got %v, want false", config.Settings["use_first_path_segment_as_database"])
 	}
 }
 

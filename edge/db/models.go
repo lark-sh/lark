@@ -7,19 +7,18 @@ import (
 
 // Project represents a project/app.
 type Project struct {
-	ID                            string `json:"id"`
-	Name                          string `json:"name"`
-	SecretKey                     string `json:"secret_key"`
-	AdminSecretKey                string `json:"admin_secret_key"`
-	RulesJSON                     string `json:"rules_json"`
-	Ephemeral                     bool   `json:"ephemeral"`
-	AutoCreate                    bool   `json:"auto_create"`
-	FirebaseCompatEnabled         bool   `json:"firebase_compat_enabled"`
-	FirebaseProjectID             string `json:"firebase_project_id"`
-	UseFirstPathSegmentAsDatabase bool   `json:"use_first_path_segment_as_database"`
-	ConfigVersion                 int64  `json:"config_version"`
-	CreatedAt                     int64  `json:"created_at"`
-	UpdatedAt                     int64  `json:"updated_at"`
+	ID                    string `json:"id"`
+	Name                  string `json:"name"`
+	SecretKey             string `json:"secret_key"`
+	AdminSecretKey        string `json:"admin_secret_key"`
+	RulesJSON             string `json:"rules_json"`
+	Ephemeral             bool   `json:"ephemeral"`
+	AutoCreate            bool   `json:"auto_create"`
+	FirebaseCompatEnabled bool   `json:"firebase_compat_enabled"`
+	FirebaseProjectID     string `json:"firebase_project_id"`
+	ConfigVersion         int64  `json:"config_version"`
+	CreatedAt             int64  `json:"created_at"`
+	UpdatedAt             int64  `json:"updated_at"`
 }
 
 // Server represents a backend database server.

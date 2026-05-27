@@ -64,7 +64,6 @@ export interface Project {
   auto_create: boolean;
   firebase_compat_enabled: boolean;
   firebase_project_id: string;
-  use_first_path_segment_as_database: boolean;
   config_version: number;
   created_at: number;
   updated_at: number;
@@ -182,7 +181,6 @@ export const api = {
     auto_create?: boolean;
     firebase_compat_enabled?: boolean;
     firebase_project_id?: string;
-    use_first_path_segment_as_database?: boolean;
     rules_json?: string;
   }) =>
     request<Project>('/projects', {

@@ -244,7 +244,7 @@ func (db *PostgresDB) DeleteSession(ctx context.Context, id string) error {
 }
 
 // nullableString returns nil for the empty string so INSERTs land NULL
-// instead of '' in nullable columns.
+// instead of ” in nullable columns.
 func nullableString(s string) interface{} {
 	if s == "" {
 		return nil
@@ -269,13 +269,13 @@ func (db *PostgresDB) GetProjectByID(ctx context.Context, id string) (*Project, 
 	err := db.pool.QueryRow(ctx, `
 		SELECT id, name, secret_key, admin_secret_key, rules_json,
 		       ephemeral, auto_create, firebase_compat_enabled,
-		       firebase_project_id, use_first_path_segment_as_database,
+		       firebase_project_id,
 		       config_version, created_at, updated_at
 		FROM projects WHERE id = $1
 	`, id).Scan(
 		&p.ID, &p.Name, &p.SecretKey, &p.AdminSecretKey, &p.RulesJSON,
 		&p.Ephemeral, &p.AutoCreate, &p.FirebaseCompatEnabled,
-		&p.FirebaseProjectID, &p.UseFirstPathSegmentAsDatabase,
+		&p.FirebaseProjectID,
 		&p.ConfigVersion, &p.CreatedAt, &p.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -291,7 +291,7 @@ func (db *PostgresDB) ListProjects(ctx context.Context) ([]*Project, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT id, name, secret_key, admin_secret_key, rules_json,
 		       ephemeral, auto_create, firebase_compat_enabled,
-		       firebase_project_id, use_first_path_segment_as_database,
+		       firebase_project_id,
 		       config_version, created_at, updated_at
 		FROM projects ORDER BY created_at ASC
 	`)
@@ -306,7 +306,7 @@ func (db *PostgresDB) ListProjects(ctx context.Context) ([]*Project, error) {
 		err := rows.Scan(
 			&p.ID, &p.Name, &p.SecretKey, &p.AdminSecretKey, &p.RulesJSON,
 			&p.Ephemeral, &p.AutoCreate, &p.FirebaseCompatEnabled,
-			&p.FirebaseProjectID, &p.UseFirstPathSegmentAsDatabase,
+			&p.FirebaseProjectID,
 			&p.ConfigVersion, &p.CreatedAt, &p.UpdatedAt,
 		)
 		if err != nil {
@@ -330,13 +330,13 @@ func (db *PostgresDB) CreateProject(ctx context.Context, p *Project) error {
 	_, err := db.pool.Exec(ctx, `
 		INSERT INTO projects (id, name, secret_key, admin_secret_key, rules_json,
 		                     ephemeral, auth_required, auto_create, firebase_compat_enabled,
-		                     firebase_project_id, use_first_path_segment_as_database,
+		                     firebase_project_id,
 		                     config_version, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	`,
 		p.ID, p.Name, p.SecretKey, p.AdminSecretKey, p.RulesJSON,
 		p.Ephemeral, false /* auth_required */, p.AutoCreate, p.FirebaseCompatEnabled,
-		p.FirebaseProjectID, p.UseFirstPathSegmentAsDatabase,
+		p.FirebaseProjectID,
 		p.ConfigVersion, p.CreatedAt, p.UpdatedAt,
 	)
 	return err
@@ -354,15 +354,14 @@ func (db *PostgresDB) UpdateProject(ctx context.Context, p *Project) (int64, err
 			auto_create = $7,
 			firebase_compat_enabled = $8,
 			firebase_project_id = $9,
-			use_first_path_segment_as_database = $10,
 			config_version = config_version + 1,
-			updated_at = $11
+			updated_at = $10
 		WHERE id = $1
 		RETURNING config_version
 	`,
 		p.ID, p.Name, p.SecretKey, p.AdminSecretKey, p.RulesJSON,
 		p.Ephemeral, p.AutoCreate, p.FirebaseCompatEnabled,
-		p.FirebaseProjectID, p.UseFirstPathSegmentAsDatabase,
+		p.FirebaseProjectID,
 		NowMS(),
 	).Scan(&newVersion)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -817,7 +816,7 @@ func (db *PostgresDB) GetConnectData(ctx context.Context, projectID, databaseID 
 		SELECT
 			p.id, p.name, p.secret_key, p.admin_secret_key, p.rules_json,
 			p.ephemeral, p.auto_create, p.firebase_compat_enabled,
-			p.firebase_project_id, p.use_first_path_segment_as_database,
+			p.firebase_project_id,
 			p.config_version, p.created_at, p.updated_at,
 			d.id, d.server_id, d.ephemeral, d.status, d.last_activity, d.created_at,
 			s.id, s.hostname, s.ip_address, s.private_ip, s.udp_port, s.last_heartbeat,
@@ -829,7 +828,7 @@ func (db *PostgresDB) GetConnectData(ctx context.Context, projectID, databaseID 
 	`, projectID, databaseID, cutoff).Scan(
 		&p.ID, &p.Name, &p.SecretKey, &p.AdminSecretKey, &p.RulesJSON,
 		&p.Ephemeral, &p.AutoCreate, &p.FirebaseCompatEnabled,
-		&p.FirebaseProjectID, &p.UseFirstPathSegmentAsDatabase,
+		&p.FirebaseProjectID,
 		&p.ConfigVersion, &p.CreatedAt, &p.UpdatedAt,
 		&dbID, &dbServerID, &dbEphemeral, &dbStatus, &dbLastActivity, &dbCreatedAt,
 		&serverID, &serverHostname, &serverIPAddress, &serverPrivateIP, &serverUDPPort, &serverLastHeartbeat,

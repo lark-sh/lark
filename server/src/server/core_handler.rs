@@ -1114,11 +1114,8 @@ impl ConnectionSender for VirtualClientSender {
         }
     }
 
-    fn firebase_path_prefix(&self) -> Option<String> {
-        self.client.firebase_adapter().map(|adapter_cell| {
-            let adapter = adapter_cell.borrow();
-            adapter.path_prefix().to_string()
-        })
+    fn is_firebase(&self) -> bool {
+        self.client.firebase_adapter().is_some()
     }
 
     fn outbox_id(&self) -> usize {

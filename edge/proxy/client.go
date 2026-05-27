@@ -103,10 +103,10 @@ import (
 type ClientState int
 
 const (
-	StateConnected   ClientState = iota // Just connected, waiting for routing info
-	StateRouting                        // Looking up backend
-	StateForwarding                     // Relay mode
-	StateClosing                        // Shutting down
+	StateConnected  ClientState = iota // Just connected, waiting for routing info
+	StateRouting                       // Looking up backend
+	StateForwarding                    // Relay mode
+	StateClosing                       // Shutting down
 )
 
 // Protocol type
@@ -611,39 +611,16 @@ func (c *ClientConn) sendFirebaseOK(requestID int, data interface{}) {
 	c.sendDirect(responseData, true)
 }
 
-// extractDatabaseFromPath extracts database ID from Firebase path
+// resolveDatabase sets the database for this connection. It's the project's
+// "default" database unless one was already selected from the `db--project`
+// subdomain convention. (`path` is unused — kept for the call site's binding.)
 func (c *ClientConn) extractDatabaseFromPath(path string) {
-	// Already set (e.g., from double-hyphen subdomain convention)
+	_ = path
+	// Already set from the `db--project` subdomain convention.
 	if c.databaseID != "" {
 		return
 	}
-
-	// Path format: /database/rest/of/path or /rest/of/path
-	if len(path) == 0 || path[0] != '/' {
-		return
-	}
-
-	// Check project config for path routing mode
-	project, err := c.server.GetProjectCached(c.server.ctx, c.projectID)
-	if err != nil {
-		logger.Error("Project lookup failed", "client_id", c.id, "project", c.projectID, "error", err)
-		return
-	}
-
-	if project.UseFirstPathSegmentAsDatabase {
-		// First segment is database
-		path = path[1:] // Remove leading /
-		for i := 0; i < len(path); i++ {
-			if path[i] == '/' {
-				c.databaseID = path[:i]
-				return
-			}
-		}
-		c.databaseID = path // Entire path is database
-	} else {
-		// Use "default" database
-		c.databaseID = "default"
-	}
+	c.databaseID = "default"
 }
 
 // startRouting initiates the routing lookup for Firebase clients
@@ -763,15 +740,11 @@ func (c *ClientConn) startRoutingWithProject(project *db.Project, authPayload *b
 
 	// Build metadata for CONNECT
 	// For Firebase connections, include firebase: true and hostname
-	// For projects with UseFirstPathSegmentAsDatabase, include firebase_path_routing: true
 	var metadataBytes []byte
 	if c.protocol == ProtocolFirebase {
 		metadata := map[string]interface{}{
 			"firebase": true,
 			"hostname": c.hostname,
-		}
-		if project.UseFirstPathSegmentAsDatabase {
-			metadata["firebase_path_routing"] = true
 		}
 		metadataBytes, _ = sonic.Marshal(metadata)
 	}
@@ -1039,8 +1012,8 @@ func parseInt(s string) (int, error) {
 // isAuthMessage checks if a message is an auth message that should be handled locally
 // Precomputed byte slices for fast auth detection (no allocations)
 var (
-	larkAuthPattern    = []byte(`"o":"au"`)
-	firebaseAuthPattern = []byte(`"a":"auth"`)
+	larkAuthPattern      = []byte(`"o":"au"`)
+	firebaseAuthPattern  = []byte(`"a":"auth"`)
 	firebaseGauthPattern = []byte(`"a":"gauth"`)
 )
 

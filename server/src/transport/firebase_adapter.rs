@@ -229,10 +229,6 @@ pub struct FirebaseOnDisconnectBody {
 /// Project configuration for Firebase compatibility.
 #[derive(Debug, Clone, Default)]
 pub struct FirebaseConfig {
-    /// If true, extract database name from first path segment (path routing mode).
-    /// If false, use default database for all connections (simple mode).
-    pub use_first_path_segment_as_database: bool,
-
     /// Database name in simple mode. Typically "default".
     pub default_database: String,
 
@@ -264,10 +260,6 @@ pub struct FirebaseAdapter {
     /// Database ID (set when joining)
     database_id: Option<String>,
 
-    /// Path prefix to strip from incoming paths and add to outgoing paths.
-    /// e.g., "/campaigns-abc123" for path-based routing
-    path_prefix: String,
-
     /// Whether we've joined a Lark database (always true in proxy mode)
     joined: bool,
 
@@ -298,7 +290,6 @@ impl FirebaseAdapter {
             hostname: hostname.to_string(),
             session_id: generate_session_id(),
             database_id: None,
-            path_prefix: String::new(),
             joined: false,
             join_request_id: None,
             auto_auth_request_id: None,
@@ -387,17 +378,6 @@ impl FirebaseAdapter {
         self.joined
     }
 
-    /// Set the path prefix for path-based routing.
-    /// e.g., "/campaign-abc" to strip from incoming and add to outgoing paths.
-    pub fn set_path_prefix(&mut self, prefix: &str) {
-        self.path_prefix = prefix.to_string();
-    }
-
-    /// Get the current path prefix.
-    pub fn path_prefix(&self) -> &str {
-        &self.path_prefix
-    }
-
     /// Set the join request ID (for swallowing JoinAck).
     pub fn set_join_request_id(&mut self, id: &str) {
         self.join_request_id = Some(id.to_string());
@@ -406,36 +386,6 @@ impl FirebaseAdapter {
     /// Set the auto-auth request ID (for swallowing AuthAck).
     pub fn set_auto_auth_request_id(&mut self, id: &str) {
         self.auto_auth_request_id = Some(id.to_string());
-    }
-
-    // =========================================================================
-    // Path Transformation
-    // =========================================================================
-
-    /// Transform a Firebase path to a Lark internal path.
-    /// Strips the path prefix if path-based routing is enabled.
-    /// e.g., "/campaigns-abc123/messages" -> "/messages"
-    pub fn to_internal_path(&self, firebase_path: &str) -> String {
-        if self.path_prefix.is_empty() {
-            return firebase_path.to_string();
-        }
-        firebase_path
-            .strip_prefix(&self.path_prefix)
-            .unwrap_or(firebase_path)
-            .to_string()
-    }
-
-    /// Transform a Lark internal path to a Firebase path.
-    /// Adds the path prefix back if path-based routing is enabled.
-    /// e.g., "/messages" -> "/campaigns-abc123/messages"
-    pub fn to_external_path(&self, lark_path: &str) -> String {
-        if self.path_prefix.is_empty() {
-            return lark_path.to_string();
-        }
-        if lark_path == "/" {
-            return self.path_prefix.clone();
-        }
-        format!("{}{}", self.path_prefix, lark_path)
     }
 
     // =========================================================================
@@ -605,8 +555,7 @@ impl FirebaseAdapter {
         let listen_body: FirebaseListenBody = serde_json::from_value(body.clone())
             .map_err(|e| format!("invalid listen body: {}", e))?;
 
-        // Transform path
-        let internal_path = self.to_internal_path(&ensure_leading_slash(&listen_body.path));
+        let internal_path = ensure_leading_slash(&listen_body.path);
 
         let mut msg = ClientMessage {
             op: crate::protocol::op::SUBSCRIBE.to_string(),
@@ -641,8 +590,7 @@ impl FirebaseAdapter {
         let listen_body: FirebaseListenBody = serde_json::from_value(body.clone())
             .map_err(|e| format!("invalid unlisten body: {}", e))?;
 
-        // Transform path
-        let internal_path = self.to_internal_path(&ensure_leading_slash(&listen_body.path));
+        let internal_path = ensure_leading_slash(&listen_body.path);
 
         let mut msg = ClientMessage {
             op: crate::protocol::op::UNSUBSCRIBE.to_string(),
@@ -676,8 +624,7 @@ impl FirebaseAdapter {
         let get_body: FirebaseGetBody =
             serde_json::from_value(body.clone()).map_err(|e| format!("invalid get body: {}", e))?;
 
-        // Transform path
-        let internal_path = self.to_internal_path(&ensure_leading_slash(&get_body.path));
+        let internal_path = ensure_leading_slash(&get_body.path);
 
         let mut msg = ClientMessage {
             op: crate::protocol::op::ONCE.to_string(),
@@ -704,8 +651,7 @@ impl FirebaseAdapter {
         let put_body: FirebasePutBody =
             serde_json::from_value(body.clone()).map_err(|e| format!("invalid put body: {}", e))?;
 
-        // Transform path
-        let internal_path = self.to_internal_path(&ensure_leading_slash(&put_body.path));
+        let internal_path = ensure_leading_slash(&put_body.path);
 
         let mut msg = ClientMessage {
             op: crate::protocol::op::SET.to_string(),
@@ -733,8 +679,7 @@ impl FirebaseAdapter {
         let merge_body: FirebaseMergeBody = serde_json::from_value(body.clone())
             .map_err(|e| format!("invalid merge body: {}", e))?;
 
-        // Transform base path
-        let base_path = self.to_internal_path(&ensure_leading_slash(&merge_body.path));
+        let base_path = ensure_leading_slash(&merge_body.path);
 
         // Check if this is a multi-path update (keys contain slashes)
         if let Value::Object(data) = &merge_body.data {
@@ -804,7 +749,7 @@ impl FirebaseAdapter {
         let od_body: FirebaseOnDisconnectBody = serde_json::from_value(body.clone())
             .map_err(|e| format!("invalid ondisconnect body: {}", e))?;
 
-        let internal_path = self.to_internal_path(&ensure_leading_slash(&od_body.path));
+        let internal_path = ensure_leading_slash(&od_body.path);
 
         Ok((
             Some(ClientMessage {
@@ -828,7 +773,7 @@ impl FirebaseAdapter {
         let od_body: FirebaseOnDisconnectBody = serde_json::from_value(body.clone())
             .map_err(|e| format!("invalid ondisconnect body: {}", e))?;
 
-        let internal_path = self.to_internal_path(&ensure_leading_slash(&od_body.path));
+        let internal_path = ensure_leading_slash(&od_body.path);
 
         Ok((
             Some(ClientMessage {
@@ -852,7 +797,7 @@ impl FirebaseAdapter {
         let od_body: FirebaseOnDisconnectBody = serde_json::from_value(body.clone())
             .map_err(|e| format!("invalid ondisconnect body: {}", e))?;
 
-        let internal_path = self.to_internal_path(&ensure_leading_slash(&od_body.path));
+        let internal_path = ensure_leading_slash(&od_body.path);
 
         Ok((
             Some(ClientMessage {
@@ -1054,7 +999,7 @@ impl FirebaseAdapter {
         let value = msg.get("v").cloned().unwrap_or(Value::Null);
 
         // Apply path transformation - add prefix back to external path
-        let external_sub_path = self.to_external_path(sub_path);
+        let external_sub_path = sub_path.to_string();
 
         // Build the full path
         let full_path = if rel_path.is_empty() || rel_path == "/" {
@@ -1288,7 +1233,6 @@ pub fn generate_session_id() -> String {
 ///
 /// # Arguments
 /// * `event_type` - Either "put" or "patch"
-/// * `path_prefix` - The Firebase path prefix (e.g., "/campaign-123" or "")
 /// * `subscription_path` - The Lark subscription path (e.g., "/users")
 /// * `relative_path` - The relative path within the subscription (e.g., "/alice" or "/")
 /// * `value_bytes` - Pre-serialized JSON bytes of the value
@@ -1298,25 +1242,16 @@ pub fn generate_session_id() -> String {
 /// Firebase wire format bytes ready to send to the client.
 pub fn encode_firebase_event(
     event_type: &str,
-    path_prefix: &str,
     subscription_path: &str,
     relative_path: &str,
     value_bytes: &[u8],
     tag: Option<i32>,
 ) -> Vec<u8> {
     // Build the full external path (Firebase format: no leading slash)
-    let external_sub_path = if path_prefix.is_empty() {
-        subscription_path.to_string()
-    } else if subscription_path == "/" {
-        path_prefix.to_string()
-    } else {
-        format!("{}{}", path_prefix, subscription_path)
-    };
-
     let full_path = if relative_path.is_empty() || relative_path == "/" {
-        external_sub_path
+        subscription_path.to_string()
     } else {
-        format!("{}{}", external_sub_path, relative_path)
+        format!("{}{}", subscription_path, relative_path)
     };
 
     // Strip leading slash for Firebase format
@@ -1387,27 +1322,6 @@ pub fn insert_firebase_tag(firebase_bytes: &[u8], tag: i32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_path_transformation() {
-        let mut adapter = FirebaseAdapter::new("my-project", "localhost");
-
-        // Without prefix
-        assert_eq!(adapter.to_internal_path("/players/abc"), "/players/abc");
-        assert_eq!(adapter.to_external_path("/players/abc"), "/players/abc");
-
-        // With prefix
-        adapter.set_path_prefix("/campaign-123");
-        assert_eq!(
-            adapter.to_internal_path("/campaign-123/players/abc"),
-            "/players/abc"
-        );
-        assert_eq!(
-            adapter.to_external_path("/players/abc"),
-            "/campaign-123/players/abc"
-        );
-        assert_eq!(adapter.to_external_path("/"), "/campaign-123");
-    }
 
     #[test]
     fn test_format_request_id() {
@@ -1972,31 +1886,6 @@ mod tests {
     }
 
     #[test]
-    fn test_event_path_transformation_with_prefix() {
-        let mut adapter = FirebaseAdapter::new("test-project", "host");
-        adapter.set_path_prefix("/campaigns-abc123");
-
-        // Simulate a put event from Lark (internal paths)
-        let event = json!({
-            "ev": "put",
-            "sp": "/messages",  // internal subscription path
-            "p": "/msg1",       // relative path
-            "v": "hello world"
-        });
-
-        let result = adapter
-            .translate_outgoing(serde_json::to_vec(&event).unwrap().as_slice())
-            .unwrap();
-
-        let result = result.unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        // Path should have prefix added back (external path)
-        // /campaigns-abc123/messages + /msg1 = campaigns-abc123/messages/msg1 (no leading slash)
-        assert_eq!(parsed["d"]["b"]["p"], "campaigns-abc123/messages/msg1");
-    }
-
-    #[test]
     fn test_translate_outgoing_chunked_small_message() {
         let adapter = FirebaseAdapter::new("test-project", "host");
 
@@ -2140,14 +2029,7 @@ mod tests {
     #[test]
     fn test_encode_firebase_event_put() {
         let value_bytes = br#"{"name":"Alice"}"#;
-        let result = encode_firebase_event(
-            "put",
-            "", // no path prefix
-            "/users",
-            "/alice",
-            value_bytes,
-            None,
-        );
+        let result = encode_firebase_event("put", "/users", "/alice", value_bytes, None);
 
         let parsed: Value = serde_json::from_slice(&result).unwrap();
         assert_eq!(parsed["t"], "d");
@@ -2160,7 +2042,7 @@ mod tests {
     #[test]
     fn test_encode_firebase_event_patch() {
         let value_bytes = br#"{"/name":"Bob"}"#;
-        let result = encode_firebase_event("patch", "", "/users", "/bob", value_bytes, None);
+        let result = encode_firebase_event("patch", "/users", "/bob", value_bytes, None);
 
         let parsed: Value = serde_json::from_slice(&result).unwrap();
         assert_eq!(parsed["t"], "d");
@@ -2169,26 +2051,9 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_firebase_event_with_path_prefix() {
-        let value_bytes = br#"42"#;
-        let result = encode_firebase_event(
-            "put",
-            "/campaign-123", // path prefix
-            "/scores",
-            "/player1",
-            value_bytes,
-            None,
-        );
-
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-        assert_eq!(parsed["d"]["b"]["p"], "campaign-123/scores/player1");
-        assert_eq!(parsed["d"]["b"]["d"], 42);
-    }
-
-    #[test]
     fn test_encode_firebase_event_with_tag() {
         let value_bytes = br#"100"#;
-        let result = encode_firebase_event("put", "", "/scores", "/player1", value_bytes, Some(7));
+        let result = encode_firebase_event("put", "/scores", "/player1", value_bytes, Some(7));
 
         let parsed: Value = serde_json::from_slice(&result).unwrap();
         assert_eq!(parsed["d"]["b"]["t"], 7);
@@ -2198,7 +2063,7 @@ mod tests {
     fn test_encode_firebase_event_root_path() {
         // When subscription path is "/" and relative path is "/"
         let value_bytes = br#"{"data":"value"}"#;
-        let result = encode_firebase_event("put", "", "/", "/", value_bytes, None);
+        let result = encode_firebase_event("put", "/", "/", value_bytes, None);
 
         let parsed: Value = serde_json::from_slice(&result).unwrap();
         // Empty path after stripping leading slash
@@ -2206,20 +2071,9 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_firebase_event_path_prefix_only() {
-        // When path prefix is set but subscription path is "/"
-        let value_bytes = br#"{"key":"val"}"#;
-        let result = encode_firebase_event("put", "/campaign-abc", "/", "/", value_bytes, None);
-
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-        assert_eq!(parsed["d"]["b"]["p"], "campaign-abc");
-    }
-
-    #[test]
     fn test_insert_firebase_tag() {
         // Create a Firebase event without tag
-        let base =
-            encode_firebase_event("put", "", "/users", "/alice", br#"{"name":"Alice"}"#, None);
+        let base = encode_firebase_event("put", "/users", "/alice", br#"{"name":"Alice"}"#, None);
 
         // Insert a tag
         let with_tag = insert_firebase_tag(&base, 42);
@@ -2234,7 +2088,7 @@ mod tests {
 
     #[test]
     fn test_insert_firebase_tag_negative() {
-        let base = encode_firebase_event("put", "", "/data", "/", br#"null"#, None);
+        let base = encode_firebase_event("put", "/data", "/", br#"null"#, None);
 
         let with_tag = insert_firebase_tag(&base, -5);
 
@@ -2246,13 +2100,13 @@ mod tests {
     fn test_insert_firebase_tag_preserves_content() {
         // Ensure that inserting a tag doesn't corrupt the JSON
         let value_bytes = br#"{"complex":{"nested":true},"array":[1,2,3]}"#;
-        let base = encode_firebase_event("patch", "/prefix", "/path", "/sub", value_bytes, None);
+        let base = encode_firebase_event("patch", "/path", "/sub", value_bytes, None);
 
         let with_tag = insert_firebase_tag(&base, 999);
 
         let parsed: Value = serde_json::from_slice(&with_tag).unwrap();
         assert_eq!(parsed["d"]["a"], "m");
-        assert_eq!(parsed["d"]["b"]["p"], "prefix/path/sub");
+        assert_eq!(parsed["d"]["b"]["p"], "path/sub");
         assert_eq!(parsed["d"]["b"]["d"]["complex"]["nested"], true);
         assert_eq!(parsed["d"]["b"]["d"]["array"][0], 1);
         assert_eq!(parsed["d"]["b"]["t"], 999);
@@ -2262,7 +2116,7 @@ mod tests {
     fn test_insert_firebase_tag_empty_object() {
         // Edge case: VALUE is an empty object {}
         // Message ends with }}}} not }}}
-        let base = encode_firebase_event("put", "", "/data", "/", br#"{}"#, None);
+        let base = encode_firebase_event("put", "/data", "/", br#"{}"#, None);
 
         // Verify the base ends with }}}} (object close + 3 envelope closes)
         assert!(base.ends_with(b"}}}}"));
@@ -2281,7 +2135,7 @@ mod tests {
     fn test_insert_firebase_tag_null_value() {
         // Edge case: VALUE is null
         // Message ends with }}} (null + 3 envelope closes)
-        let base = encode_firebase_event("put", "", "/data", "/", b"null", None);
+        let base = encode_firebase_event("put", "/data", "/", b"null", None);
 
         // Verify the base ends with }}} but not }}}}
         assert!(base.ends_with(b"}}}"));
@@ -2297,7 +2151,7 @@ mod tests {
     #[test]
     fn test_insert_firebase_tag_array_value() {
         // Edge case: VALUE is an array
-        let base = encode_firebase_event("put", "", "/data", "/", b"[1,2,3]", None);
+        let base = encode_firebase_event("put", "/data", "/", b"[1,2,3]", None);
 
         let with_tag = insert_firebase_tag(&base, 42);
 
@@ -2313,7 +2167,7 @@ mod tests {
 
         // Pre-encoded Firebase event (what ViewManager would generate)
         let firebase_bytes =
-            encode_firebase_event("put", "", "/users", "/alice", br#"{"name":"Alice"}"#, None);
+            encode_firebase_event("put", "/users", "/alice", br#"{"name":"Alice"}"#, None);
 
         // Call with skip_translation=true
         let chunks = adapter

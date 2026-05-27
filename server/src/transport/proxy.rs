@@ -979,23 +979,9 @@ impl<H: ProxyHandler + 'static> ProxyConnection<H> {
             // so mark as already joined (no lazy join needed)
             adapter.set_joined();
 
-            // Check if this project uses path-based database routing (Firebase legacy mode)
-            // If so, we need to strip/add the database prefix from/to paths
-            if metadata
-                .get("firebase_path_routing")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
-                // Firebase legacy mode: paths include database name as first segment
-                // e.g., /campaign-abc/players -> /players (internally)
-                adapter.set_path_prefix(&format!("/{}", database_id));
-            }
-
             trace!(
-                "Firebase client connected: project={}, db={}, path_prefix={}",
-                project_id,
-                database_id,
-                adapter.path_prefix()
+                "Firebase client connected: project={}, db={}",
+                project_id, database_id
             );
 
             Some(RefCell::new(adapter))

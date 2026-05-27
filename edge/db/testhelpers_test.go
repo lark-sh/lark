@@ -82,9 +82,9 @@ func seedTestData(t *testing.T, database *PostgresDB) {
 	}
 
 	_, err = database.Exec(ctx, `
-		INSERT INTO projects (id, name, secret_key, admin_secret_key, rules_json, ephemeral, auto_create, firebase_compat_enabled, firebase_project_id, use_first_path_segment_as_database, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-	`, testProjectID, "Test Project", testSecretKey, testAdminSecretKey, `{".read": true}`, false, true, true, "", true, now, now)
+		INSERT INTO projects (id, name, secret_key, admin_secret_key, rules_json, ephemeral, auto_create, firebase_compat_enabled, firebase_project_id, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	`, testProjectID, "Test Project", testSecretKey, testAdminSecretKey, `{".read": true}`, false, true, true, "", now, now)
 	if err != nil {
 		t.Fatalf("Failed to create test project: %v", err)
 	}
@@ -124,9 +124,9 @@ func seedMinimalTestData(t *testing.T, database *PostgresDB) {
 	}
 
 	_, err = database.Exec(ctx, `
-		INSERT INTO projects (id, name, secret_key, admin_secret_key, rules_json, ephemeral, auto_create, firebase_compat_enabled, firebase_project_id, use_first_path_segment_as_database, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-	`, testProjectID, "Test Project", testSecretKey, testAdminSecretKey, `{".read": true}`, false, true, true, "", true, now, now)
+		INSERT INTO projects (id, name, secret_key, admin_secret_key, rules_json, ephemeral, auto_create, firebase_compat_enabled, firebase_project_id, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	`, testProjectID, "Test Project", testSecretKey, testAdminSecretKey, `{".read": true}`, false, true, true, "", now, now)
 	if err != nil {
 		t.Fatalf("Failed to create test project: %v", err)
 	}

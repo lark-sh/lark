@@ -42,13 +42,12 @@ func (s *Server) handleAdminGetProject(w http.ResponseWriter, r *http.Request) {
 }
 
 type adminCreateProjectRequest struct {
-	ID                            string `json:"id"`
-	Name                          string `json:"name"`
-	RulesJSON                     string `json:"rules_json,omitempty"`
-	Ephemeral                     bool   `json:"ephemeral"`
-	AutoCreate                    bool   `json:"auto_create"`
-	FirebaseProjectID             string `json:"firebase_project_id,omitempty"`
-	UseFirstPathSegmentAsDatabase bool   `json:"use_first_path_segment_as_database"`
+	ID                string `json:"id"`
+	Name              string `json:"name"`
+	RulesJSON         string `json:"rules_json,omitempty"`
+	Ephemeral         bool   `json:"ephemeral"`
+	AutoCreate        bool   `json:"auto_create"`
+	FirebaseProjectID string `json:"firebase_project_id,omitempty"`
 }
 
 func (s *Server) handleAdminCreateProject(w http.ResponseWriter, r *http.Request) {
@@ -83,9 +82,8 @@ func (s *Server) handleAdminCreateProject(w http.ResponseWriter, r *http.Request
 		AutoCreate:     req.AutoCreate,
 		// Always on; no longer user-facing, but still plumbed through the DB/config
 		// in case we want to reintroduce the toggle later.
-		FirebaseCompatEnabled:         true,
-		FirebaseProjectID:             req.FirebaseProjectID,
-		UseFirstPathSegmentAsDatabase: req.UseFirstPathSegmentAsDatabase,
+		FirebaseCompatEnabled: true,
+		FirebaseProjectID:     req.FirebaseProjectID,
 	}
 	if err := s.db.CreateProject(r.Context(), project); err != nil {
 		logger.Error("admin/projects create", "error", err)
@@ -96,13 +94,12 @@ func (s *Server) handleAdminCreateProject(w http.ResponseWriter, r *http.Request
 }
 
 type adminUpdateProjectRequest struct {
-	Name                          *string `json:"name,omitempty"`
-	RulesJSON                     *string `json:"rules_json,omitempty"`
-	Ephemeral                     *bool   `json:"ephemeral,omitempty"`
-	AutoCreate                    *bool   `json:"auto_create,omitempty"`
-	FirebaseCompatEnabled         *bool   `json:"firebase_compat_enabled,omitempty"`
-	FirebaseProjectID             *string `json:"firebase_project_id,omitempty"`
-	UseFirstPathSegmentAsDatabase *bool   `json:"use_first_path_segment_as_database,omitempty"`
+	Name                  *string `json:"name,omitempty"`
+	RulesJSON             *string `json:"rules_json,omitempty"`
+	Ephemeral             *bool   `json:"ephemeral,omitempty"`
+	AutoCreate            *bool   `json:"auto_create,omitempty"`
+	FirebaseCompatEnabled *bool   `json:"firebase_compat_enabled,omitempty"`
+	FirebaseProjectID     *string `json:"firebase_project_id,omitempty"`
 }
 
 func (s *Server) handleAdminUpdateProject(w http.ResponseWriter, r *http.Request) {
@@ -139,9 +136,6 @@ func (s *Server) handleAdminUpdateProject(w http.ResponseWriter, r *http.Request
 	}
 	if req.FirebaseProjectID != nil {
 		project.FirebaseProjectID = *req.FirebaseProjectID
-	}
-	if req.UseFirstPathSegmentAsDatabase != nil {
-		project.UseFirstPathSegmentAsDatabase = *req.UseFirstPathSegmentAsDatabase
 	}
 
 	newVersion, err := s.db.UpdateProject(r.Context(), project)
