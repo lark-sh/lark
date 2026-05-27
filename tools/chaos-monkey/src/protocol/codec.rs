@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// Maximum message size (17MB: 16MB data + overhead)
-pub const MAX_MESSAGE_SIZE: usize = 17 << 20;
+pub const MAX_MESSAGE_SIZE: usize = 257 << 20;
 
 /// Protocol version for HELLO/HELLO_ACK handshake
 pub const PROTOCOL_VERSION: u16 = 1;
