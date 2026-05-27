@@ -61,17 +61,16 @@ const (
 // CreateTestProject creates a test project with default values
 func CreateTestProject() *db.Project {
 	return &db.Project{
-		ID:                            TestProjectID,
-		Name:                          "Test Project",
-		SecretKey:                     TestSecretKey,
-		AdminSecretKey:                TestAdminSecretKey,
-		RulesJSON:                     `{".read": true, ".write": true}`,
-		Ephemeral:                     false,
-		AutoCreate:                    true,
-		FirebaseCompatEnabled:         true,
-		UseFirstPathSegmentAsDatabase: true,
-		CreatedAt:                     NowMS(),
-		UpdatedAt:                     NowMS(),
+		ID:                    TestProjectID,
+		Name:                  "Test Project",
+		SecretKey:             TestSecretKey,
+		AdminSecretKey:        TestAdminSecretKey,
+		RulesJSON:             `{".read": true, ".write": true}`,
+		Ephemeral:             false,
+		AutoCreate:            true,
+		FirebaseCompatEnabled: true,
+		CreatedAt:             NowMS(),
+		UpdatedAt:             NowMS(),
 	}
 }
 

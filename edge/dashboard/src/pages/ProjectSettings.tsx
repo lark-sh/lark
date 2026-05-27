@@ -21,8 +21,6 @@ export function ProjectSettings() {
   const [autoCreate, setAutoCreate] = useState(true);
   const [rulesJson, setRulesJson] = useState('');
   const [firebaseProjectId, setFirebaseProjectId] = useState('');
-  const [useFirstPathSegmentAsDatabase, setUseFirstPathSegmentAsDatabase] =
-    useState(false);
 
   // Status.
   const [saving, setSaving] = useState(false);
@@ -51,7 +49,6 @@ export function ProjectSettings() {
         setAutoCreate(data.auto_create);
         setRulesJson(data.rules_json || '');
         setFirebaseProjectId(data.firebase_project_id || '');
-        setUseFirstPathSegmentAsDatabase(data.use_first_path_segment_as_database);
       } catch (err) {
         if (!cancelled) {
           setLoadError(err instanceof ApiError ? err.message : 'Failed to load project');
@@ -92,7 +89,6 @@ export function ProjectSettings() {
         // firebase_compat_enabled is intentionally omitted: it defaults to true on
         // project creation and is no longer user-facing, so we leave it untouched here.
         firebase_project_id: firebaseProjectId || '',
-        use_first_path_segment_as_database: useFirstPathSegmentAsDatabase,
       });
       setProject(updated);
       setSaveMessage('Settings saved');
@@ -216,13 +212,6 @@ export function ProjectSettings() {
                 hint="Create databases on first connect"
                 value={autoCreate}
                 onChange={setAutoCreate}
-              />
-
-              <Toggle
-                label="First path segment is database"
-                hint="Route by the first path segment (e.g. /room-123/...)"
-                value={useFirstPathSegmentAsDatabase}
-                onChange={setUseFirstPathSegmentAsDatabase}
               />
 
               <div className="pt-3 border-t border-gray-100">

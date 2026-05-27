@@ -53,7 +53,6 @@ CREATE TABLE projects (
     auto_create BOOLEAN NOT NULL DEFAULT true,
     firebase_compat_enabled BOOLEAN NOT NULL DEFAULT true,
     firebase_project_id TEXT NOT NULL DEFAULT '',
-    use_first_path_segment_as_database BOOLEAN NOT NULL DEFAULT false,
     config_version BIGINT NOT NULL DEFAULT 1,
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL

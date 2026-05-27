@@ -85,15 +85,14 @@ func BootstrapDefaultProjectIfEmpty(ctx context.Context, store db.Store) (bool, 
 	}
 
 	err = store.CreateProject(ctx, &db.Project{
-		ID:                            BootstrapProjectID,
-		Name:                          BootstrapProjectName,
-		SecretKey:                     randomToken(16),
-		AdminSecretKey:                randomToken(16),
-		RulesJSON:                     `{"rules":{".read":true,".write":true}}`,
-		Ephemeral:                     false,
-		AutoCreate:                    true,
-		FirebaseCompatEnabled:         true,
-		UseFirstPathSegmentAsDatabase: false,
+		ID:                    BootstrapProjectID,
+		Name:                  BootstrapProjectName,
+		SecretKey:             randomToken(16),
+		AdminSecretKey:        randomToken(16),
+		RulesJSON:             `{"rules":{".read":true,".write":true}}`,
+		Ephemeral:             false,
+		AutoCreate:            true,
+		FirebaseCompatEnabled: true,
 	})
 	if err != nil {
 		return false, fmt.Errorf("create default project: %w", err)

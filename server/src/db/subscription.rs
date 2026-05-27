@@ -241,9 +241,10 @@ pub struct Subscriber {
     pub conn: Arc<dyn ConnectionSender>,
     /// True for KCP/WebTransport clients (20Hz), false for WebSocket (4Hz)
     pub is_fast: bool,
-    /// Cached Firebase path prefix (None for native Lark clients).
-    /// Cached on subscribe to avoid calling firebase_path_prefix() on every send.
-    pub firebase_path_prefix: Option<String>,
+    /// Whether this subscriber is a Firebase-protocol client (cached on subscribe
+    /// to avoid virtual dispatch in the hot send loop). Firebase clients receive
+    /// events in Firebase wire format.
+    pub is_firebase: bool,
     /// Cached outbox_id to avoid virtual dispatch in hot loop.
     pub cached_outbox_id: usize,
     /// Cached numeric client_id to avoid virtual dispatch in hot loop.
@@ -332,7 +333,7 @@ impl SharedView {
     ) {
         let is_fast = Subscriber::is_fast_client(&client_id);
         // Cache values once on subscribe to avoid virtual dispatch in hot loop
-        let firebase_path_prefix = conn.firebase_path_prefix();
+        let is_firebase = conn.is_firebase();
         let cached_outbox_id = conn.outbox_id();
         let cached_client_id = conn.client_id();
         self.subscribers.insert(
@@ -342,7 +343,7 @@ impl SharedView {
                 tag,
                 conn,
                 is_fast,
-                firebase_path_prefix,
+                is_firebase,
                 cached_outbox_id,
                 cached_client_id,
             },
@@ -1211,14 +1212,13 @@ impl ViewManager {
             let reliable = !is_volatile;
 
             for subscriber in shared_view.subscribers.values() {
-                let is_firebase = subscriber.firebase_path_prefix.is_some();
+                let is_firebase = subscriber.is_firebase;
 
                 if is_firebase {
                     // Firebase client - use or generate Firebase format
                     let fb_bytes = firebase_base.get_or_insert_with(|| {
                         encode_firebase_event(
                             event_type,
-                            subscriber.firebase_path_prefix.as_ref().unwrap(),
                             view_path,
                             &relative_path,
                             &value_bytes,
@@ -1363,14 +1363,13 @@ impl ViewManager {
 
                 // For each subscriber, add to broadcast buffer with their tag
                 for subscriber in shared_view.subscribers.values() {
-                    let is_firebase = subscriber.firebase_path_prefix.is_some();
+                    let is_firebase = subscriber.is_firebase;
 
                     if is_firebase {
                         // Firebase client
                         let fb_base = firebase_base.get_or_insert_with(|| {
                             encode_firebase_event(
                                 event_type,
-                                subscriber.firebase_path_prefix.as_ref().unwrap(),
                                 subscription_path,
                                 relative_path,
                                 &value_bytes,
@@ -2996,14 +2995,13 @@ impl ViewManager {
 
                     for client_id in &view.fast_subscribers {
                         if let Some(subscriber) = view.subscribers.get(client_id) {
-                            let is_firebase = subscriber.firebase_path_prefix.is_some();
+                            let is_firebase = subscriber.is_firebase;
 
                             if is_firebase {
                                 // Firebase client - use or generate Firebase format
                                 let fb_bytes = firebase_base.get_or_insert_with(|| {
                                     encode_firebase_event(
                                         "patch",
-                                        subscriber.firebase_path_prefix.as_ref().unwrap(),
                                         &view.path,
                                         "/",
                                         &value_bytes,
@@ -3120,17 +3118,13 @@ impl ViewManager {
 
                                 for client_id in &view.slow_subscribers {
                                     if let Some(subscriber) = view.subscribers.get(client_id) {
-                                        let is_firebase = subscriber.firebase_path_prefix.is_some();
+                                        let is_firebase = subscriber.is_firebase;
 
                                         if is_firebase {
                                             // Firebase client - use or generate Firebase format
                                             let fb_bytes = firebase_base.get_or_insert_with(|| {
                                                 encode_firebase_event(
                                                     "patch",
-                                                    subscriber
-                                                        .firebase_path_prefix
-                                                        .as_ref()
-                                                        .unwrap(),
                                                     &view.path,
                                                     "/",
                                                     &value_bytes,

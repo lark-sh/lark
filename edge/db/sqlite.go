@@ -246,13 +246,13 @@ func (db *SqliteDB) GetProjectByID(ctx context.Context, id string) (*Project, er
 	err := db.sql.QueryRowContext(ctx, `
 		SELECT id, name, secret_key, admin_secret_key, rules_json,
 		       ephemeral, auto_create, firebase_compat_enabled,
-		       firebase_project_id, use_first_path_segment_as_database,
+		       firebase_project_id,
 		       config_version, created_at, updated_at
 		FROM projects WHERE id = ?
 	`, id).Scan(
 		&p.ID, &p.Name, &p.SecretKey, &p.AdminSecretKey, &p.RulesJSON,
 		&p.Ephemeral, &p.AutoCreate, &p.FirebaseCompatEnabled,
-		&p.FirebaseProjectID, &p.UseFirstPathSegmentAsDatabase,
+		&p.FirebaseProjectID,
 		&p.ConfigVersion, &p.CreatedAt, &p.UpdatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -268,7 +268,7 @@ func (db *SqliteDB) ListProjects(ctx context.Context) ([]*Project, error) {
 	rows, err := db.sql.QueryContext(ctx, `
 		SELECT id, name, secret_key, admin_secret_key, rules_json,
 		       ephemeral, auto_create, firebase_compat_enabled,
-		       firebase_project_id, use_first_path_segment_as_database,
+		       firebase_project_id,
 		       config_version, created_at, updated_at
 		FROM projects ORDER BY created_at ASC
 	`)
@@ -283,7 +283,7 @@ func (db *SqliteDB) ListProjects(ctx context.Context) ([]*Project, error) {
 		err := rows.Scan(
 			&p.ID, &p.Name, &p.SecretKey, &p.AdminSecretKey, &p.RulesJSON,
 			&p.Ephemeral, &p.AutoCreate, &p.FirebaseCompatEnabled,
-			&p.FirebaseProjectID, &p.UseFirstPathSegmentAsDatabase,
+			&p.FirebaseProjectID,
 			&p.ConfigVersion, &p.CreatedAt, &p.UpdatedAt,
 		)
 		if err != nil {
@@ -307,13 +307,13 @@ func (db *SqliteDB) CreateProject(ctx context.Context, p *Project) error {
 	_, err := db.sql.ExecContext(ctx, `
 		INSERT INTO projects (id, name, secret_key, admin_secret_key, rules_json,
 		                     ephemeral, auth_required, auto_create, firebase_compat_enabled,
-		                     firebase_project_id, use_first_path_segment_as_database,
+		                     firebase_project_id,
 		                     config_version, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		p.ID, p.Name, p.SecretKey, p.AdminSecretKey, p.RulesJSON,
 		boolInt(p.Ephemeral), 0 /* auth_required */, boolInt(p.AutoCreate), boolInt(p.FirebaseCompatEnabled),
-		p.FirebaseProjectID, boolInt(p.UseFirstPathSegmentAsDatabase),
+		p.FirebaseProjectID,
 		p.ConfigVersion, p.CreatedAt, p.UpdatedAt,
 	)
 	return err
@@ -331,7 +331,6 @@ func (db *SqliteDB) UpdateProject(ctx context.Context, p *Project) (int64, error
 			auto_create = ?,
 			firebase_compat_enabled = ?,
 			firebase_project_id = ?,
-			use_first_path_segment_as_database = ?,
 			config_version = config_version + 1,
 			updated_at = ?
 		WHERE id = ?
@@ -339,7 +338,7 @@ func (db *SqliteDB) UpdateProject(ctx context.Context, p *Project) (int64, error
 	`,
 		p.Name, p.SecretKey, p.AdminSecretKey, p.RulesJSON,
 		boolInt(p.Ephemeral), boolInt(p.AutoCreate), boolInt(p.FirebaseCompatEnabled),
-		p.FirebaseProjectID, boolInt(p.UseFirstPathSegmentAsDatabase),
+		p.FirebaseProjectID,
 		NowMS(),
 		p.ID,
 	).Scan(&newVersion)

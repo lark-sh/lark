@@ -466,10 +466,10 @@ pub trait ConnectionSender {
         skip_translation: bool,
     ) -> Result<(), SendError>;
 
-    /// Get the Firebase path prefix if this is a Firebase client.
-    /// Returns None for native Lark clients.
-    fn firebase_path_prefix(&self) -> Option<String> {
-        None
+    /// Whether this connection is a Firebase-protocol client (vs native Lark).
+    /// Firebase clients receive events in Firebase wire format.
+    fn is_firebase(&self) -> bool {
+        false
     }
 
     /// Get a unique identifier for the outbox this connection sends to.

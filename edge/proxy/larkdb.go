@@ -320,34 +320,15 @@ func (s *Server) handleRESTProxy(w http.ResponseWriter, r *http.Request) {
 	var databaseID string
 	var dataPath string
 
+	// Database is selected by the subdomain (`db--project.larkdb.net`); without
+	// one, requests target the project's "default" database. The whole path is
+	// always the data path.
 	if subdomainDB != "" {
-		// Database encoded in subdomain (e.g., example-9999--example-dev.larkdb.net)
-		// Entire path is data path — no first-segment extraction
 		databaseID = subdomainDB
-		dataPath = "/" + strings.Join(filteredSegments, "/")
 	} else {
-		// Firebase legacy projects with use_first_path_segment_as_database=false use "default" database
-		// All other projects use first segment as database
-		// ?v=2 forces modern Lark style (first segment = database) regardless of project settings
-		useDefaultDatabase := project.FirebaseCompatEnabled && !project.UseFirstPathSegmentAsDatabase
-		if r.URL.Query().Get("v") == "2" {
-			useDefaultDatabase = false
-		}
-
-		if useDefaultDatabase {
-			// Firebase legacy mode: entire path is data path, use "default" database
-			databaseID = "default"
-			dataPath = "/" + strings.Join(filteredSegments, "/")
-		} else {
-			// Standard mode: first segment is database ID
-			if len(filteredSegments) == 0 {
-				s.jsonError(w, http.StatusBadRequest, "bad_request", "Database ID required in path")
-				return
-			}
-			databaseID = filteredSegments[0]
-			dataPath = "/" + strings.Join(filteredSegments[1:], "/")
-		}
+		databaseID = "default"
 	}
+	dataPath = "/" + strings.Join(filteredSegments, "/")
 
 	// Normalize paths
 	if dataPath == "/" {
@@ -755,10 +736,9 @@ func buildProjectConfig(project *db.Project) *backend.ProjectConfig {
 		Ephemeral:         project.Ephemeral,
 		ConfigVersion:     project.ConfigVersion,
 		Settings: map[string]any{
-			"ephemeral":                          project.Ephemeral,
-			"auto_create":                        project.AutoCreate,
-			"firebase_compat_enabled":            project.FirebaseCompatEnabled,
-			"use_first_path_segment_as_database": project.UseFirstPathSegmentAsDatabase,
+			"ephemeral":               project.Ephemeral,
+			"auto_create":             project.AutoCreate,
+			"firebase_compat_enabled": project.FirebaseCompatEnabled,
 		},
 	}
 }
@@ -862,30 +842,15 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	var databaseID string
 	var dataPath string
 
+	// Database is selected by the subdomain (`db--project.larkdb.net`); without
+	// one, requests target the project's "default" database. The whole path is
+	// always the data path.
 	if subdomainDB != "" {
-		// Database encoded in subdomain — entire path is data path
 		databaseID = subdomainDB
-		dataPath = "/" + strings.Join(filteredSegments, "/")
 	} else {
-		// Firebase legacy projects with use_first_path_segment_as_database=false use "default" database
-		// ?v=2 forces modern Lark style (first segment = database) regardless of project settings
-		useDefaultDatabase := project.FirebaseCompatEnabled && !project.UseFirstPathSegmentAsDatabase
-		if r.URL.Query().Get("v") == "2" {
-			useDefaultDatabase = false
-		}
-
-		if useDefaultDatabase {
-			databaseID = "default"
-			dataPath = "/" + strings.Join(filteredSegments, "/")
-		} else {
-			if len(filteredSegments) == 0 {
-				s.jsonError(w, http.StatusBadRequest, "bad_request", "Database ID required in path")
-				return
-			}
-			databaseID = filteredSegments[0]
-			dataPath = "/" + strings.Join(filteredSegments[1:], "/")
-		}
+		databaseID = "default"
 	}
+	dataPath = "/" + strings.Join(filteredSegments, "/")
 
 	// Note: For SSE, we keep "/" as the root path (unlike REST which uses "")
 	// This is because Lark subscriptions expect "/" for root subscriptions

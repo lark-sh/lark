@@ -18,7 +18,6 @@ pub struct CachedProjectConfig {
     pub admin_secret_key: String,
     pub firebase_project_id: String,
     pub firebase_compat_enabled: bool,
-    pub firebase_use_first_path_segment_as_db: bool,
     pub firebase_default_database: String,
 }
 
@@ -32,7 +31,6 @@ impl Default for CachedProjectConfig {
             admin_secret_key: String::new(),
             firebase_project_id: String::new(),
             firebase_compat_enabled: true,
-            firebase_use_first_path_segment_as_db: false,
             firebase_default_database: "default".to_string(),
         }
     }
