@@ -325,7 +325,7 @@ async fn can_write(&mut self, client_id: &str, path: &str, new_data: Option<NewD
 }
 ```
 
-`new_data` is an `Option<NewData>` — `None` for deletes (no value being written), `Some(NewData::Set { .. })` for SET, `Some(NewData::Update { .. })` for UPDATE. The same `NewData` is reused at every level of the rules cascade; the rules engine builds a level-specific snapshot via `NewData::snapshot_at(tree, ctx.path)` per level — no eager merge, no per-ancestor tree walk.
+`new_data` is an `Option<NewData>` — `None` for deletes (no value being written), `Some(NewData::Set { .. })` for SET, `Some(NewData::Update { .. })` for UPDATE. The same `NewData` is reused at every level of the rules cascade; the rules engine builds a level-specific snapshot via `NewData::snapshot_at(tree, ctx.path)` per level.
 
 ### Snapshot Types
 
@@ -475,9 +475,9 @@ pub enum ArcValue {
 
 #### Sentinel Tracking (Blob-backed only)
 
-Every Sentinel in the tree must have its path recorded in the database's `sentinel_paths: BTreeSet<String>` index — this is the **I3 invariant**. The tree itself is the source of truth, and `sentinel_paths` is a derived index that gives `has_sentinel_at_or_below(path)` an O(log n) range query instead of a recursive subtree walk.
+Every Sentinel in the tree must have its path recorded in the database's `sentinel_paths: BTreeSet<String>` index. The tree itself is the source of truth, and `sentinel_paths` is a derived index that gives `has_sentinel_at_or_below(path)` an O(log n) range query instead of a recursive subtree walk.
 
-The invariant is one-way: `sentinel_paths` must be a **superset** of every actual Sentinel in the tree. Stale-extra entries are tolerated (cause unnecessary promotions); missing entries are catastrophic (cause skipped promotions, returning Sentinels to the encoder — which manifested as the production "Internal encoding error" 500 we fixed).
+The invariant is one-way: `sentinel_paths` must be a **superset** of every actual Sentinel in the tree. Stale-extra entries are tolerated (cause unnecessary promotions); missing entries are catastrophic (cause skipped promotions, returning Sentinels to the encoder).
 
 Every write site that introduces or removes Sentinels must keep `sentinel_paths` in sync:
 

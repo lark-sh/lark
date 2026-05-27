@@ -32,6 +32,8 @@
 //	HELLO (0x04): Connection handshake
 //	  Payload: version(4B, big-endian)
 //
+//  HELLO_AUTH (0x0A): Shared secret exchange
+//
 //	AUTH_CHANGED (0x05): Client auth updated (late authentication)
 //	  Payload: authJSON
 //
