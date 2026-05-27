@@ -487,6 +487,15 @@ fn expand_value(base: &str, value: &Value, out: &mut Vec<LeafEffect>) {
                 expand_value(&child, val, out);
             }
         }
+        // Arrays are stored as integer-keyed maps: each element expands under
+        // its index. A null element recurses into the Null arm below (a Clear),
+        // i.e. an absent index.
+        Value::Array(arr) => {
+            for (i, val) in arr.iter().enumerate() {
+                let child = join_path(base, &i.to_string());
+                expand_value(&child, val, out);
+            }
+        }
         Value::Null => {
             out.push(LeafEffect::Clear {
                 path: normalize_path(base),
@@ -554,6 +563,19 @@ fn flatten_value(path: &str, value: &Value, state: &mut HashMap<String, Value>) 
             state.remove(path);
             for (key, val) in obj {
                 let child_path = format!("{}/{}", path, key);
+                flatten_value(&child_path, val, state);
+            }
+        }
+        // Arrays are stored as integer-keyed maps. Each non-null element is a
+        // leaf under its index; null elements are gaps (absent), matching the
+        // server which never stores nulls.
+        Value::Array(arr) => {
+            state.remove(path);
+            for (i, val) in arr.iter().enumerate() {
+                if val.is_null() {
+                    continue;
+                }
+                let child_path = format!("{}/{}", path, i);
                 flatten_value(&child_path, val, state);
             }
         }
@@ -955,5 +977,53 @@ mod tests {
         assert_eq!(committed, 1);
         assert_eq!(rejected, 1);
         assert_eq!(sent, 1);
+    }
+
+    #[test]
+    fn test_array_expands_to_index_leaves() {
+        let mut gt = GroundTruth::new();
+        gt.record_sent("r1", 1, "/arr", WriteOp::Set(json!(["a", "b", "c"])));
+        gt.mark_committed("r1");
+
+        let state = gt.build_expected_state();
+        assert_eq!(state.get("/arr/0"), Some(&json!("a")));
+        assert_eq!(state.get("/arr/1"), Some(&json!("b")));
+        assert_eq!(state.get("/arr/2"), Some(&json!("c")));
+        // The container path itself is not a leaf.
+        assert!(!state.contains_key("/arr"));
+    }
+
+    #[test]
+    fn test_array_null_element_is_gap() {
+        let mut gt = GroundTruth::new();
+        gt.record_sent("r1", 1, "/arr", WriteOp::Set(json!(["a", null, "c"])));
+        gt.mark_committed("r1");
+
+        let state = gt.build_expected_state();
+        assert_eq!(state.get("/arr/0"), Some(&json!("a")));
+        assert!(!state.contains_key("/arr/1")); // null element = gap
+        assert_eq!(state.get("/arr/2"), Some(&json!("c")));
+    }
+
+    #[test]
+    fn test_array_partial_element_write_preserves_siblings() {
+        // The exact bug pattern: write an array of objects, then set a field on
+        // one element. The other elements and the element's other field survive.
+        let mut gt = GroundTruth::new();
+        gt.record_sent(
+            "r1",
+            1,
+            "/arr",
+            WriteOp::Set(json!([{"x": 1, "label": "a"}, {"x": 2, "label": "b"}])),
+        );
+        gt.mark_committed("r1");
+        gt.record_sent("r2", 1, "/arr/0/x", WriteOp::Set(json!(99)));
+        gt.mark_committed("r2");
+
+        let state = gt.build_expected_state();
+        assert_eq!(state.get("/arr/0/x"), Some(&json!(99))); // updated
+        assert_eq!(state.get("/arr/0/label"), Some(&json!("a"))); // sibling field survives
+        assert_eq!(state.get("/arr/1/x"), Some(&json!(2))); // sibling element survives
+        assert_eq!(state.get("/arr/1/label"), Some(&json!("b")));
     }
 }

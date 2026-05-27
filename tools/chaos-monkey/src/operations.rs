@@ -70,6 +70,9 @@ pub struct OperationGenerator {
     collections: Vec<String>,
     /// Item keys used (for targeted deletes/updates)
     written_paths: Vec<String>,
+    /// Paths that currently hold an array, as (path, element_count, is_object_array).
+    /// Used to target valid indices for partial-element writes.
+    array_paths: Vec<(String, usize, bool)>,
 }
 
 impl OperationGenerator {
@@ -84,6 +87,17 @@ impl OperationGenerator {
                 "events".to_string(),
             ],
             written_paths: Vec::new(),
+            array_paths: Vec::new(),
+        }
+    }
+
+    /// Remember an array we just wrote so later ops can target its elements.
+    /// Bounded so the list can't grow without limit.
+    fn record_array(&mut self, path: String, len: usize, is_objects: bool) {
+        const MAX_TRACKED: usize = 64;
+        self.array_paths.push((path, len, is_objects));
+        if self.array_paths.len() > MAX_TRACKED {
+            self.array_paths.remove(0);
         }
     }
 
@@ -92,18 +106,20 @@ impl OperationGenerator {
         let roll: u32 = rng.gen_range(0..100);
 
         match roll {
-            0..=32 => self.normal_write(rng),
-            33..=47 => self.collection_push(rng),
-            48..=57 => self.delete(rng),
-            58..=67 => self.edge_case(rng),
-            68..=77 => self.burst_value(rng),
-            78..=82 => self.delete_collection(rng),
-            83..=87 => self.deep_nesting(rng),
-            88..=90 => self.update(rng),
-            91..=92 => self.update_at_fresh_pid(rng),
-            93..=94 => self.multi_path_update_at_root(rng),
-            95..=96 => self.multi_path_update_at_subpath(rng),
-            97..=99 => self.transaction(rng),
+            0..=28 => self.normal_write(rng),
+            29..=43 => self.collection_push(rng),
+            44..=52 => self.delete(rng),
+            53..=61 => self.edge_case(rng),
+            62..=70 => self.burst_value(rng),
+            71..=74 => self.delete_collection(rng),
+            75..=78 => self.deep_nesting(rng),
+            79..=81 => self.update(rng),
+            82..=83 => self.update_at_fresh_pid(rng),
+            84..=85 => self.multi_path_update_at_root(rng),
+            86..=87 => self.multi_path_update_at_subpath(rng),
+            88..=90 => self.transaction(rng),
+            91..=95 => self.set_array(rng),
+            96..=99 => self.array_element_write(rng),
             _ => unreachable!(),
         }
     }
@@ -295,6 +311,71 @@ impl OperationGenerator {
             "seq": seq,
         });
         self.push_counter += 1;
+        self.written_paths.push(path.clone());
+        Operation {
+            path,
+            op_type: OpType::Set,
+            value,
+            tx_ops: None,
+        }
+    }
+
+    /// SET an array at /arrays/-item-{N}. Mixes arrays of primitives and arrays
+    /// of objects so partial-element writes can exercise both paths.
+    fn set_array<R: Rng>(&mut self, rng: &mut R) -> Operation {
+        let item_id: u32 = rng.gen_range(0..200);
+        let path = format!("/arrays/-item-abcdefg-{}", item_id);
+        let len = rng.gen_range(2..6);
+        let is_objects = rng.gen_bool(0.5);
+        let value = if is_objects {
+            Value::Array(
+                (0..len)
+                    .map(|i| {
+                        json!({
+                            "x": rng.gen_range(0..10000),
+                            "label": format!("o-{}-{}", item_id, i),
+                        })
+                    })
+                    .collect(),
+            )
+        } else {
+            Value::Array(
+                (0..len)
+                    .map(|i| json!(format!("elem-{}-{}", item_id, i)))
+                    .collect(),
+            )
+        };
+        self.written_paths.push(path.clone());
+        self.record_array(path.clone(), len, is_objects);
+        Operation {
+            path,
+            op_type: OpType::Set,
+            value,
+            tx_ops: None,
+        }
+    }
+
+    /// Write into an existing array element: either overwrite a bare index with
+    /// a primitive (`/arr/{i}`) or set a field on an object element
+    /// (`/arr/{i}/x`). The latter mirrors the partial-write-into-array case —
+    /// the other elements and the element's other fields must survive. Falls
+    /// back to creating an array if none are tracked yet.
+    fn array_element_write<R: Rng>(&mut self, rng: &mut R) -> Operation {
+        if self.array_paths.is_empty() {
+            return self.set_array(rng);
+        }
+        let pick = rng.gen_range(0..self.array_paths.len());
+        let (base, len, is_objects) = self.array_paths[pick].clone();
+        let idx = rng.gen_range(0..len);
+
+        let (path, value) = if is_objects && rng.gen_bool(0.6) {
+            (
+                format!("{}/{}/x", base, idx),
+                json!(rng.gen_range(0..10000)),
+            )
+        } else {
+            (format!("{}/{}", base, idx), json!(rng.gen_range(0..10000)))
+        };
         self.written_paths.push(path.clone());
         Operation {
             path,
