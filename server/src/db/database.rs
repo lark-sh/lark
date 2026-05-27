@@ -3582,6 +3582,20 @@ impl Database {
     // Write Operations
     // =========================================================================
 
+    /// Record and build the NACK for a write whose path or value keys are
+    /// invalid (empty/oversized segment, control char, `$ # [ ] /`,
+    /// dot-in-middle, or a literal-slash object key). Shared by every single-op
+    /// write handler so the same key invariant is enforced on each entry point,
+    /// not just inside `handle_transaction`.
+    fn nack_invalid_key(&mut self, client_id: &str, request_id: &str) -> Option<ServerMessage> {
+        self.record_nacked_write(client_id, request_id);
+        Some(ServerMessage::nack(
+            request_id,
+            error::INVALID_DATA,
+            "invalid path or key",
+        ))
+    }
+
     async fn handle_set(
         &mut self,
         client_id: &str,
@@ -3590,6 +3604,18 @@ impl Database {
     ) -> Option<ServerMessage> {
         let request_id = msg.request_id.as_deref().unwrap_or("");
         let path_str = msg.path.as_deref().unwrap_or("/");
+
+        // Reject malformed paths or value keys before any work, the rules
+        // evaluator, or the WAL/blob writers. SET stores its value object as-is,
+        // so its field-names become storage keys and must pass validate_key too.
+        if crate::db::validate_path(path_str).is_err()
+            || msg
+                .value
+                .as_ref()
+                .is_some_and(|v| validate_value_keys(v).is_err())
+        {
+            return self.nack_invalid_key(client_id, request_id);
+        }
 
         // Check for tainted write (depends on a nacked write) - silently ignore
         if self.is_write_tainted(client_id, &msg.pending_writes) {
@@ -3802,6 +3828,22 @@ impl Database {
         let path_str = msg.path.as_deref().unwrap_or("/");
         let path = Path::parse(path_str);
 
+        // Reject malformed paths or value keys before any work. Each UPDATE child
+        // key is a relative path appended to the base, and each child value's
+        // object keys become storage keys — validate the full landing paths and
+        // those keys.
+        if crate::db::validate_path(path_str).is_err() {
+            return self.nack_invalid_key(client_id, request_id);
+        }
+        if let Some(Value::Object(map)) = &msg.value {
+            for (key, val) in map {
+                let full = format!("{}/{}", path_str.trim_end_matches('/'), key);
+                if crate::db::validate_path(&full).is_err() || validate_value_keys(val).is_err() {
+                    return self.nack_invalid_key(client_id, request_id);
+                }
+            }
+        }
+
         // Check for tainted write (depends on a nacked write) - silently ignore
         if self.is_write_tainted(client_id, &msg.pending_writes) {
             return None; // Silently ignore tainted writes
@@ -3977,6 +4019,13 @@ impl Database {
         let request_id = msg.request_id.as_deref().unwrap_or("");
         let path_str = msg.path.as_deref().unwrap_or("/");
         let path = Path::parse(path_str);
+
+        // Reject malformed remove paths before any work (same key invariant as
+        // SET/UPDATE; a remove can't plant keys but still must not diverge between
+        // the rules matcher and storage on empty/odd segments).
+        if crate::db::validate_path(path_str).is_err() {
+            return self.nack_invalid_key(client_id, request_id);
+        }
 
         // Check for tainted write (depends on a nacked write) - silently ignore
         if self.is_write_tainted(client_id, &msg.pending_writes) {
@@ -5686,6 +5735,82 @@ mod tests {
             // Verify data was set
             let value = db.tree.read().unwrap().get_value_str("/foo");
             assert_eq!(value, Some(json!("bar")));
+        })
+    }
+
+    #[test]
+    fn test_write_handlers_reject_invalid_paths_and_keys() {
+        // End-to-end: drive real SET/UPDATE messages through the single-op
+        // handlers (not just the validator functions) so the dispatch path is
+        // covered. Security audit finding #3: these handlers, not just
+        // handle_transaction, must enforce the key invariant.
+        block_on(async {
+            let mut db = Database::new("test".to_string(), "test-project".to_string(), true);
+            let (conn, _messages) = MockConnection::new();
+            db.add_client_internal("client1", None, "conn1", conn);
+
+            // Empty path segment (the confused-deputy input) → NACK, nothing written.
+            let msg = ClientMessage {
+                op: "s".to_string(),
+                path: Some("/users//abc".to_string()),
+                value: Some(json!("x")),
+                request_id: Some("r1".to_string()),
+                ..Default::default()
+            };
+            let resp = db
+                .handle_set("client1", &msg, false)
+                .await
+                .expect("response");
+            assert_eq!(resp.error.as_deref(), Some(error::INVALID_DATA));
+            assert!(resp.nack.is_some());
+            assert_eq!(db.tree.read().unwrap().get_value_str("/users"), None);
+
+            // Literal-slash key inside a SET value → NACK, nothing written.
+            let msg = ClientMessage {
+                op: "s".to_string(),
+                path: Some("/ok".to_string()),
+                value: Some(json!({"a/b": 1})),
+                request_id: Some("r2".to_string()),
+                ..Default::default()
+            };
+            let resp = db
+                .handle_set("client1", &msg, false)
+                .await
+                .expect("response");
+            assert!(resp.nack.is_some());
+            assert_eq!(db.tree.read().unwrap().get_value_str("/ok"), None);
+
+            // UPDATE with a forbidden key → NACK.
+            let msg = ClientMessage {
+                op: "u".to_string(),
+                path: Some("/acct".to_string()),
+                value: Some(json!({"bal$ance": 5})),
+                request_id: Some("r3".to_string()),
+                ..Default::default()
+            };
+            let resp = db
+                .handle_update("client1", &msg, false)
+                .await
+                .expect("response");
+            assert!(resp.nack.is_some());
+
+            // A well-formed write still succeeds — no false positives.
+            let msg = ClientMessage {
+                op: "s".to_string(),
+                path: Some("/users/abc".to_string()),
+                value: Some(json!({"name": "Alice"})),
+                request_id: Some("r4".to_string()),
+                ..Default::default()
+            };
+            let resp = db
+                .handle_set("client1", &msg, false)
+                .await
+                .expect("response");
+            assert!(resp.nack.is_none(), "valid write must not be nacked");
+            assert_eq!(
+                db.tree.read().unwrap().get_value_str("/users/abc"),
+                Some(json!({"name": "Alice"}))
+            );
         })
     }
 
