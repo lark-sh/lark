@@ -38,6 +38,19 @@ func VerifyPassword(hash, plaintext string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(plaintext)) == nil
 }
 
+// dummyPasswordHash is a valid bcrypt hash of a random, discarded password. On
+// the unknown-email login path we compare against it so that path costs the same
+// bcrypt work as a wrong-password-for-a-real-account path — otherwise an attacker
+// could tell which emails are registered by response latency (audit L-1).
+var dummyPasswordHash = func() string {
+	h, err := bcrypt.GenerateFromPassword([]byte(randomToken(16)), bcryptCost)
+	if err != nil {
+		// bcrypt only errors on a broken build/runtime; fail loudly at startup.
+		panic(err)
+	}
+	return string(h)
+}()
+
 // randomToken returns n random bytes, hex-encoded. Used for session IDs
 // (256 bits) and opaque account/session public IDs (128 bits).
 func randomToken(n int) string {
@@ -125,12 +138,28 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	account, err := s.db.GetAccountByEmail(r.Context(), req.Email)
-	if err != nil || !VerifyPassword(account.PasswordHash, req.Password) {
-		// Constant-ish response on both unknown email and wrong password so
-		// callers can't enumerate accounts by timing.
+	// Always run one bcrypt comparison, whether or not the email exists, so the
+	// unknown-email and wrong-password paths are indistinguishable by timing
+	// (audit L-1). For an unknown email we compare against a throwaway hash.
+	var authed bool
+	if err != nil {
+		VerifyPassword(dummyPasswordHash, req.Password)
+	} else {
+		authed = VerifyPassword(account.PasswordHash, req.Password)
+	}
+	if !authed {
+		// Record the failure and apply per-account backoff before responding, so
+		// repeated guesses against an account are throttled (audit L-2). Only
+		// failures are delayed — a correct password always returns promptly, so a
+		// legitimate admin is never locked out even while their email is attacked.
+		if delay := s.loginThrottle.fail(req.Email); delay > 0 {
+			time.Sleep(delay)
+		}
+		// Identical response for unknown email and wrong password (no enumeration).
 		s.writeError(w, http.StatusUnauthorized, "invalid email or password")
 		return
 	}
+	s.loginThrottle.reset(req.Email)
 
 	now := db.NowMS()
 	session := &db.Session{
