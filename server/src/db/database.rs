@@ -435,11 +435,17 @@ pub fn set_eviction_idle_secs(secs: u64) {
     EVICTION_IDLE_SECS.store(secs, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Maximum on-disk size of a single database. Growth writes (set/update/
+/// transaction) are rejected once the database reaches this; deletes are still
+/// allowed so the owner can recover under the cap. Enforcement is approximate —
+/// it reads the periodically-refreshed `data_size` gauge (~60s cadence), so a
+/// burst can overshoot slightly, which is fine for a 1 TB runaway-cost backstop.
+const MAX_DATABASE_SIZE_BYTES: u64 = 1024 * 1024 * 1024 * 1024; // 1 TiB
+
 /// Maximum number of operations in a single transaction. Each condition op
 /// triggers a `promote_path_deep` (blob read + WAL replay) on the database's
 /// single-threaded inbox, so an unbounded count lets one ~16 MB request serialize
-/// many disk round trips and stall every client on the database. Firebase
-/// documents no transaction op-count limit; this is a generous DoS rail well
+/// many disk round trips and stall every client on the database. This is a generous DoS rail well
 /// under the 16 MB message ceiling (audit M-2).
 const MAX_TRANSACTION_OPS: usize = 1_000;
 
@@ -3191,6 +3197,17 @@ impl Database {
             ));
         }
 
+        // Reject transactions at the size cap. Deletes still go through
+        // handle_remove for recovery. See MAX_DATABASE_SIZE_BYTES.
+        if self.is_at_size_cap() {
+            self.record_nacked_write(client_id, request_id);
+            return Some(ServerMessage::nack(
+                request_id,
+                error::DATABASE_FULL,
+                "database is at its size limit",
+            ));
+        }
+
         // Validate every operation's paths AND the keys inside its value before
         // anything else. Both the op path and the object field-names in the value
         // become storage keys, so the same key rules (validate_key: non-empty, no
@@ -3714,6 +3731,19 @@ impl Database {
             ));
         }
 
+        // Reject this write once the database is at its size cap — including
+        // volatile writes (we don't exempt them; keeps the check trivial). Deletes
+        // still go through handle_remove so the owner can recover by freeing
+        // space. Should never happen in practice. See MAX_DATABASE_SIZE_BYTES.
+        if self.is_at_size_cap() {
+            self.record_nacked_write(client_id, request_id);
+            return Some(ServerMessage::nack(
+                request_id,
+                error::DATABASE_FULL,
+                "database is at its size limit",
+            ));
+        }
+
         let value = match &msg.value {
             Some(v) => v.clone(),
             None => Value::Null,
@@ -3938,6 +3968,18 @@ impl Database {
                 request_id,
                 error::UNAVAILABLE,
                 "Storage unavailable (WAL I/O failure)",
+            ));
+        }
+
+        // Reject this write at the size cap, including volatile writes (not
+        // exempt). Deletes still go through handle_remove for recovery.
+        // See MAX_DATABASE_SIZE_BYTES.
+        if self.is_at_size_cap() {
+            self.record_nacked_write(client_id, request_id);
+            return Some(ServerMessage::nack(
+                request_id,
+                error::DATABASE_FULL,
+                "database is at its size limit",
             ));
         }
 
@@ -5485,6 +5527,13 @@ impl Database {
         }
     }
 
+    /// Whether the database has reached its size cap and should reject growth
+    /// writes. Reads the periodically-refreshed `data_size` gauge, so it's an
+    /// approximate (slightly-stale) check — appropriate for a 1 TB backstop.
+    fn is_at_size_cap(&self) -> bool {
+        self.metrics.data_size() >= MAX_DATABASE_SIZE_BYTES
+    }
+
     /// Emit metrics to stdout in JSON format (for Vector to pick up).
     /// Only emits if there was activity since the last emission.
     fn emit_metrics(&mut self) {
@@ -6532,6 +6581,114 @@ mod tests {
             };
             let resp = db.handle_transaction("client1", &msg).await.expect("resp");
             assert_eq!(resp.error.as_deref(), Some(error::PAYLOAD_TOO_LARGE));
+        })
+    }
+
+    #[test]
+    fn test_database_size_cap_rejects_growth_allows_delete() {
+        block_on(async {
+            let mut db = Database::new("test".to_string(), "test-project".to_string(), true);
+            let (conn, _messages) = MockConnection::new();
+            db.add_client_internal("client1", None, "conn1", conn);
+
+            // Drive the (normally periodically-refreshed) size gauge to the cap.
+            db.metrics.set_data_size(MAX_DATABASE_SIZE_BYTES);
+
+            // SET (growth) → DATABASE_FULL.
+            let resp = db
+                .handle_set(
+                    "client1",
+                    &ClientMessage {
+                        op: "s".to_string(),
+                        path: Some("/a".to_string()),
+                        value: Some(json!("v")),
+                        request_id: Some("r1".to_string()),
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .await
+                .expect("resp");
+            assert_eq!(resp.error.as_deref(), Some(error::DATABASE_FULL));
+
+            // UPDATE (growth) → DATABASE_FULL.
+            let resp = db
+                .handle_update(
+                    "client1",
+                    &ClientMessage {
+                        op: "u".to_string(),
+                        path: Some("/a".to_string()),
+                        value: Some(json!({"k": "v"})),
+                        request_id: Some("r2".to_string()),
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .await
+                .expect("resp");
+            assert_eq!(resp.error.as_deref(), Some(error::DATABASE_FULL));
+
+            // TRANSACTION → DATABASE_FULL.
+            let resp = db
+                .handle_transaction(
+                    "client1",
+                    &ClientMessage {
+                        op: "t".to_string(),
+                        request_id: Some("r3".to_string()),
+                        operations: Some(vec![crate::protocol::TransactionOp {
+                            op: "s".to_string(),
+                            path: "/a".to_string(),
+                            value: Some(json!(1)),
+                            hash: None,
+                        }]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("resp");
+            assert_eq!(resp.error.as_deref(), Some(error::DATABASE_FULL));
+
+            // REMOVE is still allowed at the cap so the owner can recover.
+            let resp = db
+                .handle_remove(
+                    "client1",
+                    &ClientMessage {
+                        op: "d".to_string(),
+                        path: Some("/a".to_string()),
+                        request_id: Some("r4".to_string()),
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .await;
+            if let Some(r) = resp {
+                assert_ne!(
+                    r.error.as_deref(),
+                    Some(error::DATABASE_FULL),
+                    "remove must not be size-rejected: {:?}",
+                    r
+                );
+            }
+
+            // Volatile writes are NOT exempt — they're rejected at the cap too
+            // (we intentionally don't carve them out).
+            db.set_volatile_paths(vec!["cursors/*".to_string()]);
+            let resp = db
+                .handle_set(
+                    "client1",
+                    &ClientMessage {
+                        op: "s".to_string(),
+                        path: Some("/cursors/p1".to_string()),
+                        value: Some(json!({"x": 1})),
+                        request_id: Some("r5".to_string()),
+                        volatile: Some(true),
+                        ..Default::default()
+                    },
+                    true,
+                )
+                .await
+                .expect("resp");
+            assert_eq!(resp.error.as_deref(), Some(error::DATABASE_FULL));
         })
     }
 

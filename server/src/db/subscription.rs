@@ -629,8 +629,7 @@ impl View {
 /// Maximum number of distinct subscriptions (views) a single client connection
 /// may hold on one database. A subscription amplifies every matching write's
 /// fan-out, so an unbounded count lets one cheap connection inflate per-write
-/// work for the whole database. Firebase documents no per-connection listener
-/// limit; this is a generous DoS rail (audit M-3). Re-subscribing to a view the
+/// work for the whole database. This is a generous DoS rail (audit M-3). Re-subscribing to a view the
 /// client already holds is idempotent and does not count against this.
 const MAX_SUBSCRIPTIONS_PER_CLIENT: usize = 1_000;
 

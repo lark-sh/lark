@@ -186,6 +186,8 @@ pub mod error {
     pub const TOO_MANY_CONNECTIONS: &str = "too_many_connections";
     /// Client exceeded the per-connection subscription cap.
     pub const TOO_MANY_SUBSCRIPTIONS: &str = "too_many_subscriptions";
+    /// Database is at its maximum size; growth writes are rejected (deletes still allowed).
+    pub const DATABASE_FULL: &str = "database_full";
     /// Segment or storage unavailable - client should retry
     pub const UNAVAILABLE: &str = "unavailable";
 }
