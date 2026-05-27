@@ -109,13 +109,20 @@ impl Sidecar {
         let bytes_reused = u64::from_le_bytes(data[24..32].try_into().unwrap());
         let bytes_wasted = u64::from_le_bytes(data[32..40].try_into().unwrap());
 
-        let regions_end = 40 + count * 16;
-        if data.len() < regions_end {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "sidecar regions truncated",
-            ));
-        }
+        // `count` is an attacker-controlled u64. Compute the region table's end
+        // with checked arithmetic: `40 + count * 16` overflows usize for large
+        // counts, which would either panic (overflow-checks builds) or wrap to a
+        // small value that passes the truncation check and then panics on an
+        // out-of-bounds slice in the loop below. Folding the bounds check into
+        // the same chain rejects both overflow and truncation, bounding `count`
+        // by the input length.
+        let regions_end = count
+            .checked_mul(16)
+            .and_then(|n| n.checked_add(40))
+            .filter(|&end| end <= data.len())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "sidecar regions truncated")
+            })?;
 
         let mut free_list = FreeList::new();
         free_list.bytes_freed = bytes_freed;
@@ -126,6 +133,18 @@ impl Sidecar {
             let base = 40 + i * 16;
             let offset = u64::from_le_bytes(data[base..base + 8].try_into().unwrap());
             let size = u64::from_le_bytes(data[base + 8..base + 16].try_into().unwrap());
+            // A region whose end overflows u64 is impossible on disk. Reject the
+            // whole sidecar rather than feed it to the free list: restore_region
+            // would `offset + size` and either panic or (in release) wrap to a
+            // bogus end, mis-merging regions and later handing out overlapping
+            // space (write corruption). On Err the caller falls back to an empty
+            // free list — a space leak, not corruption.
+            if offset.checked_add(size).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "sidecar region offset+size overflows",
+                ));
+            }
             free_list.restore_region(offset, size);
         }
 
@@ -173,6 +192,50 @@ mod tests {
         assert!(restored.pending_keys.is_empty());
         assert_eq!(restored.free_list.available_region_count(), 0);
         assert_eq!(restored.free_list.bytes_freed, 0);
+    }
+
+    /// C1 regression (fuzz_sidecar): a region `count` large enough that
+    /// `40 + count * 16` overflows usize previously panicked (overflow-checks)
+    /// or wrapped past the truncation check and then panicked on an OOB slice.
+    /// `from_bytes` must return an error instead of panicking.
+    #[test]
+    fn test_from_bytes_rejects_overflowing_region_count() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"LRKF");
+        data.extend_from_slice(&7u32.to_le_bytes());
+        data.extend_from_slice(&u64::MAX.to_le_bytes()); // count → 40 + count*16 overflows
+        data.extend_from_slice(&[0u8; 24]); // bytes_freed/reused/wasted
+
+        assert!(Sidecar::from_bytes(&data).is_err());
+    }
+
+    /// A region whose offset+size overflows u64 must be rejected, not fed to the
+    /// free list (where `offset + size` would panic or wrap into a mis-merge).
+    #[test]
+    fn test_from_bytes_rejects_region_offset_size_overflow() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"LRKF");
+        data.extend_from_slice(&7u32.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes()); // count = 1
+        data.extend_from_slice(&[0u8; 24]); // bytes_freed/reused/wasted
+        data.extend_from_slice(&u64::MAX.to_le_bytes()); // region offset
+        data.extend_from_slice(&1u64.to_le_bytes()); // region size → offset+size overflows
+
+        assert!(Sidecar::from_bytes(&data).is_err());
+    }
+
+    /// A plausible-but-truncated count (no overflow, just not enough bytes) is
+    /// also rejected rather than read out of bounds.
+    #[test]
+    fn test_from_bytes_rejects_truncated_regions() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"LRKF");
+        data.extend_from_slice(&7u32.to_le_bytes());
+        data.extend_from_slice(&1000u64.to_le_bytes()); // claims 1000 regions
+        data.extend_from_slice(&[0u8; 24]);
+        // only the 40-byte header is present, not 1000*16 region bytes
+
+        assert!(Sidecar::from_bytes(&data).is_err());
     }
 
     #[test]

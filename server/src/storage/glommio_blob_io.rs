@@ -107,7 +107,15 @@ impl BlobIO for GlommioBlobIO {
         }
         // Retry short reads (matching StdBlobIO's read_exact_at behavior).
         // BufferedFile::read_at can return fewer bytes than requested.
-        let mut result = Vec::with_capacity(len);
+        //
+        // `len` may come from a corrupt on-disk node header (e.g. an oversized
+        // child_count or forwarded child size), so do NOT pre-reserve the full
+        // `len` — that would let a bad header drive a multi-gigabyte allocation
+        // before the read fails. Reserve only the first chunk; the loop grows
+        // `result` as real bytes arrive and errors at the true EOF below. This
+        // bounds the allocation by data that actually exists, without relying on
+        // a (possibly stale) `size()`.
+        let mut result = Vec::with_capacity(len.min(MAX_READ_CHUNK));
         let mut pos = 0u64;
         while result.len() < len {
             let remaining = (len - result.len()).min(MAX_READ_CHUNK);

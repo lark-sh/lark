@@ -229,6 +229,26 @@ impl Dictionary {
         let name_data_used = u32::from_le_bytes(data[12..16].try_into().unwrap());
         let max_name_data = u32::from_le_bytes(data[16..20].try_into().unwrap());
 
+        // Structural invariants. `field_count` (live fields) and `sorted_count`
+        // are read independently from `max_field_count` (allocated slots), but
+        // every length check and allocation below is sized to one of these.
+        // Corruption that sets `field_count` near u32::MAX while keeping
+        // `max_field_count` (and thus the data) small would otherwise drive an
+        // unbounded `Vec::with_capacity` (OOM). A valid dictionary always has
+        // sorted_count <= field_count <= max_field_count, so reject anything
+        // else before allocating. This bounds every count-driven allocation by
+        // `max_field_count`, which is in turn validated against `data.len()`.
+        if field_count > max_field_count as usize {
+            return Err(BlobError::CorruptData(
+                "dictionary field_count exceeds max_field_count",
+            ));
+        }
+        if sorted_count > field_count {
+            return Err(BlobError::CorruptData(
+                "dictionary sorted_count exceeds field_count",
+            ));
+        }
+
         let mut pos = 20;
 
         // sorted_hashes: read field_count live entries, skip reserved slots
@@ -450,6 +470,43 @@ mod tests {
     use super::*;
     use crate::arc_value::ArcValue;
     use serde_json::json;
+
+    /// C2 regression (fuzz_dictionary): a `field_count` near u32::MAX with a
+    /// small `max_field_count` previously drove `Vec::with_capacity(field_count)`
+    /// into a multi-gigabyte allocation (OOM). The structural-invariant check
+    /// must reject it as corrupt instead of allocating.
+    #[test]
+    fn test_from_bytes_rejects_field_count_exceeding_max() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&(u32::MAX - 1).to_le_bytes()); // field_count (huge)
+        data.extend_from_slice(&0u32.to_le_bytes()); // sorted_count
+        data.extend_from_slice(&4u32.to_le_bytes()); // max_field_count (small)
+        data.extend_from_slice(&0u32.to_le_bytes()); // name_data_used
+        data.extend_from_slice(&0u32.to_le_bytes()); // max_name_data
+        data.resize(64, 0); // some slack so a length check isn't what trips first
+
+        match Dictionary::from_bytes(&data) {
+            Err(BlobError::CorruptData(_)) => {}
+            other => panic!("expected CorruptData, got {other:?}"),
+        }
+    }
+
+    /// sorted_count must not exceed the live field_count.
+    #[test]
+    fn test_from_bytes_rejects_sorted_count_exceeding_field_count() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes()); // field_count
+        data.extend_from_slice(&5u32.to_le_bytes()); // sorted_count > field_count
+        data.extend_from_slice(&8u32.to_le_bytes()); // max_field_count
+        data.extend_from_slice(&0u32.to_le_bytes()); // name_data_used
+        data.extend_from_slice(&0u32.to_le_bytes()); // max_name_data
+        data.resize(256, 0);
+
+        match Dictionary::from_bytes(&data) {
+            Err(BlobError::CorruptData(_)) => {}
+            other => panic!("expected CorruptData, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_build_and_lookup() {

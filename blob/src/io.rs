@@ -284,7 +284,10 @@ impl BlobIO for MemBlobIO {
     async fn pread(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         let data = self.data.borrow();
         let offset = offset as usize;
-        if offset + len > data.len() {
+        // offset/len originate from possibly-corrupt on-disk offsets, so the
+        // naive `offset + len` can overflow usize and wrap past the bound check
+        // into an out-of-range slice. Compare without adding.
+        if len > data.len() || offset > data.len() - len {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 format!(
@@ -441,8 +444,27 @@ impl BlobIO for StdBlobIO {
 
     async fn pread(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         use std::os::unix::fs::FileExt;
-        let mut buf = vec![0u8; len];
-        self.file.read_exact_at(&mut buf, offset)?;
+        // `len` may come from a corrupt header; don't pre-allocate it. Grow in
+        // bounded chunks and stop at the true EOF, so a bad length reads only
+        // what exists rather than triggering a huge allocation up front.
+        const MAX_READ_CHUNK: usize = 16 * 1024 * 1024;
+        let mut buf: Vec<u8> = Vec::with_capacity(len.min(MAX_READ_CHUNK));
+        while buf.len() < len {
+            let start = buf.len();
+            let want = (len - start).min(MAX_READ_CHUNK);
+            buf.resize(start + want, 0);
+            match self.file.read_at(&mut buf[start..], offset + start as u64) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("short read at offset {offset}: wanted {len}, got {start}"),
+                    ));
+                }
+                Ok(n) => buf.truncate(start + n),
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => buf.truncate(start),
+                Err(e) => return Err(e),
+            }
+        }
         Ok(buf)
     }
 
@@ -502,6 +524,36 @@ mod tests {
 
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
         futures::executor::block_on(f)
+    }
+
+    /// `StdBlobIO::pread` must not pre-allocate an untrusted `len`: a read far
+    /// past EOF (as a corrupt node header could request) returns UnexpectedEof
+    /// promptly instead of attempting a multi-gigabyte allocation. Also checks
+    /// the ordinary read paths still return exactly `len` or error.
+    #[test]
+    fn test_std_blob_io_pread_huge_len_does_not_overallocate() {
+        block_on(async {
+            let dir = std::env::temp_dir().join(format!("lark-pread-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("blob.lark");
+            let io = StdBlobIO::create(&path).unwrap();
+            io.append(b"hello world").await.unwrap();
+
+            // Valid read returns exactly the requested bytes.
+            assert_eq!(io.pread(0, 11).await.unwrap(), b"hello world");
+            assert_eq!(io.pread(6, 5).await.unwrap(), b"world");
+
+            // A read length far larger than the file (e.g. a corrupt size of
+            // ~16 GiB) must error at EOF without trying to allocate it.
+            let huge = 16usize * 1024 * 1024 * 1024;
+            let err = io.pread(0, huge).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+            // Reading just past the end also errors rather than returning short.
+            assert!(io.pread(8, 10).await.is_err());
+
+            let _ = std::fs::remove_file(&path);
+        });
     }
 
     #[test]

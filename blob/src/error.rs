@@ -37,6 +37,9 @@ pub enum BlobError {
     #[error("dictionary is full (max capacity reached), full recompact needed")]
     DictionaryFull,
 
+    #[error("corrupt blob data: {0}")]
+    CorruptData(&'static str),
+
     #[error("internal error: {0}")]
     InternalError(String),
 }
