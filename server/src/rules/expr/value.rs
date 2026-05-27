@@ -5,6 +5,7 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::eval::EvalError;
 use crate::rules::NeedsPromotion;
 
 /// Value kind enumeration.
@@ -334,10 +335,10 @@ impl Value {
 
     /// Call a method on this value.
     /// Returns Result to propagate NeedsPromotion from snapshot methods.
-    pub fn call_method(&self, name: &str, args: &[Value]) -> Result<Value, NeedsPromotion> {
+    pub fn call_method(&self, name: &str, args: &[Value]) -> Result<Value, EvalError> {
         match self {
             Value::Snapshot(s) => call_snapshot_method(s.as_ref(), name, args),
-            Value::String(s) => Ok(call_string_method(s, name, args)),
+            Value::String(s) => call_string_method(s, name, args),
             Value::Array(a) => Ok(call_array_method(a, name, args)),
             Value::Object(o) => Ok(call_object_method(o, name, args)),
             _ => Ok(Value::Null),
@@ -354,7 +355,7 @@ fn call_snapshot_method(
     snap: &dyn Snapshot,
     name: &str,
     args: &[Value],
-) -> Result<Value, NeedsPromotion> {
+) -> Result<Value, EvalError> {
     match name {
         "val" => match snap.val()? {
             Some(v) if is_object_sentinel(&v) => Ok(Value::ObjectSentinel),
@@ -399,46 +400,52 @@ fn call_snapshot_method(
     }
 }
 
-fn call_string_method(s: &str, name: &str, args: &[Value]) -> Value {
+fn call_string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, EvalError> {
     match name {
         "contains" => {
             let substr = args.first().map(|a| a.as_string()).unwrap_or("");
-            Value::Bool(s.contains(substr))
+            Ok(Value::Bool(s.contains(substr)))
         }
         "beginsWith" | "startsWith" => {
             let prefix = args.first().map(|a| a.as_string()).unwrap_or("");
-            Value::Bool(s.starts_with(prefix))
+            Ok(Value::Bool(s.starts_with(prefix)))
         }
         "endsWith" => {
             let suffix = args.first().map(|a| a.as_string()).unwrap_or("");
-            Value::Bool(s.ends_with(suffix))
+            Ok(Value::Bool(s.ends_with(suffix)))
         }
-        "matches" => {
-            match args.first() {
-                Some(Value::Regex(cached)) => Value::Bool(cached.0.is_match(s)),
-                _ => {
-                    // Fallback: compile at runtime (for dynamically constructed patterns)
-                    let pattern = args.first().map(|a| a.as_string()).unwrap_or("");
-                    match Regex::new(pattern) {
-                        Ok(re) => Value::Bool(re.is_match(s)),
-                        Err(_) => Value::Bool(false),
-                    }
+        "matches" => match args.first() {
+            // Literal regexes are compiled once at parse time and cached, so they
+            // can never fail here.
+            Some(Value::Regex(cached)) => Ok(Value::Bool(cached.0.is_match(s))),
+            _ => {
+                // Fallback: compile a dynamically-constructed pattern at runtime.
+                // A pattern that fails to compile MUST raise an evaluation error
+                // (→ the rule denies), not return false. Returning false fails
+                // OPEN under negation: `!x.matches(badPattern)` would flip to
+                // `true` and grant. See security audit L-4.
+                let pattern = args.first().map(|a| a.as_string()).unwrap_or("");
+                match Regex::new(pattern) {
+                    Ok(re) => Ok(Value::Bool(re.is_match(s))),
+                    Err(_) => Err(EvalError::Error(
+                        "invalid regular expression in matches()".to_string(),
+                    )),
                 }
             }
-        }
+        },
         "replace" => {
             if args.len() < 2 {
-                return Value::String(s.to_string());
+                return Ok(Value::String(s.to_string()));
             }
             let from = args[0].as_string();
             let to = args[1].as_string();
             // Replace ALL occurrences
-            Value::String(s.replace(from, to))
+            Ok(Value::String(s.replace(from, to)))
         }
-        "toLowerCase" => Value::String(s.to_lowercase()),
-        "toUpperCase" => Value::String(s.to_uppercase()),
-        "trim" => Value::String(s.trim().to_string()),
-        _ => Value::Null,
+        "toLowerCase" => Ok(Value::String(s.to_lowercase())),
+        "toUpperCase" => Ok(Value::String(s.to_uppercase())),
+        "trim" => Ok(Value::String(s.trim().to_string())),
+        _ => Ok(Value::Null),
     }
 }
 
@@ -604,15 +611,15 @@ mod tests {
     fn test_string_methods() {
         let s = "hello world";
         assert_eq!(
-            call_string_method(s, "contains", &[Value::String("world".to_string())]),
+            call_string_method(s, "contains", &[Value::String("world".to_string())]).unwrap(),
             Value::Bool(true)
         );
         assert_eq!(
-            call_string_method(s, "startsWith", &[Value::String("hello".to_string())]),
+            call_string_method(s, "startsWith", &[Value::String("hello".to_string())]).unwrap(),
             Value::Bool(true)
         );
         assert_eq!(
-            call_string_method(s, "endsWith", &[Value::String("world".to_string())]),
+            call_string_method(s, "endsWith", &[Value::String("world".to_string())]).unwrap(),
             Value::Bool(true)
         );
     }
@@ -621,12 +628,26 @@ mod tests {
     fn test_string_matches() {
         let s = "hello123";
         assert_eq!(
-            call_string_method(s, "matches", &[Value::String("[a-z]+[0-9]+".to_string())]),
+            call_string_method(s, "matches", &[Value::String("[a-z]+[0-9]+".to_string())]).unwrap(),
             Value::Bool(true)
         );
         assert_eq!(
-            call_string_method(s, "matches", &[Value::String("^[0-9]+$".to_string())]),
+            call_string_method(s, "matches", &[Value::String("^[0-9]+$".to_string())]).unwrap(),
             Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn test_matches_invalid_pattern_errors_not_false() {
+        // A dynamically-constructed pattern that fails to compile must raise an
+        // evaluation error (→ deny), NOT return false — otherwise `!matches(...)`
+        // fails open and grants. See audit L-4.
+        let s = "anything";
+        let err = call_string_method(s, "matches", &[Value::String("[unterminated".to_string())]);
+        assert!(
+            matches!(err, Err(EvalError::Error(_))),
+            "invalid regex must error, got {:?}",
+            err
         );
     }
 
@@ -811,7 +832,7 @@ mod tests {
                 Value::String("hi".to_string()),
             ],
         );
-        assert_eq!(result, Value::String("hi hi hi".to_string()));
+        assert_eq!(result.unwrap(), Value::String("hi hi hi".to_string()));
     }
 
     #[test]
@@ -825,7 +846,7 @@ mod tests {
                 Value::String("there".to_string()),
             ],
         );
-        assert_eq!(result, Value::String("hello there".to_string()));
+        assert_eq!(result.unwrap(), Value::String("hello there".to_string()));
     }
 
     #[test]
@@ -839,6 +860,6 @@ mod tests {
                 Value::String("abc".to_string()),
             ],
         );
-        assert_eq!(result, Value::String("hello world".to_string()));
+        assert_eq!(result.unwrap(), Value::String("hello world".to_string()));
     }
 }
