@@ -45,9 +45,7 @@ impl ArcValueSortExt for ArcValue {
             ArcValue::Bool(b) => Some(SortKey::Bool(*b)),
             ArcValue::Number(n) => Some(SortKey::Number(n.as_f64().unwrap_or(0.0))),
             ArcValue::String(s) => Some(SortKey::String(s.clone())),
-            ArcValue::Array(_) | ArcValue::Object(_) | ArcValue::Sentinel(_) => {
-                Some(SortKey::Object)
-            }
+            ArcValue::Object(_) | ArcValue::Sentinel(_) => Some(SortKey::Object),
         }
     }
 
@@ -57,9 +55,7 @@ impl ArcValueSortExt for ArcValue {
             ArcValue::Bool(b) => Some(SortKey::Bool(*b)),
             ArcValue::Number(n) => Some(SortKey::Number(n.as_f64().unwrap_or(0.0))),
             ArcValue::String(s) => Some(SortKey::String(s.clone())),
-            ArcValue::Array(_) | ArcValue::Object(_) | ArcValue::Sentinel(_) => {
-                Some(SortKey::Object)
-            }
+            ArcValue::Object(_) | ArcValue::Sentinel(_) => Some(SortKey::Object),
         }
     }
 }

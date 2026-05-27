@@ -24,7 +24,6 @@ pub enum ArcValue {
     Bool(bool),
     Number(Number),
     String(Arc<str>),
-    Array(Arc<Vec<ArcValue>>),
     Object(Arc<HashMap<String, ArcValue>>),
     /// Marker: node exists in blob storage but full value hasn't been loaded.
     /// May contain children from in-memory writes that pass through this node.
@@ -68,10 +67,6 @@ impl ArcValue {
             ArcValue::Bool(b) => Value::Bool(*b),
             ArcValue::Number(n) => Value::Number(n.clone()),
             ArcValue::String(s) => Value::String(s.to_string()),
-            ArcValue::Array(arr) => {
-                let converted: Vec<Value> = arr.iter().map(|v| v.to_value()).collect();
-                Value::Array(converted)
-            }
             ArcValue::Object(map) => object_to_value(map),
         }
     }
@@ -86,8 +81,6 @@ impl ArcValue {
         match self {
             ArcValue::Sentinel(_) => true,
             ArcValue::Object(map) => map.values().any(|v| v.contains_sentinel()),
-            // Arrays shouldn't contain Sentinels in practice, but check anyway
-            ArcValue::Array(arr) => arr.iter().any(|v| v.contains_sentinel()),
             _ => false,
         }
     }
@@ -105,18 +98,6 @@ impl ArcValue {
                         let len = path.len();
                         path.push('/');
                         path.push_str(k);
-                        if walk(v, path) {
-                            return true;
-                        }
-                        path.truncate(len);
-                    }
-                    false
-                }
-                ArcValue::Array(arr) => {
-                    for (i, v) in arr.iter().enumerate() {
-                        let len = path.len();
-                        path.push('/');
-                        path.push_str(&i.to_string());
                         if walk(v, path) {
                             return true;
                         }
@@ -144,10 +125,6 @@ impl ArcValue {
         ArcValue::Object(Arc::new(HashMap::new()))
     }
 
-    pub fn empty_array() -> Self {
-        ArcValue::Array(Arc::new(Vec::new()))
-    }
-
     pub fn empty_sentinel() -> Self {
         ArcValue::Sentinel(Arc::new(HashMap::new()))
     }
@@ -168,13 +145,6 @@ impl ArcValue {
         }
     }
 
-    pub fn get_index(&self, index: usize) -> Option<&ArcValue> {
-        match self {
-            ArcValue::Array(arr) => arr.get(index),
-            _ => None,
-        }
-    }
-
     pub fn get_path(&self, path: &[&str]) -> Option<&ArcValue> {
         let mut current = self;
         for segment in path {
@@ -191,10 +161,6 @@ impl ArcValue {
         matches!(self, ArcValue::Object(_))
     }
 
-    pub fn is_array(&self) -> bool {
-        matches!(self, ArcValue::Array(_))
-    }
-
     pub fn is_primitive(&self) -> bool {
         matches!(
             self,
@@ -205,7 +171,6 @@ impl ArcValue {
     pub fn is_empty_container(&self) -> bool {
         match self {
             ArcValue::Object(map) => map.is_empty(),
-            ArcValue::Array(arr) => arr.is_empty(),
             ArcValue::Null => true,
             // Sentinel is never "empty" — it represents data in blob
             _ => false,
@@ -215,7 +180,6 @@ impl ArcValue {
     pub fn len(&self) -> usize {
         match self {
             ArcValue::Object(map) => map.len(),
-            ArcValue::Array(arr) => arr.len(),
             _ => 0, // Sentinel returns 0 — caller must promote first
         }
     }
@@ -235,13 +199,6 @@ impl ArcValue {
         match self {
             ArcValue::Object(map) => ObjectIter::Some(map.iter()),
             _ => ObjectIter::None, // Sentinel returns empty — caller must promote first
-        }
-    }
-
-    pub fn array_iter(&self) -> impl Iterator<Item = &ArcValue> {
-        match self {
-            ArcValue::Array(arr) => ArrayIter::Some(arr.iter()),
-            _ => ArrayIter::None,
         }
     }
 
@@ -280,20 +237,12 @@ impl ArcValue {
         }
     }
 
-    pub fn as_array(&self) -> Option<&Vec<ArcValue>> {
-        match self {
-            ArcValue::Array(arr) => Some(arr),
-            _ => None,
-        }
-    }
-
     pub fn ptr_eq(&self, other: &ArcValue) -> bool {
         match (self, other) {
             (ArcValue::Null, ArcValue::Null) => true,
             (ArcValue::Bool(a), ArcValue::Bool(b)) => a == b,
             (ArcValue::Number(a), ArcValue::Number(b)) => a == b,
             (ArcValue::String(a), ArcValue::String(b)) => Arc::ptr_eq(a, b),
-            (ArcValue::Array(a), ArcValue::Array(b)) => Arc::ptr_eq(a, b),
             (ArcValue::Object(a), ArcValue::Object(b)) => Arc::ptr_eq(a, b),
             (ArcValue::Sentinel(a), ArcValue::Sentinel(b)) => Arc::ptr_eq(a, b),
             _ => false,
@@ -564,7 +513,6 @@ impl ArcValue {
         match self {
             ArcValue::Null => false,
             ArcValue::Object(map) => !map.is_empty(),
-            ArcValue::Array(arr) => !arr.is_empty(),
             ArcValue::Sentinel(_) => false, // Caller must promote before checking existence
             _ => true,
         }
@@ -584,20 +532,6 @@ impl ArcValue {
                 let cleaned: HashMap<String, ArcValue> = map
                     .iter()
                     .filter_map(|(k, v)| v.clone().clean().map(|cv| (k.clone(), cv)))
-                    .collect();
-                if cleaned.is_empty() {
-                    None
-                } else {
-                    Some(ArcValue::Object(Arc::new(cleaned)))
-                }
-            }
-            // Drop null/empty elements; surviving elements keep their original
-            // index as the map key, leaving gaps for the dropped ones.
-            ArcValue::Array(arr) => {
-                let cleaned: HashMap<String, ArcValue> = arr
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, v)| v.clone().clean().map(|cv| (i.to_string(), cv)))
                     .collect();
                 if cleaned.is_empty() {
                     None
@@ -655,16 +589,6 @@ impl ArcValue {
             ArcValue::Bool(_) => 5,
             ArcValue::Number(_) => 12,
             ArcValue::String(s) => s.len() as i64 + 2,
-            ArcValue::Array(arr) => {
-                let mut size: i64 = 2;
-                for (i, child) in arr.iter().enumerate() {
-                    if i > 0 {
-                        size += 1;
-                    }
-                    size += child.estimate_size();
-                }
-                size
-            }
             ArcValue::Object(map) => {
                 let mut size: i64 = 2;
                 let mut first = true;
@@ -720,21 +644,6 @@ impl<'a> Iterator for ObjectIter<'a> {
     }
 }
 
-enum ArrayIter<'a> {
-    Some(std::slice::Iter<'a, ArcValue>),
-    None,
-}
-
-impl<'a> Iterator for ArrayIter<'a> {
-    type Item = &'a ArcValue;
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            ArrayIter::Some(iter) => iter.next(),
-            ArrayIter::None => None,
-        }
-    }
-}
-
 impl PartialEq for ArcValue {
     fn eq(&self, other: &Self) -> bool {
         if self.ptr_eq(other) {
@@ -746,7 +655,6 @@ impl PartialEq for ArcValue {
             (ArcValue::Bool(a), ArcValue::Bool(b)) => a == b,
             (ArcValue::Number(a), ArcValue::Number(b)) => a == b,
             (ArcValue::String(a), ArcValue::String(b)) => a == b,
-            (ArcValue::Array(a), ArcValue::Array(b)) => a == b,
             (ArcValue::Object(a), ArcValue::Object(b)) => a == b,
             _ => false,
         }
@@ -765,13 +673,6 @@ impl Serialize for ArcValue {
             ArcValue::Bool(b) => serializer.serialize_bool(*b),
             ArcValue::Number(n) => n.serialize(serializer),
             ArcValue::String(s) => serializer.serialize_str(s),
-            ArcValue::Array(arr) => {
-                let mut seq = serializer.serialize_seq(Some(arr.len()))?;
-                for item in arr.iter() {
-                    seq.serialize_element(item)?;
-                }
-                seq.end()
-            }
             ArcValue::Object(map) => match array_max_index(map) {
                 Some(max) => {
                     let len = (max as usize) + 1;
@@ -906,12 +807,6 @@ impl From<&str> for ArcValue {
 impl From<String> for ArcValue {
     fn from(s: String) -> Self {
         ArcValue::String(Arc::from(s))
-    }
-}
-
-impl<T: Into<ArcValue>> From<Vec<T>> for ArcValue {
-    fn from(arr: Vec<T>) -> Self {
-        ArcValue::Array(Arc::new(arr.into_iter().map(Into::into).collect()))
     }
 }
 

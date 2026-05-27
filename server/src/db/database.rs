@@ -4671,7 +4671,7 @@ impl Database {
             let tree = self.tree.read().unwrap();
             match tree.get(path) {
                 Some(node) if !node.is_sentinel() => {
-                    if !node.is_object() && !node.is_array() {
+                    if !node.is_object() {
                         // Path is a primitive in the tree — return it directly
                         let val = node.clone();
                         drop(tree);
@@ -4681,7 +4681,7 @@ impl Database {
                     // Container — build shallow map from children
                     for key in node.keys() {
                         if let Some(child) = node.get(key) {
-                            let shallow_val = if child.is_object() || child.is_array() {
+                            let shallow_val = if child.is_object() {
                                 size_marker(child.estimate_size() as u64)
                             } else {
                                 child.clone()
@@ -4854,7 +4854,7 @@ impl Database {
                 }
                 let tree = self.tree.read().unwrap();
                 if let Some(node) = tree.get(path) {
-                    if !node.is_object() && !node.is_array() {
+                    if !node.is_object() {
                         let val = node.clone();
                         drop(tree);
                         self.metrics.record_read();
@@ -4862,7 +4862,7 @@ impl Database {
                     }
                     for key in node.keys() {
                         if let Some(child) = node.get(key) {
-                            let shallow_val = if child.is_object() || child.is_array() {
+                            let shallow_val = if child.is_object() {
                                 size_marker(child.estimate_size() as u64)
                             } else {
                                 child.clone()

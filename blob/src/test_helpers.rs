@@ -179,9 +179,6 @@ pub fn collect_leaf_paths(
             }
             paths
         }
-        ArcValue::Array(_) => {
-            vec![prefix.to_vec()]
-        }
         _ => {
             vec![prefix.to_vec()]
         }

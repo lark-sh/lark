@@ -1699,32 +1699,4 @@ mod tests {
             assert_eq!(result.to_value(), original);
         });
     }
-
-    /// Legacy on-disk arrays (TYPE_ARRAY) decode to integer-keyed objects on
-    /// read, so existing blobs migrate transparently and still render as arrays.
-    #[test]
-    fn test_legacy_on_disk_array_migrates_to_object() {
-        block_on(async {
-            // A native array writes the legacy TYPE_ARRAY form on disk.
-            let legacy = ArcValue::Array(std::sync::Arc::new(vec![
-                ArcValue::String("a".into()),
-                ArcValue::Null,
-                ArcValue::String("c".into()),
-            ]));
-            let tree = ArcValue::Object(std::sync::Arc::new(
-                [("arr".to_string(), legacy)].into_iter().collect(),
-            ));
-            let io = MemBlobIO::new();
-            write_blob(&io, &tree).await.unwrap();
-
-            // On read it is an integer-keyed object; the null became a gap.
-            let arr = read_at_path(&io, &["arr"]).await;
-            assert!(arr.is_object());
-            assert_eq!(arr.get("0").unwrap().as_str(), Some("a"));
-            assert!(arr.get("1").is_none());
-            assert_eq!(arr.get("2").unwrap().as_str(), Some("c"));
-            // ...and it renders back as the array with the gap as null.
-            assert_eq!(arr.to_value(), json!(["a", null, "c"]));
-        });
-    }
 }

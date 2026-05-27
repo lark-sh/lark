@@ -279,7 +279,10 @@ mod tests {
         // An array hashes identically to the integer-keyed object it represents.
         let arr = compute_firebase_hash(&json!(["cat", "horse"]));
         assert!(!arr.is_empty());
-        assert_eq!(arr, compute_firebase_hash(&json!({"0": "cat", "1": "horse"})));
+        assert_eq!(
+            arr,
+            compute_firebase_hash(&json!({"0": "cat", "1": "horse"}))
+        );
 
         // Null elements are gaps: they contribute nothing, matching the sparse
         // object form.

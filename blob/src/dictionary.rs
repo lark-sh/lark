@@ -441,27 +441,19 @@ fn collect_field_names_recursive(
 ) {
     use crate::arc_value::ArcValue;
 
-    match value {
-        ArcValue::Object(map) => {
-            // If any key looks like a push ID, this is a collection —
-            // none of its keys go in the dictionary.
-            let is_collection = map.keys().any(|k| is_collection_key(k));
-            if !is_collection {
-                for key in map.keys() {
-                    names.insert(key.clone());
-                }
-            }
-            // Always recurse into children (they may contain structural objects)
-            for child in map.values() {
-                collect_field_names_recursive(child, names);
+    if let ArcValue::Object(map) = value {
+        // If any key looks like a push ID, this is a collection —
+        // none of its keys go in the dictionary.
+        let is_collection = map.keys().any(|k| is_collection_key(k));
+        if !is_collection {
+            for key in map.keys() {
+                names.insert(key.clone());
             }
         }
-        ArcValue::Array(arr) => {
-            for child in arr.iter() {
-                collect_field_names_recursive(child, names);
-            }
+        // Always recurse into children (they may contain structural objects)
+        for child in map.values() {
+            collect_field_names_recursive(child, names);
         }
-        _ => {}
     }
 }
 
