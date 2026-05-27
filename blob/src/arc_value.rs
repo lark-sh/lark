@@ -2,6 +2,24 @@
 //!
 //! Canonical source for both lark-blob and lark-server. lark-server should depend
 //! on this crate and use `lark_blob::ArcValue` instead of maintaining a copy.
+//!
+//! ## Array contract
+//!
+//! There is no array type. A JSON array is stored as an integer-keyed object —
+//! `["a","b"]` becomes `{"0":"a","1":"b"}` — so the whole engine (paths, writes,
+//! rules, subscriptions, WAL) addresses everything uniformly by string key, and a
+//! partial write like `/items/0/x` preserves its siblings for free.
+//!
+//! Arrays exist only at the read/wire boundary. `to_value()` and the `Serialize`
+//! impl render an object as a JSON array when it is non-empty, every key is a
+//! canonical non-negative integer, and `maxKey < 2 * numKeys`; otherwise it stays
+//! an object. Absent indices in `[0, maxKey]` read back as `null`. Ingest
+//! (`from_value`, `from_value_cleaned`, `clean`) does the reverse — arrays are
+//! flattened to integer keys. A `null` write deletes its target, so stored data
+//! never contains nulls: array gaps are simply absent keys.
+//!
+//! On disk, arrays are written as `TYPE_COLLECTION`. The legacy `TYPE_ARRAY` tag
+//! is read-only — decoded to an integer-keyed object — for migrating old blobs.
 
 use serde::ser::{Error as SerError, SerializeMap, SerializeSeq};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -12,7 +30,8 @@ use std::sync::Arc;
 /// An immutable, reference-counted JSON value with copy-on-write semantics.
 ///
 /// Primitives (Null, Bool, Number) are stored inline with no Arc overhead.
-/// Strings, Arrays, and Objects are wrapped in Arc for O(1) cloning.
+/// Strings and Objects are wrapped in Arc for O(1) cloning. (There is no array
+/// variant — see the array contract in the module docs.)
 ///
 /// `Sentinel` is an in-memory-only marker meaning "this node exists in blob storage
 /// but its value hasn't been loaded into memory." It is never serialized to blob or JSON.
@@ -347,10 +366,10 @@ impl ArcValue {
     /// promotion before they can be treated as authoritative.
     ///
     /// **WARNING — primitive clobber:** if any node along `path` (including `self`)
-    /// is a primitive (Null/Bool/Number/String) or Array, it is silently replaced
-    /// with a new `Sentinel` container to hold the write. This is the correct
-    /// Firebase SET semantic for client writes (writing `/a/b/c` replaces `/a/b`
-    /// if it was a primitive), but is dangerous for internal "we checked" marker
+    /// is a primitive (Null/Bool/Number/String), it is silently replaced with a
+    /// new `Sentinel` container to hold the write. This is the SET semantic for
+    /// client writes (writing `/a/b/c` replaces `/a/b` if it was a primitive),
+    /// but is dangerous for internal "we checked" marker
     /// writes — the newly-created Sentinel is not recorded in any tracking set,
     /// so a subsequent read of the primitive's path returns the untracked Sentinel
     /// and fails to serialize. See `Database::promote_path` / `promote_path_deep`

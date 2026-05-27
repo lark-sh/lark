@@ -685,8 +685,9 @@ impl<IO: BlobIO> BlobSession<IO> {
                 // TYPE_ARRAY is never written anymore — collections (including
                 // arrays) are stored as TYPE_COLLECTION. This decode is retained
                 // to migrate pre-existing on-disk arrays into integer-keyed
-                // objects on read; such nodes self-heal to TYPE_COLLECTION on the
-                // next compaction.
+                // objects on read. Compaction preserves the on-disk tag, so such
+                // nodes stay TYPE_ARRAY on disk until the path is next written
+                // (a SET goes through from_value_cleaned → object → TYPE_COLLECTION).
                 TYPE_ARRAY => {
                     let hdr = buf_slice(&buffers, cur_buf_idx, cur_offset, ARRAY_HEADER_SIZE)?;
                     let elem_count = u32::from_le_bytes(hdr[9..13].try_into().unwrap()) as usize;
