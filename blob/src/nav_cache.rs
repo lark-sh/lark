@@ -46,6 +46,81 @@ pub struct ContainerInfo {
 /// Containers with subtree_size ≤ this value get their full byte range cached.
 const CACHE_SUBTREE_THRESHOLD: u64 = 4096;
 
+/// Structural layout of a container, computed with checked arithmetic. All
+/// counts/sizes come from the on-disk node header and may be corrupt, so naive
+/// offset math can overflow u64 (and `children_area_offset - offset` underflow),
+/// which panics under overflow-checks and silently wraps otherwise. These helpers
+/// compute every offset with checked ops and reject genuine overflow as corrupt.
+///
+/// They intentionally do NOT bound offsets against the blob length:
+/// `children_area_offset` (and the reserved key region) are *logical* offsets
+/// that legitimately sit past the physical blob end — reserved capacity for
+/// in-place growth isn't materialized, and a fully-forwarded container never
+/// reads there. The blob's real extent is unreliable on the read path anyway
+/// (a `size()` Cell can lag appends). Out-of-range reads are caught where they
+/// matter: `pread` caps its allocation and stops at the true EOF.
+struct ContainerLayout {
+    index_offset: u64,
+    index_size: usize,
+    key_strings_offset: u64,
+    children_area_offset: u64,
+    structural_size: usize,
+}
+
+fn corrupt_region() -> BlobError {
+    BlobError::CorruptData("container offset arithmetic overflowed")
+}
+
+/// Layout for a TYPE_COLLECTION: header, then `total_slots` index entries, then
+/// key strings, then the children area.
+fn collection_layout(
+    offset: u64,
+    child_count: u32,
+    reserved_count: u32,
+    key_data_reserved: u32,
+) -> Result<ContainerLayout> {
+    let entry = COLLECTION_INDEX_ENTRY_SIZE as u64;
+    let total_slots = child_count as u64 + reserved_count as u64; // u64: no overflow
+    let index_offset = offset
+        .checked_add(COLLECTION_HEADER_SIZE as u64)
+        .ok_or_else(corrupt_region)?;
+    let key_strings_offset = total_slots
+        .checked_mul(entry)
+        .and_then(|n| n.checked_add(index_offset))
+        .ok_or_else(corrupt_region)?;
+    let children_area_offset = key_strings_offset
+        .checked_add(key_data_reserved as u64)
+        .ok_or_else(corrupt_region)?;
+    Ok(ContainerLayout {
+        index_offset,
+        index_size: child_count as usize * COLLECTION_INDEX_ENTRY_SIZE,
+        key_strings_offset,
+        children_area_offset,
+        // children_area_offset >= offset by construction, so no underflow.
+        structural_size: (children_area_offset - offset) as usize,
+    })
+}
+
+/// Layout for a TYPE_ARRAY: header, then `child_count` index entries, then the
+/// elements area. No reserved slots or key strings.
+fn array_layout(offset: u64, child_count: u32) -> Result<ContainerLayout> {
+    let entry = ARRAY_INDEX_ENTRY_SIZE as u64;
+    let index_offset = offset
+        .checked_add(ARRAY_HEADER_SIZE as u64)
+        .ok_or_else(corrupt_region)?;
+    let children_area_offset = (child_count as u64)
+        .checked_mul(entry)
+        .and_then(|n| n.checked_add(index_offset))
+        .ok_or_else(corrupt_region)?;
+    Ok(ContainerLayout {
+        index_offset,
+        index_size: child_count as usize * ARRAY_INDEX_ENTRY_SIZE,
+        key_strings_offset: 0,
+        children_area_offset,
+        structural_size: (children_area_offset - offset) as usize,
+    })
+}
+
 /// Read and parse a container at the given offset.
 ///
 /// Reads the header, child index, and key strings (for collections) from IO.
@@ -90,25 +165,20 @@ pub async fn read_container<IO: BlobIO>(
                     let key_data_reserved = u32::from_le_bytes(hdr[21..25].try_into().unwrap());
                     let appended_bytes = u32::from_le_bytes(hdr[25..29].try_into().unwrap());
 
-                    let total_slots = child_count + reserved_count;
-                    let child_index_offset = offset + COLLECTION_HEADER_SIZE as u64;
-                    let child_index_size = child_count as usize * COLLECTION_INDEX_ENTRY_SIZE;
-                    let key_strings_offset = child_index_offset
-                        + total_slots as u64 * COLLECTION_INDEX_ENTRY_SIZE as u64;
-                    let children_area_offset = key_strings_offset + key_data_reserved as u64;
+                    let layout =
+                        collection_layout(offset, child_count, reserved_count, key_data_reserved)?;
 
                     // Pre-cache structural region so index + key string reads are cache hits
-                    let structural_size = (children_area_offset - offset) as usize;
-                    let _ = io.cache_region(offset, structural_size).await;
+                    let _ = io.cache_region(offset, layout.structural_size).await;
 
-                    let child_index = if child_index_size > 0 {
-                        read_exact(io, child_index_offset, child_index_size).await?
+                    let child_index = if layout.index_size > 0 {
+                        read_exact(io, layout.index_offset, layout.index_size).await?
                     } else {
                         Vec::new()
                     };
 
                     let key_strings = if key_data_used > 0 {
-                        read_exact(io, key_strings_offset, key_data_used as usize).await?
+                        read_exact(io, layout.key_strings_offset, key_data_used as usize).await?
                     } else {
                         Vec::new()
                     };
@@ -119,7 +189,7 @@ pub async fn read_container<IO: BlobIO>(
                         subtree_size,
                         child_count,
                         appended_bytes,
-                        children_area_offset,
+                        children_area_offset: layout.children_area_offset,
                         child_index,
                         reserved_count,
                         key_data_used,
@@ -133,16 +203,13 @@ pub async fn read_container<IO: BlobIO>(
                     let child_count = u32::from_le_bytes(hdr[9..13].try_into().unwrap());
                     let appended_bytes = u32::from_le_bytes(hdr[13..17].try_into().unwrap());
 
-                    let elem_index_start = offset + ARRAY_HEADER_SIZE as u64;
-                    let child_index_size = child_count as usize * ARRAY_INDEX_ENTRY_SIZE;
-                    let children_area_offset = elem_index_start + child_index_size as u64;
+                    let layout = array_layout(offset, child_count)?;
 
                     // Pre-cache structural region so the index read is a cache hit
-                    let structural_size = (children_area_offset - offset) as usize;
-                    let _ = io.cache_region(offset, structural_size).await;
+                    let _ = io.cache_region(offset, layout.structural_size).await;
 
-                    let child_index = if child_index_size > 0 {
-                        read_exact(io, elem_index_start, child_index_size).await?
+                    let child_index = if layout.index_size > 0 {
+                        read_exact(io, layout.index_offset, layout.index_size).await?
                     } else {
                         Vec::new()
                     };
@@ -153,7 +220,7 @@ pub async fn read_container<IO: BlobIO>(
                         subtree_size,
                         child_count,
                         appended_bytes,
-                        children_area_offset,
+                        children_area_offset: layout.children_area_offset,
                         child_index,
                         reserved_count: 0,
                         key_data_used: 0,
@@ -219,27 +286,21 @@ pub async fn read_container<IO: BlobIO>(
             let key_data_reserved = u32::from_le_bytes(header_data[21..25].try_into().unwrap());
             let appended_bytes = u32::from_le_bytes(header_data[25..29].try_into().unwrap());
 
-            let total_slots = child_count + reserved_count;
-            let child_index_offset = offset + COLLECTION_HEADER_SIZE as u64;
-            let child_index_size = child_count as usize * COLLECTION_INDEX_ENTRY_SIZE;
-            let key_strings_offset =
-                child_index_offset + total_slots as u64 * COLLECTION_INDEX_ENTRY_SIZE as u64;
-            let children_area_offset = key_strings_offset + key_data_reserved as u64;
+            let layout = collection_layout(offset, child_count, reserved_count, key_data_reserved)?;
 
             // For large containers without a hint (root), cache structural region
             if subtree_size > CACHE_SUBTREE_THRESHOLD {
-                let structural_size = (children_area_offset - offset) as usize;
-                let _ = io.cache_region(offset, structural_size).await;
+                let _ = io.cache_region(offset, layout.structural_size).await;
             }
 
-            let child_index = if child_index_size > 0 {
-                read_exact(io, child_index_offset, child_index_size).await?
+            let child_index = if layout.index_size > 0 {
+                read_exact(io, layout.index_offset, layout.index_size).await?
             } else {
                 Vec::new()
             };
 
             let key_strings = if key_data_used > 0 {
-                read_exact(io, key_strings_offset, key_data_used as usize).await?
+                read_exact(io, layout.key_strings_offset, key_data_used as usize).await?
             } else {
                 Vec::new()
             };
@@ -250,7 +311,7 @@ pub async fn read_container<IO: BlobIO>(
                 subtree_size,
                 child_count,
                 appended_bytes,
-                children_area_offset,
+                children_area_offset: layout.children_area_offset,
                 child_index,
                 reserved_count,
                 key_data_used,
@@ -266,18 +327,15 @@ pub async fn read_container<IO: BlobIO>(
             let child_count = u32::from_le_bytes(header_data[9..13].try_into().unwrap());
             let appended_bytes = u32::from_le_bytes(header_data[13..17].try_into().unwrap());
 
-            let elem_index_start = offset + ARRAY_HEADER_SIZE as u64;
-            let child_index_size = child_count as usize * ARRAY_INDEX_ENTRY_SIZE;
-            let children_area_offset = elem_index_start + child_index_size as u64;
+            let layout = array_layout(offset, child_count)?;
 
             // For large containers without a hint (root), cache structural region
             if subtree_size > CACHE_SUBTREE_THRESHOLD {
-                let structural_size = (children_area_offset - offset) as usize;
-                let _ = io.cache_region(offset, structural_size).await;
+                let _ = io.cache_region(offset, layout.structural_size).await;
             }
 
-            let child_index = if child_index_size > 0 {
-                read_exact(io, elem_index_start, child_index_size).await?
+            let child_index = if layout.index_size > 0 {
+                read_exact(io, layout.index_offset, layout.index_size).await?
             } else {
                 Vec::new()
             };
@@ -288,7 +346,7 @@ pub async fn read_container<IO: BlobIO>(
                 subtree_size,
                 child_count,
                 appended_bytes,
-                children_area_offset,
+                children_area_offset: layout.children_area_offset,
                 child_index,
                 reserved_count: 0,
                 key_data_used: 0,
@@ -905,6 +963,30 @@ pub fn path_to_key(path: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a container's reserved capacity makes `children_area_offset`
+    /// a *logical* offset that can sit past the physical blob end. The layout
+    /// helpers must accept this — they only reject genuine u64 overflow, never a
+    /// large-but-valid offset. An earlier over-strict blob-length bound here
+    /// NACK'd valid reads in chaos-monkey ("container region ... exceeds blob
+    /// length"). Out-of-range reads are caught at `pread` (EOF), not here.
+    #[test]
+    fn test_layout_allows_large_logical_offsets() {
+        // Small live child_count, but large reserved key space pushes
+        // children_area_offset far past any plausible physical blob end.
+        let layout = collection_layout(100, 2, 0, 10_000)
+            .expect("a large logical offset must be accepted, not rejected");
+        assert!(layout.children_area_offset > 10_000);
+        assert_eq!(
+            layout.structural_size as u64,
+            layout.children_area_offset - 100
+        );
+
+        // Genuine u64 overflow in the offset math is still rejected as corrupt.
+        assert!(collection_layout(u64::MAX - 8, 1, 0, 0).is_err());
+        assert!(array_layout(100, u32::MAX).is_ok()); // large but no overflow
+        assert!(array_layout(u64::MAX, u32::MAX).is_err()); // offset+index overflows
+    }
 
     fn make_location(offset: u64) -> BlobLocation {
         BlobLocation {

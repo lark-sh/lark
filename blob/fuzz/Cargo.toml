@@ -1,0 +1,48 @@
+[package]
+name = "lark-blob-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+futures = "0.3"
+serde_json = "1"
+
+[dependencies.lark-blob]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_sidecar"
+path = "fuzz_targets/fuzz_sidecar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_dictionary"
+path = "fuzz_targets/fuzz_dictionary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_blob_header"
+path = "fuzz_targets/fuzz_blob_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_blob_session"
+path = "fuzz_targets/fuzz_blob_session.rs"
+test = false
+doc = false
+bench = false

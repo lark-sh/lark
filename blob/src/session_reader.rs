@@ -252,11 +252,26 @@ fn parse_leaf(buf: &[u8], offset: usize, type_tag: u8) -> Result<ArcValue> {
 #[inline]
 fn buf_slice(buffers: &[BufEntry], buf_idx: usize, abs_offset: u64, len: usize) -> Result<&[u8]> {
     let entry = &buffers[buf_idx];
-    let start = (abs_offset - entry.base) as usize;
-    if start + len > entry.data.len() {
+    let start = local_offset(entry, abs_offset)?;
+    let end = start.checked_add(len).ok_or(BlobError::UnexpectedEof)?;
+    if end > entry.data.len() {
         return Err(BlobError::UnexpectedEof);
     }
-    Ok(&entry.data[start..start + len])
+    Ok(&entry.data[start..end])
+}
+
+/// Translate an absolute blob offset into an index within `entry`, validating it
+/// falls inside the buffer. Child/forwarded offsets are read from on-disk node
+/// headers and may be corrupt, so the naive `(abs_offset - base) as usize` can
+/// underflow (offset < base) or land past the buffer — both panic. This returns
+/// `UnexpectedEof` instead. The returned index is `< entry.data.len()`, so it is
+/// always valid to read at least one byte there.
+fn local_offset(entry: &BufEntry, abs_offset: u64) -> Result<usize> {
+    let local = abs_offset
+        .checked_sub(entry.base)
+        .filter(|&l| l < entry.data.len() as u64)
+        .ok_or(BlobError::UnexpectedEof)?;
+    Ok(local as usize)
 }
 
 // ── BlobSession methods ──────────────────────────────────────────────
@@ -565,7 +580,8 @@ impl<IO: BlobIO> BlobSession<IO> {
                 nodes_since_yield = 0;
             }
 
-            let tag = buffers[cur_buf_idx].data[(cur_offset - buffers[cur_buf_idx].base) as usize];
+            let entry = &buffers[cur_buf_idx];
+            let tag = entry.data[local_offset(entry, cur_offset)?];
 
             let completed: ArcValue = match tag {
                 TYPE_COLLECTION => {
@@ -574,7 +590,11 @@ impl<IO: BlobIO> BlobSession<IO> {
                     let reserved_count = u32::from_le_bytes(hdr[13..17].try_into().unwrap());
                     let key_data_used = u32::from_le_bytes(hdr[17..21].try_into().unwrap());
                     let key_data_reserved = u32::from_le_bytes(hdr[21..25].try_into().unwrap());
-                    let total_slots = child_count as u32 + reserved_count;
+                    // u64 sum: child_count and reserved_count are independent
+                    // attacker-controlled u32s, so a u32 addition here can
+                    // overflow (panic under overflow-checks). buf_slice below
+                    // rejects values that exceed the buffer.
+                    let total_slots = child_count as u64 + reserved_count as u64;
 
                     if child_count == 0 {
                         ArcValue::Object(Arc::new(HashMap::new()))
@@ -583,8 +603,8 @@ impl<IO: BlobIO> BlobSession<IO> {
                         let idx_len = child_count * COLLECTION_INDEX_ENTRY_SIZE;
                         let child_index_data =
                             buf_slice(&buffers, cur_buf_idx, child_index_offset, idx_len)?;
-                        let key_strings_offset = child_index_offset
-                            + total_slots as u64 * COLLECTION_INDEX_ENTRY_SIZE as u64;
+                        let key_strings_offset =
+                            child_index_offset + total_slots * COLLECTION_INDEX_ENTRY_SIZE as u64;
 
                         let key_data = buf_slice(
                             &buffers,
@@ -730,7 +750,7 @@ impl<IO: BlobIO> BlobSession<IO> {
 
                 // Scalar at descend level
                 _ => {
-                    let local_off = (cur_offset - buffers[cur_buf_idx].base) as usize;
+                    let local_off = local_offset(&buffers[cur_buf_idx], cur_offset)?;
                     return parse_leaf(&buffers[cur_buf_idx].data, local_off, tag);
                 }
             };
@@ -835,7 +855,7 @@ impl<IO: BlobIO> BlobSession<IO> {
                 return Ok(Some(parse_leaf(&data, 0, child.type_tag)?));
             } else {
                 // Inline leaf — parse from parent buffer
-                let local_off = (child.abs_offset - buffers[parent_buf_idx].base) as usize;
+                let local_off = local_offset(&buffers[parent_buf_idx], child.abs_offset)?;
                 return Ok(Some(parse_leaf(
                     &buffers[parent_buf_idx].data,
                     local_off,
@@ -875,6 +895,50 @@ mod tests {
         write_blob(&io, &tree).await.unwrap();
         let session = BlobSession::open(io).await.unwrap();
         session.read_subtree(&[]).await.unwrap()
+    }
+
+    /// Reading a corrupted blob must never panic — only return Ok or Err. The
+    /// node reader translates on-disk child/forwarded offsets into buffer
+    /// indices; before bounds-checking, a corrupt offset would either index out
+    /// of bounds or underflow `offset - base`. This is the in-tree counterpart
+    /// to `fuzz_blob_session`: it exhaustively flips every byte of a valid blob
+    /// (to several adversarial values) and drives the read paths, asserting no
+    /// panic. It would have caught the original session_reader.rs OOB crash.
+    #[test]
+    fn test_read_does_not_panic_on_corrupted_blob() {
+        block_on(async {
+            let tree = ArcValue::from_value(json!({
+                "users": {
+                    "alice": { "age": 30, "name": "Alice", "admin": true },
+                    "bob": { "age": 25, "tags": ["x", "y", "z"] }
+                },
+                "rooms": [{ "id": 1, "members": ["alice", "bob"] }, { "id": 2 }],
+                "counters": [0, 1, 2, 3, 4, 5],
+                "title": "seed"
+            }));
+            let io = MemBlobIO::new();
+            write_blob(&io, &tree).await.unwrap();
+            let valid = io.data().to_vec();
+
+            for pos in 0..valid.len() {
+                for &val in &[0x00u8, 0x01, 0x7f, 0x80, 0xff] {
+                    let mut bytes = valid.clone();
+                    if bytes[pos] == val {
+                        continue;
+                    }
+                    bytes[pos] = val;
+
+                    // open() may reject (corrupt header/dictionary); if it
+                    // succeeds, the read traversal must also not panic.
+                    if let Ok(session) = BlobSession::open(MemBlobIO::from_bytes(bytes)).await {
+                        let _ = session.read_subtree(&[]).await;
+                        let _ = session.read_keys(&[]).await;
+                        let _ = session.read_shallow(&["users"]).await;
+                        let _ = session.read_subtree(&["rooms"]).await;
+                    }
+                }
+            }
+        });
     }
 
     #[test]
