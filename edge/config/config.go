@@ -44,6 +44,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -174,14 +175,27 @@ func Load() (*Config, error) {
 	}
 
 	cfg.ServerSecret = os.Getenv("SERVER_SECRET")
-	if cfg.ServerSecret == "" {
-		return nil, fmt.Errorf("SERVER_SECRET is required")
+	if err := validateServerSecret(cfg.ServerSecret, cfg.LocalMode); err != nil {
+		return nil, err
 	}
 
 	// LOCAL_MODE implies DISABLE_TLS; nothing in the LOCAL_MODE deploy
 	// expects to terminate TLS.
 	if cfg.LocalMode {
 		cfg.DisableTLS = true
+
+		// LOCAL_MODE bundles plaintext HTTP, hardcoded dev secrets, wide-open
+		// rules, and the "owner" admin token — it must never face an untrusted
+		// network. Refuse to bind a non-loopback interface unless explicitly
+		// acknowledged. See security audit H-2.
+		//
+		// The ack exists because a container must bind all interfaces (":port")
+		// for host port-mapping to work — 127.0.0.1 inside the container is
+		// unreachable from the host. Dockerized LOCAL_MODE (e.g. the Firebase
+		// SDK test stack) sets LOCAL_MODE_ALLOW_PUBLIC_BIND=true deliberately.
+		if !getEnvBool("LOCAL_MODE_ALLOW_PUBLIC_BIND", false) && !isLoopbackListenAddr(cfg.HTTPSListenAddr) {
+			return nil, fmt.Errorf("LOCAL_MODE refuses to bind %q: it is not a loopback address, and LOCAL_MODE enables open rules + hardcoded secrets + the \"owner\" admin token (do not expose it). Bind loopback (e.g. HTTPS_LISTEN_ADDR=127.0.0.1:8080), or set LOCAL_MODE_ALLOW_PUBLIC_BIND=true if this is an isolated container/dev host you trust", cfg.HTTPSListenAddr)
+		}
 	}
 
 	// CertMagic domains, resolvers, and Cloudflare token
@@ -205,6 +219,56 @@ func Load() (*Config, error) {
 	cfg.CoordinatorAddr = getEnv("COORDINATOR_ADDR", "")
 
 	return cfg, nil
+}
+
+// defaultServerSecret is the placeholder shipped in docker-compose.yml and
+// .env.example. It is published with the repo, so it must never authenticate a
+// real edge↔server channel. See security audit H-1.
+const defaultServerSecret = "dev-secret-change-me"
+
+// minServerSecretLen is the minimum SERVER_SECRET length (in bytes) accepted
+// outside LOCAL_MODE. `openssl rand -hex 32` produces 64 chars, well above this.
+const minServerSecretLen = 32
+
+// validateServerSecret refuses to boot with a missing, publicly-known, or
+// too-weak shared secret. LOCAL_MODE (loopback-only dev) is exempt — its
+// edge↔server channel isn't a trust boundary worth guarding.
+func validateServerSecret(secret string, localMode bool) error {
+	if localMode {
+		return nil
+	}
+	switch {
+	case secret == "":
+		return fmt.Errorf("SERVER_SECRET is required: generate one with `openssl rand -hex 32` (or run `make up`, which does this automatically), or set LOCAL_MODE=true for local dev")
+	case secret == defaultServerSecret:
+		return fmt.Errorf("SERVER_SECRET is set to the publicly-known default %q: generate a real one with `openssl rand -hex 32` (or run `make up`, which does this automatically)", defaultServerSecret)
+	case len(secret) < minServerSecretLen:
+		return fmt.Errorf("SERVER_SECRET must be at least %d bytes (got %d): generate one with `openssl rand -hex 32`", minServerSecretLen, len(secret))
+	}
+	return nil
+}
+
+// isLoopbackListenAddr reports whether a "host:port" listen address binds only
+// the loopback interface. It fails closed: an empty host (":8080" binds all
+// interfaces), an unparseable address, or a non-localhost hostname all return
+// false. Only an explicit loopback IP (127.0.0.0/8, ::1) or "localhost" passes.
+func isLoopbackListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// A hostname other than localhost — can't guarantee it's loopback.
+		return false
+	}
+	return ip.IsLoopback()
 }
 
 func getEnv(key, defaultVal string) string {

@@ -112,6 +112,34 @@ impl Args {
     }
 }
 
+/// The placeholder secret shipped in docker-compose.yml / .env.example. It is
+/// published with the repo, so it must never authenticate a real channel.
+const DEFAULT_SERVER_SECRET: &str = "dev-secret-change-me";
+
+/// Minimum accepted SERVER_SECRET length in bytes outside emulator mode.
+/// `openssl rand -hex 32` yields 64 chars, comfortably above this.
+const MIN_SERVER_SECRET_LEN: usize = 32;
+
+/// Reject a missing, publicly-known, or too-weak shared secret. Returns a
+/// human-actionable message on failure; emulator mode bypasses this entirely.
+fn validate_server_secret(secret: &str) -> Result<(), String> {
+    if secret.is_empty() {
+        return Err("SERVER_SECRET is required: generate one with `openssl rand -hex 32` (or run `make up`, which does this automatically), or pass --emulator for local dev".to_string());
+    }
+    if secret == DEFAULT_SERVER_SECRET {
+        return Err(format!(
+            "SERVER_SECRET is set to the publicly-known default {DEFAULT_SERVER_SECRET:?}: generate a real one with `openssl rand -hex 32` (or run `make up`, which does this automatically)"
+        ));
+    }
+    if secret.len() < MIN_SERVER_SECRET_LEN {
+        return Err(format!(
+            "SERVER_SECRET must be at least {MIN_SERVER_SECRET_LEN} bytes (got {}): generate one with `openssl rand -hex 32`",
+            secret.len()
+        ));
+    }
+    Ok(())
+}
+
 fn main() {
     // Initialize logging
     tracing_subscriber::registry()
@@ -123,6 +151,16 @@ fn main() {
 
     // Parse CLI arguments
     let args = Args::parse();
+
+    // Refuse to boot with a missing, publicly-known, or too-weak shared secret
+    // outside emulator (dev) mode. A clone-and-run deploy must not authenticate
+    // its edge↔server channel with the published compose default. See audit H-1.
+    if !args.emulator
+        && let Err(e) = validate_server_secret(&args.server_secret)
+    {
+        tracing::error!("{e}");
+        std::process::exit(1);
+    }
 
     let nr_cores = args.nr_cores.unwrap_or_else(|| {
         std::thread::available_parallelism()
@@ -471,5 +509,27 @@ async fn run_core(
     // Database metrics are emitted by each Database in its run loop
     loop {
         glommio::timer::Timer::new(Duration::from_secs(60)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_SERVER_SECRET, validate_server_secret};
+
+    #[test]
+    fn rejects_empty_default_and_short_secrets() {
+        assert!(validate_server_secret("").is_err());
+        assert!(validate_server_secret(DEFAULT_SERVER_SECRET).is_err());
+        assert!(validate_server_secret("short").is_err());
+        // 31 bytes: one below the minimum.
+        assert!(validate_server_secret(&"a".repeat(31)).is_err());
+    }
+
+    #[test]
+    fn accepts_sufficiently_long_secrets() {
+        // 32 bytes: exactly the minimum.
+        assert!(validate_server_secret(&"a".repeat(32)).is_ok());
+        // `openssl rand -hex 32` shape: 64 hex chars.
+        assert!(validate_server_secret(&"0".repeat(64)).is_ok());
     }
 }

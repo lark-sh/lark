@@ -21,6 +21,10 @@ services:
       HTTPS_LISTEN_ADDR: ":8080"
       LARKDB_DOMAIN: "localhost"
       LOCAL_MODE: "true"
+      # A container must bind all interfaces for host port-mapping (8090:8080)
+      # to work; this acknowledges that LOCAL_MODE's open surface is bound
+      # non-loopback inside this isolated, ephemeral test container. See H-2.
+      LOCAL_MODE_ALLOW_PUBLIC_BIND: "true"
       LOCAL_BACKEND_ADDR: "lark-server-test:2727"
       LOCAL_PROJECT_ID: "test-project"
       SERVER_SECRET: "test-secret"

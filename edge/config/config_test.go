@@ -24,9 +24,13 @@ func clearEnv() {
 	}
 }
 
+// testServerSecret is a ≥32-byte value so Load() passes the SERVER_SECRET
+// strength guard (audit H-1) outside LOCAL_MODE.
+const testServerSecret = "test-server-secret-0123456789abcdef"
+
 func setRequiredEnvVars() {
 	os.Setenv("DATABASE_URL", "postgres://test:test@localhost/testdb")
-	os.Setenv("SERVER_SECRET", "test-server-secret")
+	os.Setenv("SERVER_SECRET", testServerSecret)
 }
 
 func TestLoadWithRequiredVars(t *testing.T) {
@@ -42,7 +46,7 @@ func TestLoadWithRequiredVars(t *testing.T) {
 	if cfg.DatabaseURL != "postgres://test:test@localhost/testdb" {
 		t.Errorf("DatabaseURL: got %q", cfg.DatabaseURL)
 	}
-	if cfg.ServerSecret != "test-server-secret" {
+	if cfg.ServerSecret != testServerSecret {
 		t.Errorf("ServerSecret: got %q", cfg.ServerSecret)
 	}
 }
@@ -286,3 +290,58 @@ func TestBackendAddrs(t *testing.T) {
 	}
 }
 
+func TestValidateServerSecret(t *testing.T) {
+	strong := "0123456789abcdef0123456789abcdef" // 32 bytes
+
+	tests := []struct {
+		name      string
+		secret    string
+		localMode bool
+		wantErr   bool
+	}{
+		{"empty rejected", "", false, true},
+		{"known default rejected", defaultServerSecret, false, true},
+		{"too short rejected", "short", false, true},
+		{"31 bytes rejected", strong[:31], false, true},
+		{"32 bytes accepted", strong, false, false},
+		{"long random accepted", strong + strong, false, false},
+		{"empty allowed in local mode", "", true, false},
+		{"default allowed in local mode", defaultServerSecret, true, false},
+		{"short allowed in local mode", "short", true, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateServerSecret(tt.secret, tt.localMode)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateServerSecret(%q, local=%v): err=%v, wantErr=%v",
+					tt.secret, tt.localMode, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestIsLoopbackListenAddr(t *testing.T) {
+	tests := []struct {
+		addr string
+		want bool
+	}{
+		{"127.0.0.1:8080", true},
+		{"127.0.0.53:8080", true}, // 127.0.0.0/8 is all loopback
+		{"[::1]:8080", true},
+		{"localhost:8080", true},
+		{":8080", false},        // empty host = all interfaces
+		{"0.0.0.0:8080", false}, // explicit all-interfaces
+		{"[::]:8080", false},    // all interfaces, IPv6
+		{"192.168.1.10:8080", false},
+		{"db.example.com:443", false}, // non-localhost hostname
+		{"garbage", false},            // unparseable
+	}
+	for _, tt := range tests {
+		t.Run(tt.addr, func(t *testing.T) {
+			if got := isLoopbackListenAddr(tt.addr); got != tt.want {
+				t.Errorf("isLoopbackListenAddr(%q) = %v, want %v", tt.addr, got, tt.want)
+			}
+		})
+	}
+}
