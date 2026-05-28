@@ -33,8 +33,11 @@ services:
       # within the docker network.
       INTERNAL_LISTEN_ADDR: ":8081"
       # Single hostname; lark-edge routes by Host header against this.
-      # Browsers resolve *.localhost to loopback automatically.
-      LARKDB_DOMAIN: "localhost"
+      # Browsers resolve *.localhost (including multi-level like
+      # *.lark.localhost) to loopback per RFC 6761 — no /etc/hosts needed.
+      # We use a two-part TLD here to better simulate how it works in a deployment
+      # scenario (e.g. project-id.yourdomain.com)
+      LARKDB_DOMAIN: "lark.localhost"
       # SQLite is the default driver
       DATABASE_URL: "sqlite:///data/lark.db"
       # Bring up the dashboard + admin API + first-boot bootstrap.
