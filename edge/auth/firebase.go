@@ -361,7 +361,7 @@ func (v *FirebaseValidator) ValidateForProjectID(tokenString string, expectedPro
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return publicKey, nil
-	})
+	}, jwt.WithExpirationRequired())
 
 	if err != nil {
 		if errors.Is(err, jwt.ErrTokenExpired) {
@@ -477,7 +477,7 @@ func (v *FirebaseValidator) Validate(tokenString string) (*Info, error) {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return publicKey, nil
-	})
+	}, jwt.WithExpirationRequired())
 
 	if err != nil {
 		if errors.Is(err, jwt.ErrTokenExpired) {
@@ -613,7 +613,7 @@ func (v *FirebaseValidator) ValidateCustomToken(tokenString string, firebaseProj
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return publicKey, nil
-	})
+	}, jwt.WithExpirationRequired())
 
 	if err != nil {
 		if errors.Is(err, jwt.ErrTokenExpired) {
