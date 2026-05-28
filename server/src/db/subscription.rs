@@ -369,11 +369,6 @@ impl SharedView {
         self.subscribers.is_empty()
     }
 
-    /// Get the number of subscribers.
-    pub fn subscriber_count(&self) -> usize {
-        self.subscribers.len()
-    }
-
     /// Check if this view has query constraints.
     pub fn has_query(&self) -> bool {
         self.query.has_constraints()
@@ -916,25 +911,6 @@ impl ViewManager {
         query_id: &str,
     ) -> Option<&mut SharedView> {
         self.get_shared_view_mut(path, query_id)
-    }
-
-    /// Get all views for a client (returns shared view references).
-    pub fn get_client_views(&self, client_id: &str) -> Vec<ViewRef<'_>> {
-        let Some(view_keys) = self.by_client.get(client_id) else {
-            return Vec::new();
-        };
-
-        view_keys
-            .iter()
-            .filter_map(|key| {
-                let shared_view = self.shared_views.get(key)?;
-                let subscriber = shared_view.subscribers.get(client_id)?;
-                Some(ViewRef {
-                    shared_view,
-                    subscriber,
-                })
-            })
-            .collect()
     }
 
     /// Find all shared views affected by a change at the given path.

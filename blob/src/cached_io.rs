@@ -101,19 +101,9 @@ impl<IO: BlobIO> CachedIO<IO> {
         }
     }
 
-    /// Unwrap, returning the underlying IO.
-    pub fn into_inner(self) -> IO {
-        self.inner
-    }
-
     /// Borrow the underlying IO.
     pub fn inner(&self) -> &IO {
         &self.inner
-    }
-
-    /// Mutably borrow the underlying IO.
-    pub fn inner_mut(&mut self) -> &mut IO {
-        &mut self.inner
     }
 
     /// Number of cached regions (for testing).

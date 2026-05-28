@@ -150,21 +150,6 @@ impl Dictionary {
         self.max_field_count
     }
 
-    /// Serialize the 20-byte dictionary header.
-    ///
-    /// Used by `ensure_fields_in_dict` to atomically commit new field additions
-    /// by writing the header (with updated `field_count` and `name_data_used`)
-    /// as a single pwrite after all field data patches have been written.
-    pub fn serialize_header(&self) -> [u8; 20] {
-        let mut buf = [0u8; 20];
-        buf[0..4].copy_from_slice(&(self.field_names.len() as u32).to_le_bytes());
-        buf[4..8].copy_from_slice(&(self.sorted_count as u32).to_le_bytes());
-        buf[8..12].copy_from_slice(&self.max_field_count.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.name_data_used.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.max_name_data.to_le_bytes());
-        buf
-    }
-
     /// Serialize the dictionary to bytes with reserved space for growth.
     ///
     /// Format:
@@ -337,65 +322,6 @@ impl Dictionary {
         + (mfc * 4)              // field_name_lengths
         + self.max_name_data as usize // name_data
     }
-
-    /// Append a new field name to the dictionary (for incremental compaction).
-    ///
-    /// The new entry is appended unsorted after the sorted region.
-    /// Returns (new_field_id, patches) where patches are (offset_within_dict, bytes)
-    /// pairs for pwriting the on-disk dictionary.
-    ///
-    /// Returns Err(DictionaryFull) if no capacity remains.
-    #[allow(clippy::type_complexity)] // (field_id, Vec<(offset, bytes)>) patch list
-    pub fn append_field(&mut self, name: &str) -> Result<(u32, Vec<(usize, Vec<u8>)>)> {
-        let field_count = self.field_names.len() as u32;
-        if field_count >= self.max_field_count {
-            return Err(BlobError::DictionaryFull);
-        }
-        let name_bytes = name.as_bytes();
-        if self.name_data_used as usize + name_bytes.len() > self.max_name_data as usize {
-            return Err(BlobError::DictionaryFull);
-        }
-
-        let new_field_id = field_count;
-        let hash = hash_field_name(name);
-
-        // Update in-memory state
-        self.sorted_hashes.push(hash);
-        self.sorted_to_field_id.push(new_field_id);
-        self.field_names.push(name.to_string());
-        self.name_to_id.insert(name.to_string(), new_field_id);
-
-        let new_field_count = field_count + 1;
-        let mfc = self.max_field_count as usize;
-
-        // Compute pwrite patches (offsets within the serialized dictionary)
-        let mut patches = Vec::new();
-
-        // 1. Update field_count at offset 0
-        patches.push((0, new_field_count.to_le_bytes().to_vec()));
-
-        // 2. Write hash at sorted_hashes[field_count]
-        let hash_offset = 20 + field_count as usize * 8;
-        patches.push((hash_offset, hash.to_le_bytes().to_vec()));
-
-        // 3. Write field_id at sorted_to_field_id[field_count]
-        let fid_offset = 20 + mfc * 8 + field_count as usize * 4;
-        patches.push((fid_offset, new_field_id.to_le_bytes().to_vec()));
-
-        // 4. Write name_length at field_name_lengths[field_count]
-        let len_offset = 20 + mfc * 8 + mfc * 4 + field_count as usize * 4;
-        patches.push((len_offset, (name_bytes.len() as u32).to_le_bytes().to_vec()));
-
-        // 5. Write name bytes at name_data[name_data_used]
-        let name_offset = 20 + mfc * 8 + mfc * 4 + mfc * 4 + self.name_data_used as usize;
-        patches.push((name_offset, name_bytes.to_vec()));
-
-        // 6. Update name_data_used
-        self.name_data_used += name_bytes.len() as u32;
-        patches.push((12, self.name_data_used.to_le_bytes().to_vec()));
-
-        Ok((new_field_id, patches))
-    }
 }
 
 /// Hash a field name using xxhash64 (consistent with Lark).
@@ -412,13 +338,6 @@ pub fn is_collection_key(key: &str) -> bool {
         && key[1..]
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
-/// Returns true if all keys in an object are in the dictionary.
-/// If any key is missing from the dictionary, the object should be written
-/// as a collection (TYPE_COLLECTION) with inline keys.
-pub fn all_keys_in_dict(keys: impl Iterator<Item = impl AsRef<str>>, dict: &Dictionary) -> bool {
-    keys.into_iter().all(|k| dict.lookup(k.as_ref()).is_some())
 }
 
 /// Collect all unique *structural* field names from an ArcValue tree.

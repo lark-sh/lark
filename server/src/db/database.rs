@@ -1132,11 +1132,6 @@ impl Database {
         self.template_mode = template_mode;
     }
 
-    /// Check if this database is in template mode.
-    pub fn is_template_mode(&self) -> bool {
-        self.template_mode
-    }
-
     /// Returns true if this database is backed by blob storage.
     pub fn is_blob_backed(&self) -> bool {
         self.blob_session.is_some()

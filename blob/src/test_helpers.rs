@@ -5,27 +5,6 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Load a JSON file from disk and convert it to an ArcValue.
-pub fn load_json_as_arcvalue(path: &std::path::Path) -> ArcValue {
-    let data = std::fs::read_to_string(path).expect("failed to read seed file");
-    let value: serde_json::Value = serde_json::from_str(&data).expect("failed to parse JSON");
-    ArcValue::from_value(value)
-}
-
-/// Wrap seed data as N games under a root: `{ "games": { "game_0": seed, "game_1": seed, ... } }`.
-///
-/// Since ArcValue uses `Arc`, cloning the seed data N times is cheap — all copies share the
-/// underlying data. The blob writer will serialize each copy independently.
-pub fn replicate_as_games(seed: &ArcValue, num_games: usize) -> ArcValue {
-    let mut games = HashMap::new();
-    for i in 0..num_games {
-        games.insert(format!("game_{}", i), seed.clone());
-    }
-    let mut root = HashMap::new();
-    root.insert("games".to_string(), ArcValue::Object(Arc::new(games)));
-    ArcValue::Object(Arc::new(root))
-}
-
 /// Generate an example game database tree with the given number of games.
 /// Each game has characters, pages, chat messages, and config.
 ///
@@ -153,34 +132,4 @@ pub fn generate_game_database(
     let mut root = HashMap::new();
     root.insert("games".to_string(), ArcValue::Object(Arc::new(games)));
     ArcValue::Object(Arc::new(root))
-}
-
-/// Generate all paths to leaf values within a tree, up to max_depth.
-pub fn collect_leaf_paths(
-    value: &ArcValue,
-    prefix: &[String],
-    max_depth: usize,
-) -> Vec<Vec<String>> {
-    if prefix.len() >= max_depth {
-        return vec![prefix.to_vec()];
-    }
-
-    match value {
-        ArcValue::Object(map) => {
-            let mut paths = Vec::new();
-            for (key, child) in map.iter() {
-                let mut new_prefix = prefix.to_vec();
-                new_prefix.push(key.clone());
-                if child.is_primitive() {
-                    paths.push(new_prefix);
-                } else {
-                    paths.extend(collect_leaf_paths(child, &new_prefix, max_depth));
-                }
-            }
-            paths
-        }
-        _ => {
-            vec![prefix.to_vec()]
-        }
-    }
 }

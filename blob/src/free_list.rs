@@ -227,11 +227,6 @@ impl FreeList {
     pub fn available_region_count(&self) -> usize {
         self.by_offset.len()
     }
-
-    /// Total number of tracked regions across all epochs.
-    pub fn total_region_count(&self) -> usize {
-        self.by_offset.len() + self.previous.len() + self.current.len()
-    }
 }
 
 #[cfg(test)]

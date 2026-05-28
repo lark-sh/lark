@@ -238,11 +238,6 @@ impl VirtualClient {
         let _ = self.outbox.try_send(msg);
     }
 
-    /// Check if this client is closed.
-    pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Relaxed)
-    }
-
     /// Check if this is a Firebase client.
     pub fn is_firebase(&self) -> bool {
         self.firebase_adapter.is_some()
@@ -1286,47 +1281,6 @@ impl<H: ProxyHandler + 'static> ProxyConnection<H> {
             msg_type: server_msg::DATABASE_LOADED,
             flags: 0,
             data: loaded.encode().to_vec().into(),
-        };
-        let _ = self.outbox_tx.try_send(msg);
-    }
-
-    /// Notify that a database was unloaded
-    pub fn notify_database_unloaded(
-        &self,
-        project_id: &str,
-        database_id: &str,
-        reason: u8,
-        ephemeral: bool,
-    ) {
-        let unloaded = DatabaseUnloadedMessage {
-            project_id: project_id.to_string(),
-            database_id: database_id.to_string(),
-            reason,
-            ephemeral,
-        };
-
-        let msg = OutgoingMessage {
-            client_id: 0,
-            msg_type: server_msg::DATABASE_UNLOADED,
-            flags: 0,
-            data: unloaded.encode().to_vec().into(),
-        };
-        let _ = self.outbox_tx.try_send(msg);
-    }
-
-    /// Send a heartbeat
-    pub fn send_heartbeat(&self, load: u16, client_count: u32, memory_mb: u32) {
-        let heartbeat = HeartbeatMessage {
-            load,
-            client_count,
-            memory_mb,
-        };
-
-        let msg = OutgoingMessage {
-            client_id: 0,
-            msg_type: server_msg::HEARTBEAT,
-            flags: 0,
-            data: heartbeat.encode().to_vec().into(),
         };
         let _ = self.outbox_tx.try_send(msg);
     }

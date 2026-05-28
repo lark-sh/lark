@@ -268,14 +268,6 @@ impl ArcValue {
         }
     }
 
-    pub fn get_path_owned(&self, path: &[String]) -> Option<&ArcValue> {
-        let mut current = self;
-        for segment in path {
-            current = current.get(segment)?;
-        }
-        Some(current)
-    }
-
     pub fn set_path(&self, path: &[&str], value: ArcValue) -> ArcValue {
         if path.is_empty() {
             return value;
@@ -316,11 +308,6 @@ impl ArcValue {
                 ArcValue::Object(Arc::new(new_map))
             }
         }
-    }
-
-    pub fn set_path_owned(&self, path: &[String], value: ArcValue) -> ArcValue {
-        let refs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-        self.set_path(&refs, value)
     }
 
     pub fn set_path_mut(&mut self, path: &[&str], value: ArcValue) {
@@ -622,14 +609,6 @@ impl ArcValue {
                 size
             }
         }
-    }
-
-    pub fn get_nested_primitive(&self, path: &str) -> Option<Value> {
-        let mut current = self;
-        for segment in path.split('/').filter(|s| !s.is_empty()) {
-            current = current.get(segment)?;
-        }
-        Some(current.to_value())
     }
 }
 

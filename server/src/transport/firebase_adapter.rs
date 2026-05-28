@@ -218,16 +218,6 @@ pub struct FirebaseOnDisconnectBody {
 // Firebase Adapter
 // =============================================================================
 
-/// Project configuration for Firebase compatibility.
-#[derive(Debug, Clone, Default)]
-pub struct FirebaseConfig {
-    /// Database name in simple mode. Typically "default".
-    pub default_database: String,
-
-    /// Firebase project ID for RS256 token validation (optional).
-    pub firebase_project_id: Option<String>,
-}
-
 /// Firebase protocol adapter for translating between Firebase and Lark wire protocols.
 ///
 /// In proxy mode:
@@ -363,21 +353,6 @@ impl FirebaseAdapter {
     /// Called immediately for proxy connections.
     pub fn set_joined(&mut self) {
         self.joined = true;
-    }
-
-    /// Check if we've joined a Lark database.
-    pub fn is_joined(&self) -> bool {
-        self.joined
-    }
-
-    /// Set the join request ID (for swallowing JoinAck).
-    pub fn set_join_request_id(&mut self, id: &str) {
-        self.join_request_id = Some(id.to_string());
-    }
-
-    /// Set the auto-auth request ID (for swallowing AuthAck).
-    pub fn set_auto_auth_request_id(&mut self, id: &str) {
-        self.auto_auth_request_id = Some(id.to_string());
     }
 
     // =========================================================================

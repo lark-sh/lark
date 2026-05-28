@@ -165,11 +165,6 @@ impl Value {
         Value::Object(Arc::new(o))
     }
 
-    /// Create an object value from an existing Arc (O(1) clone).
-    pub fn object_arc(o: Arc<HashMap<String, JsonValue>>) -> Self {
-        Value::Object(o)
-    }
-
     /// Create an array value.
     pub fn array(a: Vec<JsonValue>) -> Self {
         Value::Array(a)
@@ -193,14 +188,6 @@ impl Value {
                 Value::Object(Arc::new(map))
             }
             JsonValue::Array(a) => Value::Array(a.clone()),
-        }
-    }
-
-    /// Create from any Go-style value.
-    pub fn from_any(v: Option<&JsonValue>) -> Self {
-        match v {
-            Some(val) => Self::from_json(val),
-            None => Value::Null,
         }
     }
 
@@ -293,14 +280,6 @@ impl Value {
         match self {
             Value::String(s) => s,
             _ => "",
-        }
-    }
-
-    /// Get as number if this is a number.
-    pub fn as_number(&self) -> f64 {
-        match self {
-            Value::Number(n) => *n,
-            _ => 0.0,
         }
     }
 

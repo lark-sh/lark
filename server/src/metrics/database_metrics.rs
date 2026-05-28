@@ -251,12 +251,6 @@ impl DatabaseMetrics {
     pub fn get_ccu(&self) -> u32 {
         self.current_ccu.load(Ordering::Relaxed)
     }
-
-    /// Get current subscription count without resetting.
-    #[inline]
-    pub fn get_subscriptions(&self) -> u32 {
-        self.current_subscriptions.load(Ordering::Relaxed)
-    }
 }
 
 /// Snapshot of database metrics at a point in time.

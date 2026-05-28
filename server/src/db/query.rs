@@ -113,19 +113,6 @@ impl Query {
         self.limit.is_some()
     }
 
-    /// Get the limit value, if any.
-    pub fn limit_value(&self) -> Option<usize> {
-        match self.limit {
-            Some(Limit::First(n)) | Some(Limit::Last(n)) => Some(n),
-            None => None,
-        }
-    }
-
-    /// Check if this query has range constraints.
-    pub fn has_range(&self) -> bool {
-        self.range.has_constraints()
-    }
-
     /// Generate a unique identifier for this query.
     /// Used to distinguish multiple views on the same path with different queries.
     pub fn identifier(&self) -> String {
