@@ -34,6 +34,18 @@ pub const FIREBASE_MAX_FRAME_SIZE: usize = 16384; // 16KB, matches Firebase SDK
 /// Prevents OOM from malicious frame count like 999999999.
 pub const MAX_FRAMES: usize = 1024;
 
+/// Maximum total bytes allowed across all frames of a single reassembled
+/// message: 16KB × 1024 = 16MB.
+///
+/// The operative bound is the per-frame cap in `handle_incoming_frame`: with
+/// every inbound frame held to FIREBASE_MAX_FRAME_SIZE and the frame *count*
+/// held to MAX_FRAMES, total reassembly is already bounded to 16MB. This
+/// cumulative check is defense-in-depth — it keeps the 16MB ceiling intact if
+/// MAX_FRAMES is ever raised or the per-frame check is weakened, decoupling the
+/// memory bound from the frame count. Without any byte cap, inbound frame size
+/// is otherwise limited only by the proxy's 257MB MAX_MESSAGE_SIZE.
+pub const MAX_REASSEMBLED_SIZE: usize = MAX_FRAMES * FIREBASE_MAX_FRAME_SIZE;
+
 // =============================================================================
 // Firebase Wire Protocol Types
 // =============================================================================
@@ -359,6 +371,15 @@ impl FirebaseAdapter {
     // Incoming Message Handling
     // =========================================================================
 
+    /// Clear all multi-frame reassembly state, returning the adapter to
+    /// single-frame mode. Called after a message is fully reassembled and
+    /// whenever a partial message is dropped (size violation).
+    fn reset_frame_state(&mut self) {
+        self.frame_count = 0;
+        self.frames.clear();
+        self.frame_bytes_received = 0;
+    }
+
     /// Process a single WebSocket frame from a Firebase client.
     ///
     /// Firebase SDK splits messages >16KB into multiple frames with a frame count prefix.
@@ -370,6 +391,21 @@ impl FirebaseAdapter {
         &mut self,
         frame: &[u8],
     ) -> Result<(Option<ClientMessage>, Option<Vec<u8>>), String> {
+        // While reassembling a multi-frame message, enforce the per-frame size
+        // cap before allocating anything. A legitimate Firebase data frame is
+        // never larger than FIREBASE_MAX_FRAME_SIZE (the SDK splits on exactly
+        // that boundary), so an oversized inbound frame is either malformed or
+        // an amplification attempt — reject it and drop the partial message
+        // rather than copy it into `self.frames`.
+        if self.frame_count > 0 && frame.len() > FIREBASE_MAX_FRAME_SIZE {
+            self.reset_frame_state();
+            return Err(format!(
+                "inbound frame size {} exceeds maximum allowed ({})",
+                frame.len(),
+                FIREBASE_MAX_FRAME_SIZE
+            ));
+        }
+
         let frame_str = String::from_utf8_lossy(frame);
 
         // Handle keepalive specially - "0" sent as keepalive ping
@@ -381,8 +417,21 @@ impl FirebaseAdapter {
 
         // If we're in multi-frame mode, accumulate this frame
         if self.frame_count > 0 {
-            self.frames.push(frame_str.to_string());
             self.frame_bytes_received += frame.len();
+
+            // Defense-in-depth cumulative ceiling. The per-frame cap above plus
+            // the MAX_FRAMES count cap already bound this to 16MB under current
+            // constants, so this won't trip today — but it keeps the 16MB bound
+            // independent of MAX_FRAMES if that is ever raised.
+            if self.frame_bytes_received > MAX_REASSEMBLED_SIZE {
+                self.reset_frame_state();
+                return Err(format!(
+                    "reassembled message size {} exceeds maximum allowed ({})",
+                    self.frame_bytes_received, MAX_REASSEMBLED_SIZE
+                ));
+            }
+
+            self.frames.push(frame_str.to_string());
 
             // Check if we have all frames
             if self.frames.len() >= self.frame_count {
@@ -390,9 +439,7 @@ impl FirebaseAdapter {
                 let complete_data = self.frames.join("");
 
                 // Reset frame state
-                self.frame_count = 0;
-                self.frames.clear();
-                self.frame_bytes_received = 0;
+                self.reset_frame_state();
 
                 // Now translate the complete message
                 return self.translate_incoming(complete_data.as_bytes());
@@ -1459,6 +1506,78 @@ mod tests {
         let result = adapter.handle_incoming_frame(huge_count.as_bytes());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("exceeds maximum allowed"));
+    }
+
+    #[test]
+    fn test_oversized_inbound_frame_rejected() {
+        let mut adapter = FirebaseAdapter::new("proj", "host");
+
+        // Enter multi-frame mode expecting 2 frames.
+        adapter.handle_incoming_frame(b"2").unwrap();
+
+        // A single inbound data frame larger than FIREBASE_MAX_FRAME_SIZE must
+        // be rejected before it is copied into the accumulator — the SDK never
+        // produces a data frame this large.
+        let oversized = vec![b'x'; FIREBASE_MAX_FRAME_SIZE + 1];
+        let err = adapter.handle_incoming_frame(&oversized).unwrap_err();
+        assert!(err.contains("inbound frame size"));
+
+        // Frame state must be reset so the adapter isn't stuck mid-message.
+        assert_eq!(adapter.frame_count, 0);
+        assert!(adapter.frames.is_empty());
+        assert_eq!(adapter.frame_bytes_received, 0);
+    }
+
+    #[test]
+    fn test_max_reassembled_size_admits_full_legit_message() {
+        // The per-frame cap is the operative memory bound; the cumulative cap
+        // must be set so it never rejects a legitimate maximum-size message
+        // (MAX_FRAMES frames of exactly FIREBASE_MAX_FRAME_SIZE). Guards against
+        // an off-by-one that would make the ceiling too low.
+        assert_eq!(MAX_REASSEMBLED_SIZE, MAX_FRAMES * FIREBASE_MAX_FRAME_SIZE);
+
+        let mut adapter = FirebaseAdapter::new("proj", "host");
+        adapter
+            .handle_incoming_frame(MAX_FRAMES.to_string().as_bytes())
+            .unwrap();
+
+        // Feeding MAX_FRAMES full-size frames must never trip the byte ceiling
+        // (it sums to exactly MAX_REASSEMBLED_SIZE). Stop one short of the
+        // count so we don't trigger reassembly/translation of junk bytes.
+        let full_frame = vec![b'x'; FIREBASE_MAX_FRAME_SIZE];
+        for _ in 0..(MAX_FRAMES - 1) {
+            let (msg, _) = adapter
+                .handle_incoming_frame(&full_frame)
+                .expect("in-spec frame must not be rejected");
+            assert!(msg.is_none());
+        }
+        assert_eq!(
+            adapter.frame_bytes_received,
+            (MAX_FRAMES - 1) * FIREBASE_MAX_FRAME_SIZE
+        );
+    }
+
+    #[test]
+    fn test_reassembly_still_works_after_rejection() {
+        let mut adapter = FirebaseAdapter::new("proj", "host");
+
+        // Trip the per-frame cap.
+        adapter.handle_incoming_frame(b"2").unwrap();
+        let oversized = vec![b'x'; FIREBASE_MAX_FRAME_SIZE + 1];
+        assert!(adapter.handle_incoming_frame(&oversized).is_err());
+
+        // A normal multi-frame message must still reassemble cleanly afterward.
+        adapter.handle_incoming_frame(b"3").unwrap();
+        adapter.handle_incoming_frame(b"{\"t\":\"d\",").unwrap();
+        adapter
+            .handle_incoming_frame(b"\"d\":{\"r\":1,\"a\":\"p\",")
+            .unwrap();
+        let (msg, _) = adapter
+            .handle_incoming_frame(b"\"b\":{\"p\":\"/test\",\"d\":1}}}")
+            .unwrap();
+        let msg = msg.unwrap();
+        assert_eq!(msg.op, "s");
+        assert_eq!(msg.path, Some("/test".to_string()));
     }
 
     #[test]
