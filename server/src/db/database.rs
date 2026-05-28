@@ -833,9 +833,6 @@ pub struct Database {
     /// Maintained by: set_lazy (add ancestors), eviction (add), promotion (remove).
     sentinel_paths: BTreeSet<String>,
 
-    /// Project secret for token validation (optional - if None, uses emulator mode)
-    project_secret: Option<String>,
-
     /// Write deduplication - tracks connection_id -> set of request_ids (in insertion order)
     /// Used to prevent duplicate writes on reconnect retry
     /// Keeps last MAX_WRITES_PER_CONNECTION entries per connection
@@ -1045,7 +1042,6 @@ impl Database {
             blob_sequence: 0,
             promoted_paths: HashMap::new(),
             sentinel_paths: BTreeSet::new(),
-            project_secret: None,
             processed_writes: HashMap::new(),
             nacked_writes: HashMap::new(),
             template_mode: false,
@@ -1100,7 +1096,6 @@ impl Database {
             blob_sequence: 0,
             promoted_paths: HashMap::new(),
             sentinel_paths: BTreeSet::new(),
-            project_secret: None,
             processed_writes: HashMap::new(),
             nacked_writes: HashMap::new(),
             template_mode: false,
@@ -1130,11 +1125,6 @@ impl Database {
     /// is enabled; otherwise metrics are stdout-only.
     pub fn set_metrics_tx(&mut self, tx: std::sync::mpsc::SyncSender<String>) {
         self.metrics_tx = Some(tx);
-    }
-
-    /// Set the project secret for token validation.
-    pub fn set_project_secret(&mut self, secret: &str) {
-        self.project_secret = Some(secret.to_string());
     }
 
     /// Set template mode - databases in template mode skip compaction/segmentation queues.
@@ -3060,8 +3050,6 @@ impl Database {
     ) {
         let response = match msg.op.as_str() {
             op::JOIN => self.handle_join(client_id, &msg),
-            op::AUTH => self.handle_auth(client_id, &msg),
-            op::UNAUTH => self.handle_unauth(client_id, &msg),
             op::SET => self.handle_set(client_id, &msg, volatile).await,
             op::UPDATE => self.handle_update(client_id, &msg, volatile).await,
             op::REMOVE => self.handle_remove(client_id, &msg, volatile).await,
@@ -3109,75 +3097,6 @@ impl Database {
             request_id,
             self.volatile_paths.clone(),
             &connection_id,
-        ))
-    }
-
-    /// Handle AUTH message - validates token and sets auth state for the client.
-    ///
-    /// In production, token validation is done by the server/proxy layer which has
-    /// access to project secrets. Here we validate HS256 tokens using the project secret
-    /// if available, or accept the token in emulator mode.
-    fn handle_auth(&mut self, client_id: &str, msg: &ClientMessage) -> Option<ServerMessage> {
-        let request_id = msg.request_id.as_deref().unwrap_or("");
-
-        let client = match self.clients.get_mut(client_id) {
-            Some(c) => c,
-            None => {
-                return Some(ServerMessage::nack(
-                    request_id,
-                    error::NOT_FOUND,
-                    "client not found",
-                ));
-            }
-        };
-
-        // Empty token = anonymous auth
-        let token = msg.token.as_deref().unwrap_or("");
-        if token.is_empty() {
-            client.auth_complete = true;
-            client.auth = None;
-            client.rules_auth = None;
-            return Some(ServerMessage::auth_ack(request_id, ""));
-        }
-
-        // Validate the token using our auth module
-        match validate_auth_token(token, self.project_secret.as_deref()) {
-            Ok(auth_info) => {
-                let uid = auth_info.uid.clone();
-                let auth = AuthInfo {
-                    uid: auth_info.uid,
-                    provider: auth_info.provider,
-                    token: auth_info.token,
-                    is_admin: auth_info.is_true_admin,
-                };
-                client.rules_auth = Some(Self::convert_auth_to_rules(&auth));
-                client.auth = Some(auth);
-                client.auth_complete = true;
-                Some(ServerMessage::auth_ack(request_id, &uid))
-            }
-            Err(e) => Some(ServerMessage::nack(
-                request_id,
-                error::PERMISSION_DENIED,
-                &format!("invalid token: {}", e),
-            )),
-        }
-    }
-
-    /// Handle UNAUTH message - clears auth state for the client.
-    fn handle_unauth(&mut self, client_id: &str, msg: &ClientMessage) -> Option<ServerMessage> {
-        let request_id = msg.request_id.as_deref().unwrap_or("");
-
-        if let Some(client) = self.clients.get_mut(client_id) {
-            client.auth = None;
-            client.rules_auth = None;
-            // Keep auth_complete true - just cleared the auth
-            return Some(ServerMessage::ack(request_id));
-        }
-
-        Some(ServerMessage::nack(
-            request_id,
-            error::NOT_FOUND,
-            "client not found",
         ))
     }
 
@@ -5711,29 +5630,6 @@ fn validate_value_keys(value: &Value) -> Result<(), crate::db::KeyError> {
         _ => {}
     }
     Ok(())
-}
-
-/// Validate an authentication token and extract auth info.
-///
-/// Uses the actual JWT validation from our auth module.
-/// If no secret is provided (emulator mode), accepts valid-format tokens.
-fn validate_auth_token(
-    token: &str,
-    project_secret: Option<&str>,
-) -> Result<crate::auth::jwt::AuthInfo, String> {
-    use crate::auth::jwt::{peek_token_header, validate_lark_customer_token};
-
-    // Check if it's a valid JWT format
-    let (alg, _kid) = peek_token_header(token).map_err(|e| format!("{:?}", e))?;
-
-    match alg.as_str() {
-        "HS256" => {
-            // HS256 tokens need validation with the secret
-            let secret = project_secret.ok_or_else(|| "no project secret available".to_string())?;
-            validate_lark_customer_token(token, secret.as_bytes()).map_err(|e| format!("{:?}", e))
-        }
-        _ => Err(format!("unsupported algorithm: {}", alg)),
-    }
 }
 
 /// Compute a hash of a JSON value for transaction conditions.

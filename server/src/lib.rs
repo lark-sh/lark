@@ -16,12 +16,14 @@
 //! - [`transport`]: Network layer (proxy protocol, Firebase adapter)
 //! - [`rules`]: Security rules engine (expression evaluator)
 //! - [`storage`]: Persistence layer (WAL, blob storage, in-process compaction)
-//! - [`auth`]: JWT validation and token handling
 //! - [`protocol`]: Client/server message types
+//!
+//! Note: token validation lives entirely in the Go edge. The Rust server trusts
+//! the edge's resolved auth (delivered out-of-band via AUTH_CHANGED) and never
+//! validates JWTs itself.
 //!
 //! See the `docs/` directory at the repo root for deeper architecture writeups.
 
-pub mod auth;
 pub mod db;
 pub mod executor;
 pub mod metrics;
