@@ -143,6 +143,6 @@ because of how the blob is written:
 
 The `.compacting` marker turns "slightly stale but valid" into "exactly
 consistent" by ensuring `blob.lark`/`sidecar.lark`/`sequence` don't move at all
-during the copy. See the [Storage section of the README](../README.md#storage)
+during the copy. See the [Storage section of CONTRIBUTING](../CONTRIBUTING.md#storage)
 for the full on-disk design and [WRITE_LIFECYCLE.md](WRITE_LIFECYCLE.md) for how
 writes flow from client to disk.

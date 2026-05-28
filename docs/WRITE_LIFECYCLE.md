@@ -16,7 +16,7 @@ Lark databases come in two flavors, and the write lifecycle is largely the same 
 | WAL append | Skipped | Every write |
 | Use case | Volatile playspaces, throwaway test DBs | Long-lived game/app data |
 
-**Key concept for blob-backed DBs: Sentinels.** A `Sentinel` ArcValue represents "data exists at or below this point in the tree, but it hasn't been loaded from the blob yet." Sentinels make writes free of blob I/O — `set_lazy` walks down the path through Sentinel intermediates and just inserts the leaf — and reads opt-in to loading via `promote_path*`. See the "Storage" and "Data model" sections in the root [README](../README.md) for the lazy tree design.
+**Key concept for blob-backed DBs: Sentinels.** A `Sentinel` ArcValue represents "data exists at or below this point in the tree, but it hasn't been loaded from the blob yet." Sentinels make writes free of blob I/O — `set_lazy` walks down the path through Sentinel intermediates and just inserts the leaf — and reads opt-in to loading via `promote_path*`. See the "Storage" and "Data model" sections in the root [CONTRIBUTING](../CONTRIBUTING.md) for the lazy tree design.
 
 ## Overview
 
