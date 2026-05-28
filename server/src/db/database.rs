@@ -51,7 +51,7 @@ use crate::db::query::{QueryError, QueryParams};
 use crate::db::subscription::{MutationEvent, SubscribeError, ViewManager};
 use crate::db::value::ArcValueSortExt;
 use crate::db::{ArcValue, Path, Tree};
-use crate::protocol::{ClientMessage, ServerMessage, error, op};
+use crate::protocol::{ClientMessage, MAX_VOLATILE_WRITE_SIZE, ServerMessage, error, op};
 use crate::rules::{
     AuthInfo as RulesAuthInfo, Evaluator, NewData, RuleSet, RulesContext, TreeGetter,
 };
@@ -3925,6 +3925,16 @@ impl Database {
         // Determine if this path is volatile based on RULES (don't trust client flag)
         let is_volatile = self.is_volatile_path(path_str);
 
+        // Cap volatile writes at MAX_VOLATILE_WRITE_SIZE. The threat is fan-out
+        // amplification: volatile writes skip WAL but broadcast to every subscriber,
+        // and they're exempt from the per-DB byte rate limiter (no durable cost) —
+        // so without this, one client could blast 16MB (SDK) or 256MB (REST) of
+        // payload at N subscribers per write. Volatile writes don't get NACKs;
+        // silently drop, matching how this path swallows other errors above.
+        if is_volatile && estimate_value_bytes(&value) > MAX_VOLATILE_WRITE_SIZE {
+            return None;
+        }
+
         // Check if this is a volatile path - use ViewManager batching, skip persistence
         if is_volatile {
             // Fast path: buffer in ViewManager for batch sending
@@ -4037,6 +4047,17 @@ impl Database {
                 error::UNAVAILABLE,
                 "Storage unavailable (WAL I/O failure)",
             ));
+        }
+
+        // Cap volatile writes at MAX_VOLATILE_WRITE_SIZE — same fan-out
+        // amplification threat as handle_set. UPDATE's wire-flag gate matches
+        // its WAL-skip decision (handle_set uses is_volatile_path; that
+        // divergence is tracked separately). Silently drop, no NACK.
+        if volatile
+            && let Some(ref v) = msg.value
+            && estimate_value_bytes(v) > MAX_VOLATILE_WRITE_SIZE
+        {
+            return None;
         }
 
         // Reject this write at the size cap, including volatile writes (not

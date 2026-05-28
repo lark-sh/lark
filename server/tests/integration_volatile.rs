@@ -301,3 +301,75 @@ fn test_regular_write_size_limit() {
         assert_eq!(value, json!("small value"));
     });
 }
+
+#[test]
+fn test_volatile_write_over_size_cap_is_dropped() {
+    // Volatile writes are exempt from WAL and the per-DB byte rate limiter, so
+    // without a per-write cap a client can fan out 16MB (SDK) / 256MB (REST) of
+    // payload at every subscriber per write. MAX_VOLATILE_WRITE_SIZE (2 KB) caps
+    // that. Drops are silent — volatile writes never NACK.
+    run_test(|| async {
+        let server = TestServer::new();
+
+        server
+            .set_rules(
+                "volatile-cap-db",
+                json!({
+                    "rules": {
+                        "players": {
+                            "$uid": {
+                                "position": {
+                                    ".read": true,
+                                    ".write": true,
+                                    ".volatile": true
+                                }
+                            }
+                        },
+                        ".read": true,
+                        ".write": true
+                    }
+                }),
+            )
+            .expect("Failed to set rules");
+
+        let mut writer = server.client();
+        let mut subscriber = server.client();
+        writer.connect("volatile-cap-db").await;
+        subscriber.connect("volatile-cap-db").await;
+
+        subscriber
+            .subscribe("/players/p1/position", &["value"])
+            .await
+            .expect("Failed to subscribe");
+
+        // Drain the initial null event from the subscribe.
+        let _ = subscriber.wait_for_event(Duration::from_secs(1)).await;
+        subscriber.clear_events().await;
+
+        // Oversized volatile write (>2 KB) — should be silently dropped.
+        let big = "x".repeat(3 * 1024);
+        writer
+            .set_volatile("/players/p1/position", json!({ "payload": big }))
+            .await
+            .expect("set_volatile returns immediately; backend drops silently");
+
+        // Wait long enough for both fast (50ms) and slow (333ms) volatile flushes.
+        glommio::timer::sleep(Duration::from_millis(450)).await;
+        assert!(
+            subscriber.events().await.is_empty(),
+            "oversized volatile write must not reach subscribers"
+        );
+
+        // And the cap is per-write, not a poison pill: a follow-up small volatile
+        // write still flows through.
+        writer
+            .set_volatile("/players/p1/position", json!({"x": 10, "y": 20}))
+            .await
+            .expect("Small volatile write should succeed");
+        glommio::timer::sleep(Duration::from_millis(450)).await;
+        assert!(
+            !subscriber.events().await.is_empty(),
+            "small volatile write after a dropped one must still fan out"
+        );
+    });
+}
