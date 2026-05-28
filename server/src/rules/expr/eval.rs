@@ -472,6 +472,26 @@ mod tests {
     }
 
     #[test]
+    fn test_eval_string_length_utf16_semantics() {
+        // Rules see JS string `.length` = UTF-16 code units.
+        // Bytes or codepoints would let multibyte input bypass min-length checks
+        // (e.g., a `length >= 8` validator satisfied by 4 emoji = 8 bytes).
+        let cases = [
+            ("'é'.length", 1.0),        // one BMP code unit (UTF-8: 2 bytes)
+            ("'🔥'.length", 2.0),       // surrogate pair (UTF-8: 4 bytes)
+            ("'🔥🔥🔥🔥'.length", 8.0), // four emoji = 8 code units
+            ("'café'.length", 4.0),     // mixed ASCII + accented
+        ];
+        for (expr, want) in cases {
+            let val = eval_expr(expr).unwrap_or_else(|e| panic!("{expr}: {e:?}"));
+            assert!(
+                matches!(val, Value::Number(n) if n == want),
+                "{expr} expected {want}, got {val:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_eval_auth_null() {
         // Auth is null by default
         assert!(!eval_expr_bool("auth !== null").unwrap());
