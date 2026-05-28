@@ -1,9 +1,7 @@
 //! Server module - per-core handlers and database management for Glommio.
 
-pub mod config;
 pub mod core_handler;
 
-pub use config::{CachedProjectConfig, ProjectConfigCache};
 pub use core_handler::{CoreHandler, CoreHandlerConfig, VirtualClientSender};
 
 /// Storage configuration for persistence.

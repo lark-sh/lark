@@ -4,11 +4,9 @@
 //! thread-per-core model with io_uring. Each core runs its own LocalExecutor
 //! with dedicated task queues for TCP I/O and database processing.
 
-pub mod core_state;
 pub mod pool;
 
-pub use core_state::CoreState;
-pub use pool::{ExecutorPool, ExecutorPoolConfig, create_task_queues};
+pub use pool::{ExecutorPool, ExecutorPoolConfig};
 
 use xxhash_rust::xxh64::xxh64;
 
