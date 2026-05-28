@@ -427,7 +427,7 @@ What makes this a different class of problem from Tier 2 is the
   reasonably current automatically. Full re-compaction (space reclamation) is the
   separate `lark-compact` tool, run when a blob has accumulated significant wasted
   space; it coordinates with the server via the `.compacting` marker (see
-  [BACKUP.md](BACKUP.md) and the README's [Storage section](../README.md#storage)).
+  [BACKUP.md](BACKUP.md) and CONTRIBUTING's [Storage section](../CONTRIBUTING.md#storage)).
 - **Observability** — with `LARK_METRICS_PUSH=true`, `lark-server` pushes
   per-database metrics straight to `lark-edge`'s internal endpoint and the admin
   dashboard's Monitoring tab works with no extra setup (this is set in the bundled
