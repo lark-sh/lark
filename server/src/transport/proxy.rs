@@ -1242,13 +1242,7 @@ impl<H: ProxyHandler + 'static> ProxyConnection<H> {
                 if let Ok(json_str) = std::str::from_utf8(auth_json) {
                     trace!("CONNECT auth JSON: {}", json_str);
                 }
-                if let Ok(mut parsed_auth) = serde_json::from_slice::<ProxyAuthInfo>(auth_json) {
-                    // Check if is_admin is inside claims (Go proxy may send it there)
-                    if !parsed_auth.is_admin
-                        && let Some(is_admin_val) = parsed_auth.claims.get("is_admin")
-                    {
-                        parsed_auth.is_admin = is_admin_val.as_bool().unwrap_or(false);
-                    }
+                if let Ok(parsed_auth) = serde_json::from_slice::<ProxyAuthInfo>(auth_json) {
                     auth = Some(parsed_auth);
                 }
             }
@@ -1497,6 +1491,61 @@ mod tests {
 
         assert_eq!(decoded.uid, "user-123");
         assert_eq!(decoded.provider, "google");
+    }
+
+    /// Build a minimal CONNECT payload carrying the given auth JSON, using the
+    /// wire layout `parse_connect_payload` expects.
+    fn connect_payload_with_auth(auth_json: &str) -> Vec<u8> {
+        // protocol=1, project_id="p" (len 1), database_id="d" (len 1)
+        let mut buf = vec![1u8, 1u8, b'p', 1u8, b'd'];
+        buf.extend_from_slice(&0u16.to_be_bytes()); // metadata len = 0
+        let auth = auth_json.as_bytes();
+        buf.extend_from_slice(&(auth.len() as u16).to_be_bytes());
+        buf.extend_from_slice(auth);
+        buf
+    }
+
+    /// Regression test for the client-controlled `is_admin` privilege escalation:
+    /// a valid customer/Firebase token (gateway sets wire `is_admin = false`) that
+    /// smuggles a custom claim `is_admin: true` must NOT be promoted to admin. The
+    /// gateway's dedicated wire field is the sole authority; the claim stays inert.
+    #[test]
+    fn test_claims_is_admin_does_not_grant_admin() {
+        let payload = connect_payload_with_auth(
+            r#"{"uid":"attacker","provider":"customer","is_admin":false,"claims":{"is_admin":true}}"#,
+        );
+
+        let (_proto, _project, _db, _meta, auth) = ProxyConnection::<
+            crate::server::core_handler::CoreHandler,
+        >::parse_connect_payload(&payload)
+        .expect("payload parses");
+        let auth = auth.expect("auth present");
+
+        assert!(
+            !auth.is_admin,
+            "a client-supplied claims.is_admin must never be promoted to the trusted admin flag"
+        );
+        // The claim itself is preserved as inert app data (Firebase-compatible:
+        // rules can still read it as auth.token.is_admin).
+        assert_eq!(
+            auth.claims.get("is_admin").and_then(|v| v.as_bool()),
+            Some(true),
+            "the custom claim should pass through untouched for rules to read"
+        );
+    }
+
+    /// The gateway's authoritative wire field still grants admin (true admins work).
+    #[test]
+    fn test_wire_is_admin_grants_admin() {
+        let payload = connect_payload_with_auth(
+            r#"{"uid":"coordinator","provider":"admin","is_admin":true,"claims":{}}"#,
+        );
+        let (_p, _pr, _d, _m, auth) =
+            ProxyConnection::<crate::server::core_handler::CoreHandler>::parse_connect_payload(
+                &payload,
+            )
+            .expect("payload parses");
+        assert!(auth.expect("auth present").is_admin);
     }
 
     #[test]
