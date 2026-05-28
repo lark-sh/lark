@@ -1,19 +1,8 @@
 //! Server module - per-core handlers and database management for Glommio.
 
-pub mod config;
 pub mod core_handler;
 
-pub use config::{CachedProjectConfig, ProjectConfigCache};
 pub use core_handler::{CoreHandler, CoreHandlerConfig, VirtualClientSender};
-
-/// Storage configuration for persistence.
-#[derive(Clone, Debug, Default)]
-pub struct StorageConfig {
-    /// SharedFS root directory for persistence.
-    pub shared_fs_root: Option<String>,
-    /// Template directory for load testing.
-    pub template_path: Option<String>,
-}
 
 /// Parse project ID from database ID.
 /// Database IDs are in format "project/database", e.g., "gorilla-smash/room-123".

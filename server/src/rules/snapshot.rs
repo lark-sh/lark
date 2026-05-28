@@ -1251,13 +1251,6 @@ impl AuthInfo {
         }
     }
 
-    /// Pre-compute and cache the JSON representation.
-    /// Call this after constructing AuthInfo to avoid repeated computation during rules evaluation.
-    pub fn with_cached_json(mut self) -> Self {
-        self.cached_json = self.compute_json();
-        self
-    }
-
     /// Converts auth info to a JSON value for use in expressions.
     /// Returns cached value if available, otherwise computes it.
     /// Token claims are hoisted to the top level:

@@ -34,15 +34,6 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Sync a file to ensure its data is durable.
-///
-/// Opens the file for reading (doesn't modify it) and calls fsync.
-pub fn sync_file(path: &Path) -> io::Result<()> {
-    let file = File::open(path)?;
-    file.sync_all()?;
-    Ok(())
-}
-
 /// Write data to a file with full durability guarantees.
 ///
 /// This function:

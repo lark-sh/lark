@@ -563,34 +563,6 @@ impl ShutdownMessage {
 // Frame Encoding/Decoding Helpers
 // =============================================================================
 
-/// Encode a server -> proxy frame
-pub fn encode_server_frame(msg_type: u8, client_id: u32, flags: u8, payload: &[u8]) -> BytesMut {
-    // Format: [Length:4][Type:1][ClientID:4][Flags:1][Payload...]
-    let payload_len = 1 + 4 + 1 + payload.len();
-    let mut buf = BytesMut::with_capacity(4 + payload_len);
-
-    buf.put_u32(payload_len as u32);
-    buf.put_u8(msg_type);
-    buf.put_u32(client_id);
-    buf.put_u8(flags);
-    buf.put_slice(payload);
-
-    buf
-}
-
-/// Encode a control frame (no client ID, used for HELLO_ACK, HEARTBEAT, etc.)
-pub fn encode_control_frame(msg_type: u8, payload: &[u8]) -> BytesMut {
-    // Format: [Length:4][Type:1][Payload...]
-    let payload_len = 1 + payload.len();
-    let mut buf = BytesMut::with_capacity(4 + payload_len);
-
-    buf.put_u32(payload_len as u32);
-    buf.put_u8(msg_type);
-    buf.put_slice(payload);
-
-    buf
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

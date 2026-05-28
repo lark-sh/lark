@@ -814,11 +814,6 @@ impl CoreHandler {
         self.project_configs.borrow().contains_key(project_id)
     }
 
-    /// Check emulator mode.
-    pub fn is_emulator_mode(&self) -> bool {
-        self.config.emulator
-    }
-
     /// Count connected clients for a specific database.
     fn client_count_for_database(&self, database_id: &str) -> usize {
         self.client_databases

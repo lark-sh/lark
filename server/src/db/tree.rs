@@ -25,11 +25,6 @@ impl Tree {
         }
     }
 
-    /// Create a tree from an existing ArcValue.
-    pub fn from_arc_value(root: ArcValue) -> Self {
-        Self { root }
-    }
-
     /// Create a tree with a Sentinel root (blob-backed, nothing loaded yet).
     pub fn new_sentinel() -> Self {
         Self {
@@ -47,11 +42,6 @@ impl Tree {
     /// Get a reference to the root value.
     pub fn root(&self) -> &ArcValue {
         &self.root
-    }
-
-    /// Get a clone of the root value (O(1) Arc::clone).
-    pub fn root_arc(&self) -> ArcValue {
-        self.root.clone()
     }
 
     /// Get a reference to the value at the given path, or None if not found.
@@ -85,13 +75,6 @@ impl Tree {
         self.get_value(&Path::parse(path))
     }
 
-    /// Estimate the JSON-encoded size of the value at the given path.
-    /// Returns 0 if the path doesn't exist.
-    /// This is much faster than serializing to JSON just to check size.
-    pub fn estimate_size_at(&self, path: &Path) -> i64 {
-        self.get(path).map(|v| v.estimate_size()).unwrap_or(0)
-    }
-
     /// Set a value at the given path, creating intermediate nodes as needed.
     /// Values are cleaned before storage: null, {}, and [] are treated as deletions.
     /// Returns true if a value was set, false if it was deleted/cleaned away.
@@ -116,21 +99,6 @@ impl Tree {
         let refs: Vec<&str> = segments.iter().map(|s| s.as_ref()).collect();
         self.root.set_path_mut(&refs, cleaned);
         true
-    }
-
-    /// Set an ArcValue directly at the given path (avoids Value conversion).
-    /// The value will be cleaned before setting.
-    pub fn set_arc(&mut self, path: &Path, value: ArcValue) -> bool {
-        // Clean the value first
-        let cleaned = match value.clean() {
-            Some(v) => v,
-            None => {
-                self.remove(path);
-                return false;
-            }
-        };
-
-        self.set_arc_uncleaned(path, cleaned)
     }
 
     /// Set an already-cleaned ArcValue at the given path.
@@ -173,19 +141,6 @@ impl Tree {
         let refs: Vec<&str> = segments.iter().map(|s| s.as_ref()).collect();
         self.root.set_path_mut_sentinel(&refs, cleaned);
         true
-    }
-
-    /// Set an ArcValue directly at the given path using Sentinel intermediates.
-    pub fn set_arc_lazy(&mut self, path: &Path, value: ArcValue) -> bool {
-        let cleaned = match value.clean() {
-            Some(v) => v,
-            None => {
-                self.remove(path);
-                return false;
-            }
-        };
-
-        self.set_arc_uncleaned_lazy(path, cleaned)
     }
 
     /// Set an already-cleaned ArcValue at the given path using Sentinel intermediates.
@@ -332,16 +287,6 @@ impl Tree {
     /// Push at the given path string.
     pub fn push_str(&mut self, path: &str, value: Value) -> String {
         self.push(&Path::parse(path), value)
-    }
-
-    /// Check if two paths have the same underlying data (O(1) pointer comparison).
-    /// Useful for detecting if data has changed.
-    pub fn ptr_eq_at(&self, path: &Path, other: &Tree) -> bool {
-        match (self.get(path), other.get(path)) {
-            (Some(a), Some(b)) => a.ptr_eq(b),
-            (None, None) => true,
-            _ => false,
-        }
     }
 }
 

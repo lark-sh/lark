@@ -656,14 +656,6 @@ func (s *Server) unregisterClient(client *ClientConn) {
 	s.freeIDsMu.Unlock()
 }
 
-// getClient returns a client by ID
-func (s *Server) getClient(id uint32) *ClientConn {
-	if val, ok := s.clients.Load(id); ok {
-		return val.(*ClientConn)
-	}
-	return nil
-}
-
 // ConnectionCount returns the number of active connections
 func (s *Server) ConnectionCount() int {
 	count := 0

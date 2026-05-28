@@ -119,11 +119,6 @@ impl Path {
             .all(|(a, b)| a == b)
     }
 
-    /// Returns true if this path is a descendant of the given path.
-    pub fn is_descendant_of(&self, other: &Path) -> bool {
-        other.is_ancestor_of(self)
-    }
-
     /// Returns the relative path from ancestor to this path.
     /// Returns None if ancestor is not actually an ancestor.
     ///

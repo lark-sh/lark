@@ -57,7 +57,6 @@ var (
 	ErrInvalidToken  = errors.New("invalid token")
 	ErrExpiredToken  = errors.New("token expired")
 	ErrInvalidClaims = errors.New("invalid claims")
-	ErrWrongServer   = errors.New("token assigned to different server")
 )
 
 // UserFriendlyError returns a user-friendly error message for auth errors.
@@ -73,8 +72,6 @@ func UserFriendlyError(err error) string {
 		return "no token provided"
 	case errors.Is(err, ErrExpiredToken):
 		return "token expired - please reauthenticate"
-	case errors.Is(err, ErrWrongServer):
-		return "token assigned to different server"
 	case errors.Is(err, ErrInvalidIssuer):
 		return "invalid token issuer - check firebase_project_id configuration"
 	case errors.Is(err, ErrInvalidAudience):
@@ -138,18 +135,12 @@ type Info struct {
 
 // Validator validates JWT tokens.
 type Validator struct {
-	secret   []byte
-	serverID string // Expected server ID (optional, set for coordinator-issued tokens)
+	secret []byte
 }
 
 // NewValidator creates a new JWT validator with the given secret.
 func NewValidator(secret []byte) *Validator {
 	return &Validator{secret: secret}
-}
-
-// NewValidatorWithServer creates a validator that also checks the server claim.
-func NewValidatorWithServer(secret []byte, serverID string) *Validator {
-	return &Validator{secret: secret, serverID: serverID}
 }
 
 // Validate validates a JWT token and returns the auth info.
@@ -188,11 +179,6 @@ func (v *Validator) Validate(tokenString string) (*Info, error) {
 	uid := claims.Subject
 	if uid == "" {
 		return nil, fmt.Errorf("%w: missing sub claim", ErrInvalidClaims)
-	}
-
-	// Check server claim if validator was configured with expected server ID
-	if v.serverID != "" && claims.Server != v.serverID {
-		return nil, fmt.Errorf("%w: expected %s, got %s", ErrWrongServer, v.serverID, claims.Server)
 	}
 
 	// Extract database ID from audience (first audience if multiple)

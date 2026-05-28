@@ -3,8 +3,7 @@
 //! This module handles the setup of Glommio's thread-per-core model,
 //! spawning one LocalExecutor per CPU core with appropriate task queues.
 
-use glommio::{Latency, LocalExecutorBuilder, Placement, Shares, executor};
-use std::time::Duration;
+use glommio::{LocalExecutorBuilder, Placement};
 use tracing::{error, info};
 
 /// Configuration for the executor pool.
@@ -93,25 +92,6 @@ impl ExecutorPool {
 
         info!("Executor pool shutdown complete");
     }
-}
-
-/// Create task queues for a core.
-///
-/// Returns (tcp_tq, db_tq) handles.
-pub fn create_task_queues() -> (glommio::TaskQueueHandle, glommio::TaskQueueHandle) {
-    // TCP task queue - HIGH priority, latency-sensitive
-    // Glommio will preempt other tasks to run these if they wait >5ms
-    let tcp_tq = executor().create_task_queue(
-        Shares::Static(100),
-        Latency::Matters(Duration::from_millis(5)),
-        "tcp-io",
-    );
-
-    // Database task queue - LOWER priority
-    // Database processing can tolerate more latency
-    let db_tq = executor().create_task_queue(Shares::Static(50), Latency::NotImportant, "database");
-
-    (tcp_tq, db_tq)
 }
 
 /// Yield to the scheduler if needed.

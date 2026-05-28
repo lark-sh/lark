@@ -29,11 +29,6 @@ impl MessageValue {
         MessageValue::Json(v)
     }
 
-    /// Create from an ArcValue (avoids to_value() conversion)
-    pub fn from_arc(v: ArcValue) -> Self {
-        MessageValue::Arc(v)
-    }
-
     /// Check if this is null
     pub fn is_null(&self) -> bool {
         match self {
@@ -471,19 +466,9 @@ impl ClientMessage {
         Ok(msg)
     }
 
-    /// Parse without size validation (for internal use or when size is pre-validated).
-    pub fn parse_unchecked(data: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(data)
-    }
-
     /// Check if this is a volatile write.
     pub fn is_volatile(&self) -> bool {
         self.volatile.unwrap_or(false)
-    }
-
-    /// Check if this is a write operation (set, update, remove).
-    pub fn is_write(&self) -> bool {
-        matches!(self.op.as_str(), "s" | "u" | "d")
     }
 
     /// Get the value as a specific type.

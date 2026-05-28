@@ -102,14 +102,6 @@ pub struct FirebaseDataMessage {
     pub tag: Option<i32>,
 }
 
-/// Firebase auth body.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FirebaseAuthBody {
-    /// Auth credential (JWT token)
-    #[serde(rename = "cred")]
-    pub cred: String,
-}
-
 /// Firebase listen/query body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FirebaseListenBody {
@@ -225,16 +217,6 @@ pub struct FirebaseOnDisconnectBody {
 // =============================================================================
 // Firebase Adapter
 // =============================================================================
-
-/// Project configuration for Firebase compatibility.
-#[derive(Debug, Clone, Default)]
-pub struct FirebaseConfig {
-    /// Database name in simple mode. Typically "default".
-    pub default_database: String,
-
-    /// Firebase project ID for RS256 token validation (optional).
-    pub firebase_project_id: Option<String>,
-}
 
 /// Firebase protocol adapter for translating between Firebase and Lark wire protocols.
 ///
@@ -373,21 +355,6 @@ impl FirebaseAdapter {
         self.joined = true;
     }
 
-    /// Check if we've joined a Lark database.
-    pub fn is_joined(&self) -> bool {
-        self.joined
-    }
-
-    /// Set the join request ID (for swallowing JoinAck).
-    pub fn set_join_request_id(&mut self, id: &str) {
-        self.join_request_id = Some(id.to_string());
-    }
-
-    /// Set the auto-auth request ID (for swallowing AuthAck).
-    pub fn set_auto_auth_request_id(&mut self, id: &str) {
-        self.auto_auth_request_id = Some(id.to_string());
-    }
-
     // =========================================================================
     // Incoming Message Handling
     // =========================================================================
@@ -503,7 +470,11 @@ impl FirebaseAdapter {
         match action {
             "s" => Ok((None, None)), // Stats - ignore
 
-            "auth" => self.translate_auth(&req_id, data_msg.body.as_ref()),
+            // Auth is resolved entirely by the edge, which validates the token and
+            // pushes the result to the backend out-of-band (AUTH_CHANGED). The edge
+            // also forwards the raw auth frame here and answers the client itself, so
+            // the backend must stay silent on it — ignore, don't translate or respond.
+            "auth" => Ok((None, None)),
 
             "q" => self.translate_listen(&req_id, data_msg.body.as_ref(), data_msg.tag),
 
@@ -523,26 +494,6 @@ impl FirebaseAdapter {
 
             _ => Err(format!("unknown firebase action: {}", action)),
         }
-    }
-
-    fn translate_auth(
-        &self,
-        req_id: &str,
-        body: Option<&Value>,
-    ) -> Result<(Option<ClientMessage>, Option<Vec<u8>>), String> {
-        let body = body.ok_or("missing auth body")?;
-        let auth_body: FirebaseAuthBody = serde_json::from_value(body.clone())
-            .map_err(|e| format!("invalid auth body: {}", e))?;
-
-        Ok((
-            Some(ClientMessage {
-                op: crate::protocol::op::AUTH.to_string(),
-                request_id: Some(req_id.to_string()),
-                token: Some(auth_body.cred),
-                ..Default::default()
-            }),
-            None,
-        ))
     }
 
     fn translate_listen(
@@ -1547,7 +1498,9 @@ mod tests {
     }
 
     #[test]
-    fn test_translate_auth() {
+    fn test_translate_auth_is_ignored() {
+        // Auth is owned by the edge; the backend must not translate or respond to
+        // forwarded auth frames (the edge already answered the client).
         let adapter = FirebaseAdapter::new("test-db", "host");
 
         let auth_msg = json!({
@@ -1559,14 +1512,15 @@ mod tests {
             }
         });
 
-        let (msg, _) = adapter
+        let (msg, response) = adapter
             .translate_incoming(serde_json::to_vec(&auth_msg).unwrap().as_slice())
             .unwrap();
 
-        let msg = msg.unwrap();
-        assert_eq!(msg.op, crate::protocol::op::AUTH);
-        assert_eq!(msg.token, Some("my-jwt-token".to_string()));
-        assert_eq!(msg.request_id, Some("2".to_string()));
+        assert!(
+            msg.is_none(),
+            "auth frame must not produce a backend message"
+        );
+        assert!(response.is_none(), "auth frame must not produce a response");
     }
 
     #[test]
