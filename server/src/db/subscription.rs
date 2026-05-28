@@ -207,6 +207,14 @@ where
 // View Types
 // =============================================================================
 
+/// One of a client's subscriptions: `(path, query_id, rules_query)`.
+/// `rules_query` is the query context captured at subscribe time, for re-running
+/// `can_read` on auth/rules change.
+pub type ClientSubscription = (String, String, Option<Arc<HashMap<String, Value>>>);
+
+/// A subscription across all clients: `(client_id, path, query_id, rules_query)`.
+pub type GlobalSubscription = (String, String, String, Option<Arc<HashMap<String, Value>>>);
+
 /// Key for identifying a shared view: (path, query_id).
 /// All clients with the same path and query parameters share a view.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -283,6 +291,14 @@ pub struct SharedView {
     pub query_id: String,
     pub is_volatile: bool,
 
+    /// The rules-query context (`query.*` map) for this view's query, built once
+    /// at subscribe time. `None` for simple (non-query) subscriptions. Stored so
+    /// a subscription can be re-evaluated against `can_read` after an auth or
+    /// rules change without the original SUBSCRIBE message in hand. Identical for
+    /// every subscriber of a shared view (it's a pure function of the query), so
+    /// it lives on the shared view rather than per-subscriber.
+    pub rules_query: Option<Arc<HashMap<String, Value>>>,
+
     /// For query views: keys currently in the view, in sorted order.
     pub ordered_keys: Vec<String>,
 
@@ -307,13 +323,19 @@ pub struct SharedView {
 
 impl SharedView {
     /// Create a new shared view.
-    pub fn new(path: String, query: Query, is_volatile: bool) -> Self {
+    pub fn new(
+        path: String,
+        query: Query,
+        is_volatile: bool,
+        rules_query: Option<Arc<HashMap<String, Value>>>,
+    ) -> Self {
         let query_id = query.identifier();
         Self {
             path,
             query,
             query_id,
             is_volatile,
+            rules_query,
             ordered_keys: Vec::new(),
             sort_key_cache: HashMap::new(),
             boundary: None,
@@ -745,6 +767,11 @@ impl ViewManager {
             Some(p) => p.to_query()?,
             None => Query::default(),
         };
+        // Build the rules-query context now so the view can be re-evaluated
+        // against rules later (auth/rules change) without the SUBSCRIBE message.
+        // Built unconditionally (not gated on whether the *current* rules use
+        // query.*) so it stays correct if a later rules change starts using it.
+        let rules_query = query_params.map(|p| p.to_rules_query());
         let is_volatile = self.is_volatile_path(path);
         let tag = query.tag;
         let query_id = query.identifier();
@@ -771,7 +798,9 @@ impl ViewManager {
             let shared_view = self
                 .shared_views
                 .entry(view_key.clone())
-                .or_insert_with(|| SharedView::new(path.to_string(), query, is_volatile));
+                .or_insert_with(|| {
+                    SharedView::new(path.to_string(), query, is_volatile, rules_query)
+                });
 
             // Add this client as a subscriber
             shared_view.add_subscriber(client_id.to_string(), tag, conn);
@@ -853,6 +882,49 @@ impl ViewManager {
         if removed {
             self.total_subscriptions = self.total_subscriptions.saturating_sub(1);
         }
+    }
+
+    /// List a client's active subscriptions as `(path, query_id, rules_query)`.
+    ///
+    /// Used to re-evaluate a client's live views against `can_read` after an
+    /// auth or rules change. `rules_query` is the query context captured at
+    /// subscribe time (see [`SharedView::rules_query`]), so the re-check matches
+    /// the original permission decision's query inputs.
+    pub fn list_client_subscriptions(&self, client_id: &str) -> Vec<ClientSubscription> {
+        let Some(view_keys) = self.by_client.get(client_id) else {
+            return Vec::new();
+        };
+        view_keys
+            .iter()
+            .map(|vk| {
+                let rules_query = self
+                    .shared_views
+                    .get(vk)
+                    .and_then(|sv| sv.rules_query.clone());
+                (vk.path.clone(), vk.query_id.clone(), rules_query)
+            })
+            .collect()
+    }
+
+    /// List every (client_id, path, query_id, rules_query) across all active
+    /// subscriptions. Used to re-evaluate all views after a rules change.
+    pub fn list_all_subscriptions(&self) -> Vec<GlobalSubscription> {
+        let mut out = Vec::new();
+        for (client_id, view_keys) in &self.by_client {
+            for vk in view_keys {
+                let rules_query = self
+                    .shared_views
+                    .get(vk)
+                    .and_then(|sv| sv.rules_query.clone());
+                out.push((
+                    client_id.clone(),
+                    vk.path.clone(),
+                    vk.query_id.clone(),
+                    rules_query,
+                ));
+            }
+        }
+        out
     }
 
     /// Unsubscribe a client from all paths.

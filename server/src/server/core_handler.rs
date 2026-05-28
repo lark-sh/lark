@@ -87,6 +87,14 @@ pub struct CoreHandler {
     /// Buffered messages for clients pending config: client_id -> messages
     pending_client_messages: RefCell<HashMap<String, Vec<BufferedMessage>>>,
 
+    /// Latest auth for clients still pending config: client_id -> auth.
+    /// An AUTH_CHANGED can arrive before the client's CONNECT is processed
+    /// (while it's buffered waiting on project config). Dropping it would leave
+    /// the client on its original CONNECT-time auth — a privilege-retention bug
+    /// if the change was a downgrade. We stash the newest auth here and
+    /// `process_connect` applies it when the client finally connects.
+    pending_client_auth: RefCell<HashMap<String, ProxyAuthInfo>>,
+
     /// Client to database mapping: client_id -> (database_id, virtual client).
     /// We keep the `Rc<VirtualClient>` so explicit eviction can force-close
     /// in-flight clients for a database.
@@ -137,6 +145,7 @@ impl CoreHandler {
             project_configs: RefCell::new(HashMap::new()),
             pending_configs: RefCell::new(HashMap::new()),
             pending_client_messages: RefCell::new(HashMap::new()),
+            pending_client_auth: RefCell::new(HashMap::new()),
             client_databases: RefCell::new(HashMap::new()),
             evicted_databases: RefCell::new(std::collections::HashSet::new()),
             shutting_down: RefCell::new(false),
@@ -538,8 +547,10 @@ impl CoreHandler {
         }
         if !pending_to_remove.is_empty() {
             let mut buffers = self.pending_client_messages.borrow_mut();
+            let mut deferred_auth = self.pending_client_auth.borrow_mut();
             for id in &pending_to_remove {
                 buffers.remove(id);
+                deferred_auth.remove(id);
             }
             debug!(
                 "  closed {} pending-config clients waiting on {}",
@@ -672,6 +683,11 @@ impl CoreHandler {
                 token: HashMap::new(),
                 is_admin: true,
             })
+        } else if let Some(deferred) = self.pending_client_auth.borrow_mut().remove(&client.id) {
+            // A late AUTH_CHANGED arrived while this client was buffered pending
+            // config. Prefer that newer auth over the CONNECT-time auth so a
+            // mid-handshake sign-in/out isn't silently lost.
+            convert_auth(&deferred)
         } else {
             client.proxy_auth.as_ref().and_then(convert_auth)
         };
@@ -973,8 +989,9 @@ impl ProxyHandler for CoreHandler {
     fn on_disconnect(&self, client: Rc<VirtualClient>) {
         debug!("Client disconnected: {}", client.id);
 
-        // Clean up any pending message buffer
+        // Clean up any pending message buffer + deferred auth
         self.pending_client_messages.borrow_mut().remove(&client.id);
+        self.pending_client_auth.borrow_mut().remove(&client.id);
 
         // Clean up from pending configs if client was waiting for config
         let project_id = client.project_id.clone();
@@ -1012,17 +1029,24 @@ impl ProxyHandler for CoreHandler {
         let database_id = match self.client_databases.borrow().get(&client.id) {
             Some((id, _)) => id.clone(),
             None => {
-                // Client may be pending config - check if buffered
+                // Client may be pending config (CONNECT buffered, waiting on
+                // project config). Stash the newest auth so process_connect
+                // applies it on connect rather than dropping it (which would
+                // leave the client on its original CONNECT-time auth).
                 if self
                     .pending_client_messages
                     .borrow()
                     .contains_key(&client.id)
                 {
-                    warn!(
-                        "AUTH_CHANGED for pending client {} - auth update will be lost! \
-                        Client will use original auth from CONNECT.",
+                    debug!(
+                        "AUTH_CHANGED for pending client {} — deferring until connect",
                         client.id
                     );
+                    self.pending_client_auth
+                        .borrow_mut()
+                        .insert(client.id.clone(), auth);
+                } else {
+                    warn!("AUTH_CHANGED for unknown client {}", client.id);
                 }
                 return;
             }

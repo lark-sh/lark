@@ -2989,6 +2989,11 @@ impl Database {
                 Some(evaluator) => {
                     debug!("Database {} applying new rules from CONFIG_PUSH", self.id);
                     self.set_evaluator(evaluator);
+                    // Rules just changed. A tightened ruleset must not keep
+                    // streaming to listeners it now forbids, so re-check every
+                    // active subscription against the new rules and revoke the
+                    // ones that no longer pass.
+                    self.revoke_all_unauthorized_subscriptions().await;
                 }
                 None => {
                     debug!(
@@ -2997,6 +3002,9 @@ impl Database {
                     );
                     self.evaluator = None;
                     self.set_volatile_paths(Vec::new());
+                    // Rules cleared to fully-open: `can_read` now allows
+                    // everything, so no existing subscription can have become
+                    // unauthorized. Nothing to revoke.
                 }
             }
             return;
@@ -3021,7 +3029,8 @@ impl Database {
         }
 
         if msg.has_auth {
-            self.handle_auth_update(&msg.client_id, msg.auth_update.clone());
+            self.handle_auth_update(&msg.client_id, msg.auth_update.clone())
+                .await;
             return;
         }
 
@@ -3632,11 +3641,85 @@ impl Database {
         self.metrics.decrement_ccu();
     }
 
-    fn handle_auth_update(&mut self, client_id: &str, auth: Option<AuthInfo>) {
-        if let Some(client) = self.clients.get_mut(client_id) {
-            client.rules_auth = auth.as_ref().map(Self::convert_auth_to_rules);
-            client.auth = auth;
-            client.auth_complete = true;
+    async fn handle_auth_update(&mut self, client_id: &str, auth: Option<AuthInfo>) {
+        match self.clients.get_mut(client_id) {
+            Some(client) => {
+                client.rules_auth = auth.as_ref().map(Self::convert_auth_to_rules);
+                client.auth = auth;
+                client.auth_complete = true;
+            }
+            None => return,
+        }
+
+        // The client's auth just changed. Any subscription that was authorized
+        // under the previous auth must be re-checked: a sign-out, or a token
+        // refresh to a different uid, can make a once-allowed read now fail.
+        self.revoke_unauthorized_subscriptions(client_id).await;
+    }
+
+    /// Re-evaluate one client's active subscriptions against the current rules
+    /// and auth, silently unsubscribing any that no longer pass `can_read`.
+    ///
+    /// The server-side unsubscribe is the security control; we don't send a
+    /// client-facing cancel (cooperative SDKs already tear down their listeners
+    /// on auth change, and a malicious client would ignore a notification). Each
+    /// revocation is logged for observability.
+    async fn revoke_unauthorized_subscriptions(&mut self, client_id: &str) {
+        // No ruleset means `can_read` always allows — nothing can be revoked, so
+        // skip the work (and the allocation) entirely.
+        if self.evaluator.is_none() {
+            return;
+        }
+
+        let subs = self.view_manager.list_client_subscriptions(client_id);
+        let mut revoked = 0usize;
+        for (path, query_id, rules_query) in subs {
+            if !self.can_read(client_id, &path, rules_query).await {
+                debug!(
+                    "{}: revoking subscription {} (query {}) for client {} — no longer authorized",
+                    self.id, path, query_id, client_id
+                );
+                self.view_manager
+                    .unsubscribe_with_query(client_id, &path, &query_id);
+                self.metrics.record_permission_denial();
+                revoked += 1;
+            }
+        }
+
+        if revoked > 0 {
+            self.metrics
+                .set_subscriptions(self.view_manager.subscription_count() as u32);
+        }
+    }
+
+    /// Re-evaluate ALL active subscriptions against the current rules, revoking
+    /// any that no longer pass `can_read`. Called after a CONFIG_PUSH rules
+    /// change so a tightened ruleset stops streaming to now-unauthorized
+    /// listeners. O(active subscriptions) rule evaluations — acceptable because
+    /// a rules change is a rare admin operation, not a per-write hot path.
+    async fn revoke_all_unauthorized_subscriptions(&mut self) {
+        if self.evaluator.is_none() {
+            return;
+        }
+
+        let subs = self.view_manager.list_all_subscriptions();
+        let mut revoked = 0usize;
+        for (client_id, path, query_id, rules_query) in subs {
+            if !self.can_read(&client_id, &path, rules_query).await {
+                debug!(
+                    "{}: revoking subscription {} (query {}) for client {} — denied by new rules",
+                    self.id, path, query_id, client_id
+                );
+                self.view_manager
+                    .unsubscribe_with_query(&client_id, &path, &query_id);
+                self.metrics.record_permission_denial();
+                revoked += 1;
+            }
+        }
+
+        if revoked > 0 {
+            self.metrics
+                .set_subscriptions(self.view_manager.subscription_count() as u32);
         }
     }
 
@@ -6250,6 +6333,182 @@ mod tests {
                 .await
                 .expect("resp");
             assert_eq!(resp.error.as_deref(), Some(error::PAYLOAD_TOO_LARGE));
+        })
+    }
+
+    /// Build a non-admin authenticated identity with the given uid.
+    fn authed(uid: &str) -> AuthInfo {
+        AuthInfo {
+            uid: uid.to_string(),
+            provider: "password".to_string(),
+            token: HashMap::new(),
+            is_admin: false,
+        }
+    }
+
+    /// Per-user read rule used by the revocation tests: a client may read
+    /// `/private/<uid>` only when `auth.uid` matches that uid.
+    fn private_per_user_rules() -> crate::rules::RuleSet {
+        crate::rules::parse_rules(&json!({
+            "rules": { "private": { "$uid": {
+                ".read": "auth.uid === $uid",
+                ".write": true
+            }}}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_auth_change_revokes_now_unauthorized_subscription() {
+        // H-2: a subscription authorized under one auth must be torn down
+        // server-side when the connection's auth changes to one the read rule
+        // denies — not left streaming for the connection's lifetime.
+        block_on(async {
+            let mut db = Database::new("test".to_string(), "test-project".to_string(), true);
+            let (conn, _messages) = MockConnection::new();
+            db.set_rules(private_per_user_rules());
+
+            // Alice connects and subscribes to her own private path — allowed.
+            db.add_client_internal("client1", Some(authed("alice")), "conn1", conn);
+            db.tree
+                .write()
+                .unwrap()
+                .set_str("/private/alice", json!({"secret": 1}));
+
+            let sub = ClientMessage {
+                op: "sb".to_string(),
+                path: Some("/private/alice".to_string()),
+                request_id: Some("r1".to_string()),
+                ..Default::default()
+            };
+            db.handle_subscribe("client1", &sub).await;
+            assert_eq!(
+                db.view_manager.subscription_count(),
+                1,
+                "alice's subscribe to her own path should be accepted"
+            );
+
+            // Connection's auth is swapped to a different uid (sign-out, or a
+            // token refresh to bob). Alice's old subscription no longer passes.
+            db.handle_auth_update("client1", Some(authed("bob"))).await;
+            assert_eq!(
+                db.view_manager.subscription_count(),
+                0,
+                "subscription must be revoked once auth changes to a uid the rule denies"
+            );
+        })
+    }
+
+    #[test]
+    fn test_auth_change_keeps_still_authorized_subscription() {
+        // A re-auth that still satisfies the rule (e.g. token refresh, same uid)
+        // must NOT drop the subscription.
+        block_on(async {
+            let mut db = Database::new("test".to_string(), "test-project".to_string(), true);
+            let (conn, _messages) = MockConnection::new();
+            db.set_rules(private_per_user_rules());
+            db.add_client_internal("client1", Some(authed("alice")), "conn1", conn);
+            db.tree
+                .write()
+                .unwrap()
+                .set_str("/private/alice", json!({"secret": 1}));
+
+            let sub = ClientMessage {
+                op: "sb".to_string(),
+                path: Some("/private/alice".to_string()),
+                request_id: Some("r1".to_string()),
+                ..Default::default()
+            };
+            db.handle_subscribe("client1", &sub).await;
+            assert_eq!(db.view_manager.subscription_count(), 1);
+
+            // Re-auth, still alice → still authorized, subscription survives.
+            db.handle_auth_update("client1", Some(authed("alice")))
+                .await;
+            assert_eq!(
+                db.view_manager.subscription_count(),
+                1,
+                "a still-authorized re-auth must not revoke the subscription"
+            );
+        })
+    }
+
+    #[test]
+    fn test_query_subscription_revoked_on_auth_change() {
+        // Exercises the query path: the stored rules-query is carried through
+        // list_client_subscriptions and the revoke uses the right query_id.
+        block_on(async {
+            let mut db = Database::new("test".to_string(), "test-project".to_string(), true);
+            let (conn, _messages) = MockConnection::new();
+            db.set_rules(private_per_user_rules());
+            db.add_client_internal("client1", Some(authed("alice")), "conn1", conn);
+            {
+                let mut tree = db.tree.write().unwrap();
+                tree.set_str("/private/alice/a", json!({"n": 1}));
+                tree.set_str("/private/alice/b", json!({"n": 2}));
+            }
+
+            let sub = ClientMessage {
+                op: "sb".to_string(),
+                path: Some("/private/alice".to_string()),
+                request_id: Some("r1".to_string()),
+                order_by_child: Some("n".to_string()),
+                limit_to_first: Some(1),
+                ..Default::default()
+            };
+            db.handle_subscribe("client1", &sub).await;
+            assert_eq!(db.view_manager.subscription_count(), 1);
+
+            db.handle_auth_update("client1", Some(authed("bob"))).await;
+            assert_eq!(
+                db.view_manager.subscription_count(),
+                0,
+                "query subscription must be revoked on auth change too"
+            );
+        })
+    }
+
+    #[test]
+    fn test_rules_change_revokes_now_unauthorized_subscription() {
+        // A tightened ruleset (CONFIG_PUSH) must revoke subscriptions it now
+        // forbids. Drives the all-clients re-check helper.
+        block_on(async {
+            let mut db = Database::new("test".to_string(), "test-project".to_string(), true);
+            let (conn, _messages) = MockConnection::new();
+
+            // Start fully open: alice subscribes to /room successfully.
+            db.set_rules(
+                crate::rules::parse_rules(&json!({"rules": {".read": true, ".write": true}}))
+                    .unwrap(),
+            );
+            db.add_client_internal("client1", Some(authed("alice")), "conn1", conn);
+            db.tree
+                .write()
+                .unwrap()
+                .set_str("/room", json!({"msg": "hi"}));
+
+            let sub = ClientMessage {
+                op: "sb".to_string(),
+                path: Some("/room".to_string()),
+                request_id: Some("r1".to_string()),
+                ..Default::default()
+            };
+            db.handle_subscribe("client1", &sub).await;
+            assert_eq!(db.view_manager.subscription_count(), 1);
+
+            // Admin tightens rules: /room is no longer readable.
+            db.set_rules(
+                crate::rules::parse_rules(&json!({
+                    "rules": { ".write": true, "room": { ".read": false } }
+                }))
+                .unwrap(),
+            );
+            db.revoke_all_unauthorized_subscriptions().await;
+            assert_eq!(
+                db.view_manager.subscription_count(),
+                0,
+                "subscription must be revoked once new rules deny the read"
+            );
         })
     }
 
