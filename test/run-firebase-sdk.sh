@@ -33,6 +33,12 @@ CACHE_DIR="$REPO_DIR/.cache"
 SDK_DIR="$CACHE_DIR/firebase-sdk"
 SDK_REPO="https://github.com/firebase/firebase-js-sdk.git"
 
+# Lark-owned test files. We keep them in this repo (so they survive SDK
+# commit bumps and live next to the code they test) and copy them into the
+# SDK's test directory at run time. Naming convention: `lark-*.test.ts`,
+# which is also how cleanup identifies them.
+LARK_TESTS_DIR="$REPO_DIR/test/firebase-sdk-tests"
+
 # Pinned firebase-js-sdk commit.
 # To bump: pick a new SHA from https://github.com/firebase/firebase-js-sdk
 # (typically after the @firebase/database-compat package has cut a release),
@@ -163,7 +169,28 @@ ensure_stack_up() {
     exit 1
 }
 
+copy_lark_tests() {
+    if [ ! -d "$LARK_TESTS_DIR" ]; then
+        return
+    fi
+    shopt -s nullglob
+    local files=("$LARK_TESTS_DIR"/lark-*.test.ts)
+    shopt -u nullglob
+    if [ ${#files[@]} -eq 0 ]; then
+        return
+    fi
+    log "Copying ${#files[@]} Lark-owned test file(s) into the SDK harness..."
+    cp "${files[@]}" "$SDK_DIR/packages/database-compat/test/"
+}
+
+remove_lark_tests() {
+    # Symmetric removal of whatever copy_lark_tests put in place. Leaves the
+    # SDK tree clean so a future upstream-only run sees no leftovers.
+    rm -f "$SDK_DIR/packages/database-compat/test/"lark-*.test.ts 2>/dev/null || true
+}
+
 cleanup() {
+    remove_lark_tests
     if [ "${KEEP_RUNNING:-0}" = "1" ]; then
         log "Leaving the test stack running (KEEP_RUNNING=1)."
         log "Stop it later with: docker compose -f $COMPOSE_FILE down"
@@ -229,7 +256,9 @@ main() {
     ensure_sdk_built
     # Trap set before bringing the stack up so a partial failure (e.g.
     # build OK but the wait-for-ready times out) still tears down.
+    # Trap also covers remove_lark_tests so we don't leave copies behind.
     trap cleanup EXIT
+    copy_lark_tests
     ensure_stack_up
     run_tests "${1:-}" "${2:-}"
     log "All tests completed."
