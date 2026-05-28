@@ -224,7 +224,7 @@ impl Value {
 
     /// Convert to number, following JavaScript's `ToNumber` for the types that
     /// appear in rules. Matching JS matters because rules are authored against
-    /// Firebase (a JS engine): a numeric string parses to its value, the empty
+    /// a JS engine: a numeric string parses to its value, the empty
     /// string is `0`, and anything non-numeric is `NaN`. `NaN` then makes every
     /// comparison false (see `compare`), so a `.validate` like
     /// `newData.val() <= MAX` correctly *denies* a non-numeric or oversized
@@ -292,7 +292,13 @@ impl Value {
             },
             Value::String(s) => {
                 if name == "length" {
-                    Value::Number(s.len() as f64)
+                    // Rules see JS string `.length`, which counts
+                    // UTF-16 code units — not bytes (Rust's `str::len()`) and not
+                    // codepoints. Same numbers for ASCII; "é" → 1 (one BMP unit, two
+                    // UTF-8 bytes); "🔥" → 2 (surrogate pair, four UTF-8 bytes).
+                    // Without this a min-length validator like `length >= 8` waves
+                    // through a 4-emoji string (8 bytes).
+                    Value::Number(s.encode_utf16().count() as f64)
                 } else {
                     Value::Null
                 }
