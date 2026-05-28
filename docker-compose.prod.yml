@@ -32,7 +32,7 @@ services:
       DISABLE_TLS: "true"
       HTTPS_LISTEN_ADDR: ":8080"
       INTERNAL_LISTEN_ADDR: ":8081"
-      LARKDB_DOMAIN: "localhost"
+      LARKDB_DOMAIN: "lark.localhost"
       DATABASE_URL: "sqlite:///data/lark.db"
       ADMIN_API_ENABLED: "true"
       SERVER_SECRET: "${SERVER_SECRET:?SERVER_SECRET is required — run 'make up-release', or set it in .env}"
