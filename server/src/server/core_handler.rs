@@ -552,7 +552,12 @@ impl CoreHandler {
         if purge {
             if let Some(ref data_dir) = self.config.data_dir {
                 let db_data_dir = PathBuf::from(format!("{}/{}", data_dir, full_id));
-                if db_data_dir.exists() {
+                if !is_safe_database_id(&full_id) {
+                    error!(
+                        "Refusing PURGE_DATA rename for unsafe database id {:?}",
+                        full_id
+                    );
+                } else if db_data_dir.exists() {
                     let ts = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
@@ -612,6 +617,24 @@ impl CoreHandler {
         } else {
             format!("{}/{}", client.project_id, client.database_id)
         };
+
+        // Reject identifiers that could escape the data directory. The edge
+        // validates these, but the server must not depend on that — a crafted
+        // id like `../../other` would otherwise resolve a data dir in another
+        // tenant's tree (defense in depth; also covers any future transport).
+        if !is_safe_database_id(&database_id) {
+            warn!(
+                "Rejecting client {} - unsafe database id {:?}",
+                client.id, database_id
+            );
+            if let Ok(data) =
+                ServerMessage::nack("", error::INVALID_DATA, "invalid database id").encode()
+            {
+                let _ = client.try_send(data.into(), false);
+            }
+            client.close();
+            return None;
+        }
 
         // Check per-database connection limit
         let current_count = self.client_count_for_database(&database_id);
@@ -1182,6 +1205,20 @@ fn parse_project_id(database_id: &str) -> String {
     }
 }
 
+/// True if `id` (a `project/database` identifier) is safe to append to the
+/// on-disk data directory. Rejects empty / `.` / `..` path segments, NUL bytes,
+/// and backslashes so a crafted id can't escape `{data_dir}` into another
+/// tenant's tree (e.g. `../../other`). The edge enforces a stricter DNS-safe
+/// charset; this is the server-side backstop so tenant isolation never depends
+/// on the gateway sanitizing identifiers.
+fn is_safe_database_id(id: &str) -> bool {
+    if id.is_empty() || id.contains('\0') || id.contains('\\') {
+        return false;
+    }
+    id.split('/')
+        .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1191,6 +1228,25 @@ mod tests {
         assert_eq!(parse_project_id("my-project/room-123"), "my-project");
         assert_eq!(parse_project_id("project/db"), "project");
         assert_eq!(parse_project_id("simple-db"), "simple-db");
+    }
+
+    #[test]
+    fn test_is_safe_database_id() {
+        // Normal identifiers.
+        assert!(is_safe_database_id("project/database"));
+        assert!(is_safe_database_id("simple-db"));
+        assert!(is_safe_database_id("p/d"));
+        // Traversal / escape attempts.
+        assert!(!is_safe_database_id("../../etc"));
+        assert!(!is_safe_database_id("project/../other"));
+        assert!(!is_safe_database_id("..")); // bare parent
+        assert!(!is_safe_database_id(".")); // bare current
+        assert!(!is_safe_database_id("/abs/path")); // leading slash -> empty segment
+        assert!(!is_safe_database_id("project//database")); // empty segment
+        assert!(!is_safe_database_id("project/")); // trailing slash -> empty segment
+        assert!(!is_safe_database_id("")); // empty
+        assert!(!is_safe_database_id("project\\database")); // backslash
+        assert!(!is_safe_database_id("project/db\0")); // NUL
     }
 
     #[test]

@@ -183,6 +183,12 @@ func (db *LocalDB) localServer() *Server {
 // ---------------------------------------------------------------------------
 
 func (db *LocalDB) EnsureRoutingData(ctx context.Context, projectID, databaseID string, heartbeatTimeout int64) (*Server, *Project, error) {
+	// Validate the database ID even in local mode: it flows to the server and
+	// into its on-disk data-dir path, so an unvalidated id (e.g. "../foo") would
+	// escape the project's directory. Mirrors the SQLite/Postgres backends.
+	if err := ValidateDatabaseID(databaseID); err != nil {
+		return nil, nil, err
+	}
 	project, _ := db.GetProjectByID(ctx, projectID)
 	return db.localServer(), project, nil
 }
