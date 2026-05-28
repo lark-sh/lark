@@ -1282,21 +1282,25 @@ impl AuthInfo {
 
         let mut map = HashMap::new();
 
-        if let Some(ref uid) = self.uid {
-            map.insert("uid".to_string(), JsonValue::String(uid.clone()));
-        }
-
-        if let Some(ref provider) = self.provider {
-            map.insert("provider".to_string(), JsonValue::String(provider.clone()));
-        }
-
+        // Hoist custom token claims to the top level FIRST, so rules can use both
+        // auth.player_id and auth.token.player_id.
         if let Some(ref token) = self.token {
-            // Hoist token claims to top level
-            // This allows rules to use both auth.player_id and auth.token.player_id
             for (k, v) in token {
                 map.insert(k.clone(), v.clone());
             }
-            // Also keep them at auth.token for explicit access
+        }
+
+        // Then write the authoritative identity LAST, so a custom claim named
+        // `uid`/`provider`/`token` can never shadow the verified values that
+        // rules depend on for access decisions.
+        if let Some(ref uid) = self.uid {
+            map.insert("uid".to_string(), JsonValue::String(uid.clone()));
+        }
+        if let Some(ref provider) = self.provider {
+            map.insert("provider".to_string(), JsonValue::String(provider.clone()));
+        }
+        if let Some(ref token) = self.token {
+            // Keep the full claims object at auth.token for explicit access.
             map.insert("token".to_string(), JsonValue::Object(token.clone()));
         }
 
@@ -1518,6 +1522,38 @@ mod tests {
     fn test_auth_info_null_when_empty() {
         let auth = AuthInfo::default();
         assert!(auth.to_json().is_none());
+    }
+
+    #[test]
+    fn test_custom_claims_cannot_shadow_authenticated_identity() {
+        // Custom claims named `uid`/`provider`/`token` must NOT override the
+        // verified identity that rules use for access decisions.
+        let mut token = serde_json::Map::new();
+        token.insert("uid".to_string(), JsonValue::String("victim".to_string()));
+        token.insert(
+            "provider".to_string(),
+            JsonValue::String("spoofed".to_string()),
+        );
+        token.insert("token".to_string(), JsonValue::String("hijack".to_string()));
+        token.insert("role".to_string(), JsonValue::String("gm".to_string()));
+
+        let auth = AuthInfo::new(
+            Some("attacker".to_string()),
+            Some("custom".to_string()),
+            Some(token),
+            false,
+        );
+
+        let json = auth.to_json().unwrap();
+        // Authoritative identity wins over the same-named custom claims.
+        assert_eq!(json.get("uid").unwrap(), "attacker");
+        assert_eq!(json.get("provider").unwrap(), "custom");
+        // auth.token stays the full claims object, not a hoisted `token` claim.
+        assert!(json.get("token").unwrap().is_object());
+        // Non-colliding custom claims are still hoisted to the top level.
+        assert_eq!(json.get("role").unwrap(), "gm");
+        // The original claim values remain visible under auth.token.*.
+        assert_eq!(json.get("token").unwrap().get("uid").unwrap(), "victim");
     }
 
     #[test]

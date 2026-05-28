@@ -251,6 +251,39 @@ func TestMultiValidatorLegacyToken(t *testing.T) {
 	}
 }
 
+// Tokens with no `exp` claim are rejected for every type EXCEPT Firebase legacy
+// tokens, which Firebase 2.x allowed to never expire.
+func TestMultiValidatorRequiresExpiration(t *testing.T) {
+	secretKey := "customer-secret"
+	adminSecretKey := "admin-secret"
+	validator := NewMultiValidator(nil)
+
+	// Lark customer token without exp → rejected.
+	cust := jwt.NewWithClaims(jwt.SigningMethodHS256, &LarkCustomerClaims{UID: "u1"})
+	custStr, _ := cust.SignedString([]byte(secretKey))
+	if _, err := validator.ValidateForProject(custStr, secretKey, adminSecretKey); err == nil {
+		t.Error("customer token without exp should be rejected")
+	}
+
+	// Coordinator admin token without exp → rejected.
+	admin := jwt.NewWithClaims(jwt.SigningMethodHS256, &Claims{Provider: "coordinator"})
+	admin.Header["kid"] = "coordinator"
+	adminStr, _ := admin.SignedString([]byte(adminSecretKey))
+	if _, err := validator.ValidateForProject(adminStr, secretKey, adminSecretKey); err == nil {
+		t.Error("coordinator token without exp should be rejected")
+	}
+
+	// Firebase legacy token without exp → accepted (intentional exemption).
+	legacy := jwt.NewWithClaims(jwt.SigningMethodHS256, &LegacyClaims{
+		Version: "0",
+		D:       map[string]any{"k": "v"},
+	})
+	legacyStr, _ := legacy.SignedString([]byte(secretKey))
+	if _, err := validator.ValidateForProject(legacyStr, secretKey, ""); err != nil {
+		t.Errorf("legacy token without exp should be accepted, got %v", err)
+	}
+}
+
 func TestMultiValidatorEmulatorMode(t *testing.T) {
 	validator := NewMultiValidator(nil)
 

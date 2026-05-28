@@ -166,7 +166,7 @@ func (v *Validator) Validate(tokenString string) (*Info, error) {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
 		return v.secret, nil
-	})
+	}, jwt.WithExpirationRequired())
 
 	if err != nil {
 		if errors.Is(err, jwt.ErrTokenExpired) {
@@ -543,6 +543,11 @@ type LegacyClaims struct {
 
 // validateLegacyToken validates a Firebase Legacy Token (HS256 with d field).
 // Returns auth info with empty UID (legacy tokens predate user ID concept).
+//
+// Unlike every other token type, legacy tokens do NOT require an `exp` claim:
+// the Firebase 2.x FirebaseTokenGenerator made expiration optional (a
+// "never-expire" token was valid), so enforcing it here would reject tokens
+// that legacy clients legitimately mint. Expiration is still checked when present.
 func validateLegacyToken(tokenString string, secretKey []byte) (*Info, error) {
 	token, err := jwt.ParseWithClaims(tokenString, &LegacyClaims{}, func(token *jwt.Token) (any, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
@@ -598,7 +603,7 @@ func validateLarkCustomerToken(tokenString string, secretKey []byte) (*Info, err
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
 		return secretKey, nil
-	})
+	}, jwt.WithExpirationRequired())
 
 	if err != nil {
 		if errors.Is(err, jwt.ErrTokenExpired) {
