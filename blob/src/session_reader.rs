@@ -682,12 +682,18 @@ impl<IO: BlobIO> BlobSession<IO> {
                     }
                 }
 
+                // TYPE_ARRAY is never written anymore — collections (including
+                // arrays) are stored as TYPE_COLLECTION. This decode is retained
+                // to migrate pre-existing on-disk arrays into integer-keyed
+                // objects on read. Compaction preserves the on-disk tag, so such
+                // nodes stay TYPE_ARRAY on disk until the path is next written
+                // (a SET goes through from_value_cleaned → object → TYPE_COLLECTION).
                 TYPE_ARRAY => {
                     let hdr = buf_slice(&buffers, cur_buf_idx, cur_offset, ARRAY_HEADER_SIZE)?;
                     let elem_count = u32::from_le_bytes(hdr[9..13].try_into().unwrap()) as usize;
 
                     if elem_count == 0 {
-                        ArcValue::Array(Arc::new(Vec::new()))
+                        ArcValue::Object(Arc::new(HashMap::new()))
                     } else {
                         let elem_index_start = cur_offset + ARRAY_HEADER_SIZE as u64;
                         let idx_len = elem_count * ARRAY_INDEX_ENTRY_SIZE;
@@ -828,8 +834,14 @@ impl<IO: BlobIO> BlobSession<IO> {
                                 }
                             }
                         } else {
-                            let final_arr = std::mem::take(arr);
-                            value = ArcValue::Array(Arc::new(final_arr));
+                            // On-disk arrays decode to integer-keyed objects,
+                            // keyed by element position; null elements become gaps.
+                            let final_map: HashMap<String, ArcValue> = std::mem::take(arr)
+                                .into_iter()
+                                .enumerate()
+                                .filter_map(|(i, v)| (!v.is_null()).then(|| (i.to_string(), v)))
+                                .collect();
+                            value = ArcValue::Object(Arc::new(final_map));
                             stack.pop();
                         }
                     }
@@ -968,9 +980,10 @@ mod tests {
     #[test]
     fn test_roundtrip_array() {
         block_on(async {
-            let original = json!({"items": [1, 2, 3, "four", true, null]});
-            let result = write_and_read_back(original.clone()).await;
-            assert_eq!(result.to_value(), original);
+            // The trailing null is dropped (null = absent), so it does not
+            // round-trip; the rest of the array is preserved.
+            let result = write_and_read_back(json!({"items": [1, 2, 3, "four", true, null]})).await;
+            assert_eq!(result.to_value(), json!({"items": [1, 2, 3, "four", true]}));
         });
     }
 
@@ -997,8 +1010,19 @@ mod tests {
                 "arr": [1, "two", null],
                 "nested": {"x": {"y": 1}}
             });
-            let result = write_and_read_back(original.clone()).await;
-            assert_eq!(result.to_value(), original);
+            let result = write_and_read_back(original).await;
+            // The trailing null in "arr" is dropped on read.
+            let expected = json!({
+                "s": "hello",
+                "n_int": 42,
+                "n_float": 3.14,
+                "b_true": true,
+                "b_false": false,
+                "null_v": null,
+                "arr": [1, "two"],
+                "nested": {"x": {"y": 1}}
+            });
+            assert_eq!(result.to_value(), expected);
         });
     }
 
@@ -1085,9 +1109,10 @@ mod tests {
     #[test]
     fn test_roundtrip_empty_array() {
         block_on(async {
-            let original = json!({"empty": []});
-            let result = write_and_read_back(original.clone()).await;
-            assert_eq!(result.to_value(), original);
+            // An empty array carries no data; it is stored as an empty object,
+            // not preserved as `[]`.
+            let result = write_and_read_back(json!({"empty": []})).await;
+            assert_eq!(result.to_value(), json!({"empty": {}}));
         });
     }
 

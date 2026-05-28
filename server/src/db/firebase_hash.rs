@@ -66,6 +66,16 @@ fn build_firebase_hash_string(value: &Value, priority: Option<&Value>) -> String
             let node_priority = map.get(".priority");
             build_children_hash_string(map, node_priority)
         }
+        Value::Array(arr) => {
+            // Arrays hash as integer-keyed children (index -> element); null
+            // elements are gaps and contribute nothing to the hash.
+            let map: serde_json::Map<String, Value> = arr
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i.to_string(), v.clone()))
+                .collect();
+            build_children_hash_string(&map, priority)
+        }
         // Primitive value (LeafNode without priority wrapper)
         _ => build_leaf_hash_string(value, priority),
     }
@@ -262,6 +272,24 @@ mod tests {
     fn test_compute_firebase_hash_object() {
         let hash = compute_firebase_hash(&json!({"a": 1, "b": 2}));
         assert!(!hash.is_empty());
+    }
+
+    #[test]
+    fn test_array_hashes_as_integer_keyed_object() {
+        // An array hashes identically to the integer-keyed object it represents.
+        let arr = compute_firebase_hash(&json!(["cat", "horse"]));
+        assert!(!arr.is_empty());
+        assert_eq!(
+            arr,
+            compute_firebase_hash(&json!({"0": "cat", "1": "horse"}))
+        );
+
+        // Null elements are gaps: they contribute nothing, matching the sparse
+        // object form.
+        assert_eq!(
+            compute_firebase_hash(&json!(["a", null, "c"])),
+            compute_firebase_hash(&json!({"0": "a", "2": "c"}))
+        );
     }
 
     #[test]

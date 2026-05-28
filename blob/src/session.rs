@@ -3653,7 +3653,6 @@ mod tests {
             ArcValue::Bool(b) => format!("Bool({})", b),
             ArcValue::Null => "Null".to_string(),
             ArcValue::Object(map) => format!("Object({} keys)", map.len()),
-            ArcValue::Array(arr) => format!("Array({} elems)", arr.len()),
             _ => format!("{:?}", v),
         }
     }

@@ -12,7 +12,7 @@ This design is influenced by Oracle's OSON binary format, described in:
 
 1. **Dictionary** — Deduplicated field names, stored once per document, referenced by small integer IDs. Binary search via sorted hash codes for O(log n) field lookup.
 
-2. **Tree-structured binary with jump offsets** — Objects store a sorted field ID array and an offset array. Navigate to any child without scanning siblings. Arrays store element offsets for O(1) indexed access.
+2. **Tree-structured binary with jump offsets** — Objects store a sorted field ID array and an offset array. Navigate to any child without scanning siblings. (Legacy array nodes store element offsets for O(1) indexed access; arrays are no longer written — see the note under Node Encoding.)
 
 3. **Variable-size field IDs** — Field ID size adapts based on distinct key count: 1 byte (<256 keys), 2 bytes (<65536), or 4 bytes. Size is recorded in the header. Most documents use 1-byte field IDs, saving significant space in child index arrays.
 
@@ -67,7 +67,7 @@ This design is influenced by Oracle's OSON binary format, described in:
 Every node starts with a 1-byte type tag:
 
 ```
-Array:      0x02  [subtree_size:u64] [elem_count:u32] [appended_bytes:u32]
+Array:      0x02  [subtree_size:u64] [elem_count:u32] [appended_bytes:u32]   (LEGACY — read-only, see below)
                   [elem_index: (type_flags:u8, offset:u64, size:u64) x elem_count]
                   [elements: contiguous depth-first values]
 
@@ -89,7 +89,9 @@ Container nodes have a fixed header followed by a sorted child index and a child
 - **Array header**: 17 bytes (`ARRAY_HEADER_SIZE`). Element index entries are 17 bytes each (`ARRAY_INDEX_ENTRY_SIZE`).
 - **Collection header**: 29 bytes (`COLLECTION_HEADER_SIZE`). Child index entries are 25 bytes each (`COLLECTION_INDEX_ENTRY_SIZE`).
 
-All JSON objects use **TYPE_COLLECTION**. Some collections happen to have only dictionary-resolvable keys (structural fields like `"name"`, `"score"`) and some have push-ID keys (`"-Mabc123"`); the distinction is handled at the key-encoding level (see below).
+All containers — JSON objects **and arrays** — use **TYPE_COLLECTION**. Arrays carry no native type: they are stored as integer-keyed collections (`{"0":…,"1":…}`) and rendered back as JSON arrays only at the read/wire boundary (see the array contract in `arc_value.rs`). **`TYPE_ARRAY` (0x02) is legacy and read-only** — the writer never emits it, but the reader and compactor still decode pre-existing array nodes, converting them to integer-keyed objects on read. Such nodes persist on disk (compaction preserves the tag) until the path is next written, at which point they're rewritten as `TYPE_COLLECTION`.
+
+Some collections happen to have only dictionary-resolvable keys (structural fields like `"name"`, `"score"`) and some have push-ID keys (`"-Mabc123"`); the distinction is handled at the key-encoding level (see below).
 
 **Type tag in the index entry, not at child offset.** Each entry in a parent's `child_index` / `elem_index` carries the child's `type_flags:u8`, `offset:u64`, and `size:u64`. The child's offset is found *without* reading the child first. This means type+size live in the parent index, so navigation never reads a child node just to learn its type/size.
 

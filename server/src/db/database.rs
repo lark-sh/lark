@@ -1519,7 +1519,7 @@ impl Database {
                     // - If a child were deleted, it is correctly absent.
                     //
                     // IMPORTANT: only write the Null marker if the parent is an Object.
-                    // If the parent is a primitive (Null/Bool/Number/String) or Array,
+                    // If the parent is a primitive (Null/Bool/Number/String),
                     // the child definitively doesn't exist, but `set_arc_uncleaned_lazy`
                     // would clobber the primitive into a Sentinel container (see
                     // ArcValue::set_path_mut_sentinel's primitive branch), corrupting
@@ -1536,7 +1536,7 @@ impl Database {
                             return Ok(false);
                         }
                         if !parent_node.is_sentinel() {
-                            // Parent is a primitive or Array — child can't exist.
+                            // Parent is a primitive — child can't exist.
                             // No marker write (would corrupt parent). No blob read.
                             return Ok(false);
                         }
@@ -1632,7 +1632,7 @@ impl Database {
                 }
                 None => {
                     // Same parent-container check as in promote_path: only write the
-                    // Null marker when the parent is an Object. A primitive/Array
+                    // Null marker when the parent is an Object. A primitive
                     // parent means the child definitively doesn't exist, but writing
                     // Null through `set_path_mut_sentinel` would clobber the parent
                     // into a Sentinel — see comment in promote_path for the full
@@ -1798,7 +1798,7 @@ impl Database {
                 // tree-state check and now, walking through it (whether
                 // from `promote_path_unchecked` or a bare marker write)
                 // would silently destroy the primitive's value. Walk up
-                // first; if any ancestor is primitive/Array, skip the
+                // first; if any ancestor is primitive, skip the
                 // promotion entirely. The next read re-evaluates and
                 // arrives at the right answer via the WAL/blob.
                 //
@@ -4671,7 +4671,7 @@ impl Database {
             let tree = self.tree.read().unwrap();
             match tree.get(path) {
                 Some(node) if !node.is_sentinel() => {
-                    if !node.is_object() && !node.is_array() {
+                    if !node.is_object() {
                         // Path is a primitive in the tree — return it directly
                         let val = node.clone();
                         drop(tree);
@@ -4681,7 +4681,7 @@ impl Database {
                     // Container — build shallow map from children
                     for key in node.keys() {
                         if let Some(child) = node.get(key) {
-                            let shallow_val = if child.is_object() || child.is_array() {
+                            let shallow_val = if child.is_object() {
                                 size_marker(child.estimate_size() as u64)
                             } else {
                                 child.clone()
@@ -4854,7 +4854,7 @@ impl Database {
                 }
                 let tree = self.tree.read().unwrap();
                 if let Some(node) = tree.get(path) {
-                    if !node.is_object() && !node.is_array() {
+                    if !node.is_object() {
                         let val = node.clone();
                         drop(tree);
                         self.metrics.record_read();
@@ -4862,7 +4862,7 @@ impl Database {
                     }
                     for key in node.keys() {
                         if let Some(child) = node.get(key) {
-                            let shallow_val = if child.is_object() || child.is_array() {
+                            let shallow_val = if child.is_object() {
                                 size_marker(child.estimate_size() as u64)
                             } else {
                                 child.clone()

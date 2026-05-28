@@ -93,58 +93,6 @@ fn serialize_value(value: &ArcValue, ctx: &mut WriteContext) -> Result<usize> {
             serialize_collection(map, ctx, node_start)?;
         }
 
-        ArcValue::Array(arr) => {
-            // Type tag
-            ctx.buf.push(TYPE_ARRAY);
-
-            // Placeholder for subtree_size (u64)
-            let subtree_size_pos = ctx.buf.len();
-            ctx.buf.extend_from_slice(&0u64.to_le_bytes());
-
-            // elem_count (u32)
-            let elem_count = arr.len() as u32;
-            ctx.buf.extend_from_slice(&elem_count.to_le_bytes());
-
-            // appended_bytes (u32) — starts at 0 for a fresh blob
-            ctx.buf.extend_from_slice(&0u32.to_le_bytes());
-
-            // Placeholder for elem_index: (type_flags:1, offset:8, size:8) per element
-            let elem_index_start = ctx.buf.len();
-            ctx.buf
-                .resize(elem_index_start + arr.len() * ARRAY_INDEX_ENTRY_SIZE, 0);
-
-            // Elements area starts right after index
-            let elements_area_start = ctx.buf.len();
-
-            // Serialize each element, recording offsets, types, and sizes
-            let mut elem_info: Vec<(u64, u8, u64)> = Vec::with_capacity(arr.len()); // (offset, type_tag, size)
-            for elem in arr.iter() {
-                let rel_offset = (ctx.buf.len() - elements_area_start) as u64;
-                let elem_start = ctx.buf.len();
-                serialize_value(elem, ctx)?;
-                let type_tag = ctx.buf[elem_start]; // First byte is the type tag
-                let elem_size = (ctx.buf.len() - elem_start) as u64;
-                elem_info.push((rel_offset, type_tag, elem_size));
-            }
-
-            // Backpatch elem_index with type_flags, offsets, and sizes
-            for (i, &(rel_offset, type_tag, size)) in elem_info.iter().enumerate() {
-                let entry_pos = elem_index_start + i * ARRAY_INDEX_ENTRY_SIZE;
-                // type_flags (1 byte) - fresh blob: not dirty, not forwarded
-                let type_flags = make_type_flags(type_tag, false);
-                ctx.buf[entry_pos] = type_flags;
-                // offset (8 bytes)
-                ctx.buf[entry_pos + 1..entry_pos + 9].copy_from_slice(&rel_offset.to_le_bytes());
-                // size (8 bytes)
-                ctx.buf[entry_pos + 9..entry_pos + 17].copy_from_slice(&size.to_le_bytes());
-            }
-
-            // Backpatch subtree_size
-            let subtree_size = (ctx.buf.len() - node_start) as u64;
-            ctx.buf[subtree_size_pos..subtree_size_pos + 8]
-                .copy_from_slice(&subtree_size.to_le_bytes());
-        }
-
         ArcValue::String(s) => {
             ctx.buf.push(TYPE_STRING);
             let bytes = s.as_bytes();

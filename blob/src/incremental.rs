@@ -1633,7 +1633,6 @@ mod tests {
             }
             ArcValue::Number(n) => format!("Number({})", n),
             ArcValue::Object(map) => format!("Object({} keys)", map.len()),
-            ArcValue::Array(arr) => format!("Array({} elems)", arr.len()),
             _ => format!("{:?}", v),
         }
     }
@@ -1650,13 +1649,6 @@ mod tests {
             (ArcValue::Number(na), ArcValue::Number(nb)) => {
                 // -0.0 and 0.0: both as_f64() == 0.0 but serde_json treats them as different
                 na.as_f64() == Some(0.0) && nb.as_f64() == Some(0.0)
-            }
-            (ArcValue::Array(aa), ArcValue::Array(ab)) => {
-                aa.len() == ab.len()
-                    && aa
-                        .iter()
-                        .zip(ab.iter())
-                        .all(|(x, y)| values_equal_ignore_neg_zero(x, y))
             }
             (ArcValue::Object(oa), ArcValue::Object(ob)) => {
                 oa.len() == ob.len()

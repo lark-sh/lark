@@ -601,9 +601,6 @@ fn arc_value_to_json(v: &lark_blob::ArcValue) -> Value {
             }
             Value::Object(out)
         }
-        lark_blob::ArcValue::Array(items) => {
-            Value::Array(items.iter().map(arc_value_to_json).collect())
-        }
         lark_blob::ArcValue::Sentinel(_) => Value::Null,
     }
 }

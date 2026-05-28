@@ -2,6 +2,24 @@
 //!
 //! Canonical source for both lark-blob and lark-server. lark-server should depend
 //! on this crate and use `lark_blob::ArcValue` instead of maintaining a copy.
+//!
+//! ## Array contract
+//!
+//! There is no array type. A JSON array is stored as an integer-keyed object —
+//! `["a","b"]` becomes `{"0":"a","1":"b"}` — so the whole engine (paths, writes,
+//! rules, subscriptions, WAL) addresses everything uniformly by string key, and a
+//! partial write like `/items/0/x` preserves its siblings for free.
+//!
+//! Arrays exist only at the read/wire boundary. `to_value()` and the `Serialize`
+//! impl render an object as a JSON array when it is non-empty, every key is a
+//! canonical non-negative integer, and `maxKey < 2 * numKeys`; otherwise it stays
+//! an object. Absent indices in `[0, maxKey]` read back as `null`. Ingest
+//! (`from_value`, `from_value_cleaned`, `clean`) does the reverse — arrays are
+//! flattened to integer keys. A `null` write deletes its target, so stored data
+//! never contains nulls: array gaps are simply absent keys.
+//!
+//! On disk, arrays are written as `TYPE_COLLECTION`. The legacy `TYPE_ARRAY` tag
+//! is read-only — decoded to an integer-keyed object — for migrating old blobs.
 
 use serde::ser::{Error as SerError, SerializeMap, SerializeSeq};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -12,7 +30,8 @@ use std::sync::Arc;
 /// An immutable, reference-counted JSON value with copy-on-write semantics.
 ///
 /// Primitives (Null, Bool, Number) are stored inline with no Arc overhead.
-/// Strings, Arrays, and Objects are wrapped in Arc for O(1) cloning.
+/// Strings and Objects are wrapped in Arc for O(1) cloning. (There is no array
+/// variant — see the array contract in the module docs.)
 ///
 /// `Sentinel` is an in-memory-only marker meaning "this node exists in blob storage
 /// but its value hasn't been loaded into memory." It is never serialized to blob or JSON.
@@ -24,7 +43,6 @@ pub enum ArcValue {
     Bool(bool),
     Number(Number),
     String(Arc<str>),
-    Array(Arc<Vec<ArcValue>>),
     Object(Arc<HashMap<String, ArcValue>>),
     /// Marker: node exists in blob storage but full value hasn't been loaded.
     /// May contain children from in-memory writes that pass through this node.
@@ -41,9 +59,16 @@ impl ArcValue {
             Value::Bool(b) => ArcValue::Bool(b),
             Value::Number(n) => ArcValue::Number(n),
             Value::String(s) => ArcValue::String(Arc::from(s)),
+            // Arrays are stored as integer-keyed maps, keyed by element index;
+            // null elements are dropped, leaving their index as a gap.
             Value::Array(arr) => {
-                let converted: Vec<ArcValue> = arr.into_iter().map(ArcValue::from_value).collect();
-                ArcValue::Array(Arc::new(converted))
+                let converted: HashMap<String, ArcValue> = arr
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, v)| !v.is_null())
+                    .map(|(i, v)| (i.to_string(), ArcValue::from_value(v)))
+                    .collect();
+                ArcValue::Object(Arc::new(converted))
             }
             Value::Object(map) => {
                 let converted: HashMap<String, ArcValue> = map
@@ -61,15 +86,7 @@ impl ArcValue {
             ArcValue::Bool(b) => Value::Bool(*b),
             ArcValue::Number(n) => Value::Number(n.clone()),
             ArcValue::String(s) => Value::String(s.to_string()),
-            ArcValue::Array(arr) => {
-                let converted: Vec<Value> = arr.iter().map(|v| v.to_value()).collect();
-                Value::Array(converted)
-            }
-            ArcValue::Object(map) => {
-                let converted: Map<String, Value> =
-                    map.iter().map(|(k, v)| (k.clone(), v.to_value())).collect();
-                Value::Object(converted)
-            }
+            ArcValue::Object(map) => object_to_value(map),
         }
     }
 
@@ -83,8 +100,6 @@ impl ArcValue {
         match self {
             ArcValue::Sentinel(_) => true,
             ArcValue::Object(map) => map.values().any(|v| v.contains_sentinel()),
-            // Arrays shouldn't contain Sentinels in practice, but check anyway
-            ArcValue::Array(arr) => arr.iter().any(|v| v.contains_sentinel()),
             _ => false,
         }
     }
@@ -102,18 +117,6 @@ impl ArcValue {
                         let len = path.len();
                         path.push('/');
                         path.push_str(k);
-                        if walk(v, path) {
-                            return true;
-                        }
-                        path.truncate(len);
-                    }
-                    false
-                }
-                ArcValue::Array(arr) => {
-                    for (i, v) in arr.iter().enumerate() {
-                        let len = path.len();
-                        path.push('/');
-                        path.push_str(&i.to_string());
                         if walk(v, path) {
                             return true;
                         }
@@ -141,10 +144,6 @@ impl ArcValue {
         ArcValue::Object(Arc::new(HashMap::new()))
     }
 
-    pub fn empty_array() -> Self {
-        ArcValue::Array(Arc::new(Vec::new()))
-    }
-
     pub fn empty_sentinel() -> Self {
         ArcValue::Sentinel(Arc::new(HashMap::new()))
     }
@@ -165,13 +164,6 @@ impl ArcValue {
         }
     }
 
-    pub fn get_index(&self, index: usize) -> Option<&ArcValue> {
-        match self {
-            ArcValue::Array(arr) => arr.get(index),
-            _ => None,
-        }
-    }
-
     pub fn get_path(&self, path: &[&str]) -> Option<&ArcValue> {
         let mut current = self;
         for segment in path {
@@ -188,10 +180,6 @@ impl ArcValue {
         matches!(self, ArcValue::Object(_))
     }
 
-    pub fn is_array(&self) -> bool {
-        matches!(self, ArcValue::Array(_))
-    }
-
     pub fn is_primitive(&self) -> bool {
         matches!(
             self,
@@ -202,7 +190,6 @@ impl ArcValue {
     pub fn is_empty_container(&self) -> bool {
         match self {
             ArcValue::Object(map) => map.is_empty(),
-            ArcValue::Array(arr) => arr.is_empty(),
             ArcValue::Null => true,
             // Sentinel is never "empty" — it represents data in blob
             _ => false,
@@ -212,7 +199,6 @@ impl ArcValue {
     pub fn len(&self) -> usize {
         match self {
             ArcValue::Object(map) => map.len(),
-            ArcValue::Array(arr) => arr.len(),
             _ => 0, // Sentinel returns 0 — caller must promote first
         }
     }
@@ -232,13 +218,6 @@ impl ArcValue {
         match self {
             ArcValue::Object(map) => ObjectIter::Some(map.iter()),
             _ => ObjectIter::None, // Sentinel returns empty — caller must promote first
-        }
-    }
-
-    pub fn array_iter(&self) -> impl Iterator<Item = &ArcValue> {
-        match self {
-            ArcValue::Array(arr) => ArrayIter::Some(arr.iter()),
-            _ => ArrayIter::None,
         }
     }
 
@@ -277,20 +256,12 @@ impl ArcValue {
         }
     }
 
-    pub fn as_array(&self) -> Option<&Vec<ArcValue>> {
-        match self {
-            ArcValue::Array(arr) => Some(arr),
-            _ => None,
-        }
-    }
-
     pub fn ptr_eq(&self, other: &ArcValue) -> bool {
         match (self, other) {
             (ArcValue::Null, ArcValue::Null) => true,
             (ArcValue::Bool(a), ArcValue::Bool(b)) => a == b,
             (ArcValue::Number(a), ArcValue::Number(b)) => a == b,
             (ArcValue::String(a), ArcValue::String(b)) => Arc::ptr_eq(a, b),
-            (ArcValue::Array(a), ArcValue::Array(b)) => Arc::ptr_eq(a, b),
             (ArcValue::Object(a), ArcValue::Object(b)) => Arc::ptr_eq(a, b),
             (ArcValue::Sentinel(a), ArcValue::Sentinel(b)) => Arc::ptr_eq(a, b),
             _ => false,
@@ -395,10 +366,10 @@ impl ArcValue {
     /// promotion before they can be treated as authoritative.
     ///
     /// **WARNING — primitive clobber:** if any node along `path` (including `self`)
-    /// is a primitive (Null/Bool/Number/String) or Array, it is silently replaced
-    /// with a new `Sentinel` container to hold the write. This is the correct
-    /// Firebase SET semantic for client writes (writing `/a/b/c` replaces `/a/b`
-    /// if it was a primitive), but is dangerous for internal "we checked" marker
+    /// is a primitive (Null/Bool/Number/String), it is silently replaced with a
+    /// new `Sentinel` container to hold the write. This is the SET semantic for
+    /// client writes (writing `/a/b/c` replaces `/a/b` if it was a primitive),
+    /// but is dangerous for internal "we checked" marker
     /// writes — the newly-created Sentinel is not recorded in any tracking set,
     /// so a subsequent read of the primitive's path returns the untracked Sentinel
     /// and fails to serialize. See `Database::promote_path` / `promote_path_deep`
@@ -561,7 +532,6 @@ impl ArcValue {
         match self {
             ArcValue::Null => false,
             ArcValue::Object(map) => !map.is_empty(),
-            ArcValue::Array(arr) => !arr.is_empty(),
             ArcValue::Sentinel(_) => false, // Caller must promote before checking existence
             _ => true,
         }
@@ -588,21 +558,6 @@ impl ArcValue {
                     Some(ArcValue::Object(Arc::new(cleaned)))
                 }
             }
-            ArcValue::Array(arr) => {
-                if arr.is_empty() {
-                    return None;
-                }
-                let cleaned: Vec<ArcValue> = arr
-                    .iter()
-                    .map(|v| v.clone().clean().unwrap_or(ArcValue::Null))
-                    .collect();
-                let has_non_null = cleaned.iter().any(|v| !v.is_null());
-                if !has_non_null {
-                    None
-                } else {
-                    Some(ArcValue::Array(Arc::new(cleaned)))
-                }
-            }
             ArcValue::Sentinel(_) => Some(self), // Sentinel is never cleaned away
             other => Some(other),
         }
@@ -614,19 +569,20 @@ impl ArcValue {
             Value::Bool(b) => Some(ArcValue::Bool(b)),
             Value::Number(n) => Some(ArcValue::Number(n)),
             Value::String(s) => Some(ArcValue::String(Arc::from(s))),
+            // Stored as an integer-keyed map; null/empty elements are dropped and
+            // their indices become gaps.
             Value::Array(arr) => {
-                if arr.is_empty() {
-                    return None;
-                }
-                let cleaned: Vec<ArcValue> = arr
+                let cleaned: HashMap<String, ArcValue> = arr
                     .into_iter()
-                    .map(|v| ArcValue::from_value_cleaned(v).unwrap_or(ArcValue::Null))
+                    .enumerate()
+                    .filter_map(|(i, v)| {
+                        ArcValue::from_value_cleaned(v).map(|cv| (i.to_string(), cv))
+                    })
                     .collect();
-                let has_non_null = cleaned.iter().any(|v| !v.is_null());
-                if !has_non_null {
+                if cleaned.is_empty() {
                     None
                 } else {
-                    Some(ArcValue::Array(Arc::new(cleaned)))
+                    Some(ArcValue::Object(Arc::new(cleaned)))
                 }
             }
             Value::Object(map) => {
@@ -652,16 +608,6 @@ impl ArcValue {
             ArcValue::Bool(_) => 5,
             ArcValue::Number(_) => 12,
             ArcValue::String(s) => s.len() as i64 + 2,
-            ArcValue::Array(arr) => {
-                let mut size: i64 = 2;
-                for (i, child) in arr.iter().enumerate() {
-                    if i > 0 {
-                        size += 1;
-                    }
-                    size += child.estimate_size();
-                }
-                size
-            }
             ArcValue::Object(map) => {
                 let mut size: i64 = 2;
                 let mut first = true;
@@ -717,21 +663,6 @@ impl<'a> Iterator for ObjectIter<'a> {
     }
 }
 
-enum ArrayIter<'a> {
-    Some(std::slice::Iter<'a, ArcValue>),
-    None,
-}
-
-impl<'a> Iterator for ArrayIter<'a> {
-    type Item = &'a ArcValue;
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            ArrayIter::Some(iter) => iter.next(),
-            ArrayIter::None => None,
-        }
-    }
-}
-
 impl PartialEq for ArcValue {
     fn eq(&self, other: &Self) -> bool {
         if self.ptr_eq(other) {
@@ -743,7 +674,6 @@ impl PartialEq for ArcValue {
             (ArcValue::Bool(a), ArcValue::Bool(b)) => a == b,
             (ArcValue::Number(a), ArcValue::Number(b)) => a == b,
             (ArcValue::String(a), ArcValue::String(b)) => a == b,
-            (ArcValue::Array(a), ArcValue::Array(b)) => a == b,
             (ArcValue::Object(a), ArcValue::Object(b)) => a == b,
             _ => false,
         }
@@ -762,20 +692,31 @@ impl Serialize for ArcValue {
             ArcValue::Bool(b) => serializer.serialize_bool(*b),
             ArcValue::Number(n) => n.serialize(serializer),
             ArcValue::String(s) => serializer.serialize_str(s),
-            ArcValue::Array(arr) => {
-                let mut seq = serializer.serialize_seq(Some(arr.len()))?;
-                for item in arr.iter() {
-                    seq.serialize_element(item)?;
+            ArcValue::Object(map) => match array_max_index(map) {
+                Some(max) => {
+                    let len = (max as usize) + 1;
+                    let mut slots: Vec<Option<&ArcValue>> = vec![None; len];
+                    for (k, v) in map.iter() {
+                        let i: usize = k.parse().expect("canonical integer key");
+                        slots[i] = Some(v);
+                    }
+                    let mut seq = serializer.serialize_seq(Some(len))?;
+                    for slot in slots {
+                        match slot {
+                            Some(v) => seq.serialize_element(v)?,
+                            None => seq.serialize_element(&Value::Null)?,
+                        }
+                    }
+                    seq.end()
                 }
-                seq.end()
-            }
-            ArcValue::Object(map) => {
-                let mut obj = serializer.serialize_map(Some(map.len()))?;
-                for (k, v) in map.iter() {
-                    obj.serialize_entry(k, v)?;
+                None => {
+                    let mut obj = serializer.serialize_map(Some(map.len()))?;
+                    for (k, v) in map.iter() {
+                        obj.serialize_entry(k, v)?;
+                    }
+                    obj.end()
                 }
-                obj.end()
-            }
+            },
             ArcValue::Sentinel(_) => Err(S::Error::custom(
                 "attempted to serialize ArcValue::Sentinel — sentinels are in-memory only",
             )),
@@ -791,6 +732,47 @@ impl<'de> Deserialize<'de> for ArcValue {
         let value = Value::deserialize(deserializer)?;
         Ok(ArcValue::from_value(value))
     }
+}
+
+/// Convert a stored object map to JSON, rendering it as an array when it is
+/// non-empty, every key is a canonical non-negative integer, and
+/// `maxKey < 2 * numKeys`. Otherwise it renders as an object. When rendered as
+/// an array, absent indices in `[0, maxKey]` are filled with `null`.
+fn object_to_value(map: &HashMap<String, ArcValue>) -> Value {
+    match array_max_index(map) {
+        Some(max) => {
+            let mut arr = vec![Value::Null; (max as usize) + 1];
+            for (k, v) in map.iter() {
+                // array_max_index guarantees every key parses as an index.
+                let i: usize = k.parse().expect("canonical integer key");
+                arr[i] = v.to_value();
+            }
+            Value::Array(arr)
+        }
+        None => {
+            let converted: Map<String, Value> =
+                map.iter().map(|(k, v)| (k.clone(), v.to_value())).collect();
+            Value::Object(converted)
+        }
+    }
+}
+
+/// Returns `Some(maxKey)` when `map` should render as an array, else `None`.
+/// A key is a canonical integer only if it equals the plain decimal form of its
+/// value (rejects leading zeros, signs, non-numeric, and empty keys).
+fn array_max_index(map: &HashMap<String, ArcValue>) -> Option<u64> {
+    if map.is_empty() {
+        return None;
+    }
+    let mut max: u64 = 0;
+    for k in map.keys() {
+        let n: u64 = k.parse().ok()?;
+        if *k != n.to_string() {
+            return None;
+        }
+        max = max.max(n);
+    }
+    ((max as u128) < 2 * (map.len() as u128)).then_some(max)
 }
 
 impl From<Value> for ArcValue {
@@ -847,12 +829,6 @@ impl From<String> for ArcValue {
     }
 }
 
-impl<T: Into<ArcValue>> From<Vec<T>> for ArcValue {
-    fn from(arr: Vec<T>) -> Self {
-        ArcValue::Array(Arc::new(arr.into_iter().map(Into::into).collect()))
-    }
-}
-
 impl<T: Into<ArcValue>> From<HashMap<String, T>> for ArcValue {
     fn from(map: HashMap<String, T>) -> Self {
         ArcValue::Object(Arc::new(
@@ -893,10 +869,12 @@ mod tests {
 
     #[test]
     fn test_from_value_array() {
+        // Arrays are stored as integer-keyed objects, and render back as arrays.
         let v = ArcValue::from_value(json!([1, 2, 3]));
-        assert!(v.is_array());
-        assert_eq!(v.len(), 3);
-        assert_eq!(v.get_index(0).unwrap().as_i64(), Some(1));
+        assert!(v.is_object());
+        assert_eq!(v.get("0").unwrap().as_i64(), Some(1));
+        assert_eq!(v.get("2").unwrap().as_i64(), Some(3));
+        assert_eq!(v.to_value(), json!([1, 2, 3]));
     }
 
     #[test]
