@@ -732,6 +732,15 @@ impl ViewManager {
         query_params: Option<&QueryParams>,
         conn: Arc<dyn ConnectionSender>,
     ) -> Result<String, SubscribeError> {
+        // Canonicalize the subscribe path so it indexes into `by_path` under
+        // the same form `broadcast_mutation` normalizes mutation paths to.
+        // Without this, a mutation broadcast at `"/foo"` would miss a subscriber
+        // who subscribed via `"/foo/"` (trailing slash) or `"foo"` (no leading
+        // slash) — the raw-string prefix match in `find_affected_shared_views`
+        // is exact on the key form, so both sides must agree on canonical.
+        let path_owned = crate::db::path::normalize_path(path);
+        let path = path_owned.as_str();
+
         let query = match query_params {
             Some(p) => p.to_query()?,
             None => Query::default(),

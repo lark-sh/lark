@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{TestServer, run_test};
+use common::{QueryOptions, TestServer, run_test};
 use serde_json::json;
 use std::time::Duration;
 
@@ -147,6 +147,145 @@ fn test_write_echo_arrives_before_ack() {
              Expected event before ACK for correct optimistic UI behavior.",
             put_idx,
             ack_idx
+        );
+    });
+}
+
+// =============================================================================
+// Multi-path Update Echo
+// =============================================================================
+//
+// These two tests pin down a real-world bug: a logged-in user
+// posts → `writeNewPost` issues `update(ref(db), { "/posts/<id>": ..., "/user-posts/<uid>/<id>": ... })`
+// (a multi-path update at root with two paths-as-keys) → the SDK applies the
+// write optimistically and the UI shows the post → the server acks with `ok`
+// but never echoes a data event for the `/posts` subscription → the SDK clears
+// the optimistic write on ack, recomputes its view from the canonical (now
+// stale) server state, and fires `child_removed`, making the post disappear
+// until a page reload pulls fresh state.
+
+#[test]
+fn test_multi_path_update_echoes_to_writers_own_query_subscription() {
+    run_test(|| async {
+        let server = TestServer::new();
+        let mut client = server.client();
+        client.connect("multi-path-echo-query").await;
+
+        client
+            .subscribe_with_query(
+                "/posts",
+                &["value"],
+                QueryOptions {
+                    order_by_child: Some("starCount".to_string()),
+                    limit_to_last: Some(100),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("Failed to subscribe");
+
+        // Drain the initial-snapshot event so we only assert against
+        // anything triggered by the upcoming write.
+        let _ = client.wait_for_event(Duration::from_secs(1)).await;
+        client.clear_raw_messages().await;
+
+        client
+            .update(
+                "/",
+                json!({
+                    "/posts/post1": {
+                        "author": "Alice",
+                        "uid": "user1",
+                        "title": "Hello",
+                        "body": "First post",
+                        "starCount": 0,
+                    },
+                    "/user-posts/user1/post1": {
+                        "author": "Alice",
+                        "uid": "user1",
+                        "title": "Hello",
+                        "body": "First post",
+                        "starCount": 0,
+                    },
+                }),
+            )
+            .await
+            .expect("Multi-path update should succeed");
+
+        // Give the broadcast a moment to fan out.
+        glommio::timer::sleep(Duration::from_millis(50)).await;
+
+        let msgs = client.get_raw_messages().await;
+        let got_posts_event = msgs.iter().any(|m| {
+            (m.event.as_deref() == Some("put") || m.event.as_deref() == Some("patch"))
+                && m.subscription_path.as_deref() == Some("/posts")
+        });
+
+        assert!(
+            got_posts_event,
+            "/posts query subscription received no put/patch echo for the new \
+             child written via a multi-path update at root. Without this, the \
+             SDK clears its optimistic write on ack and the new \
+             post vanishes from the UI until reload. Received messages: {:?}",
+            msgs
+        );
+    });
+}
+
+#[test]
+fn test_single_path_set_echoes_to_writers_own_query_subscription() {
+    // Control for the multi-path case above: identical setup but the write
+    // is a direct `set` on the child, not a root-level multi-path update.
+    // If this passes and the multi-path test fails, the bug is specific to
+    // multi-path updates, not query views.
+    run_test(|| async {
+        let server = TestServer::new();
+        let mut client = server.client();
+        client.connect("single-path-echo-query").await;
+
+        client
+            .subscribe_with_query(
+                "/posts",
+                &["value"],
+                QueryOptions {
+                    order_by_child: Some("starCount".to_string()),
+                    limit_to_last: Some(100),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("Failed to subscribe");
+
+        let _ = client.wait_for_event(Duration::from_secs(1)).await;
+        client.clear_raw_messages().await;
+
+        client
+            .set(
+                "/posts/post1",
+                json!({
+                    "author": "Alice",
+                    "uid": "user1",
+                    "title": "Hello",
+                    "body": "First post",
+                    "starCount": 0,
+                }),
+            )
+            .await
+            .expect("Set should succeed");
+
+        glommio::timer::sleep(Duration::from_millis(50)).await;
+
+        let msgs = client.get_raw_messages().await;
+        let got_posts_event = msgs.iter().any(|m| {
+            (m.event.as_deref() == Some("put") || m.event.as_deref() == Some("patch"))
+                && m.subscription_path.as_deref() == Some("/posts")
+        });
+
+        assert!(
+            got_posts_event,
+            "/posts query subscription received no put/patch echo for a direct \
+             child set. Received messages: {:?}",
+            msgs
         );
     });
 }
