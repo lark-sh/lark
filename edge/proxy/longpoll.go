@@ -56,7 +56,6 @@ package proxy
 import (
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
 	"fmt"
 	"net/http"
 	"sort"
@@ -969,11 +968,3 @@ func parseSegmentedData(query map[string][]string) ([][]byte, error) {
 	return [][]byte{decoded}, nil
 }
 
-// generateLPSessionID creates a random session ID for long polling
-func generateLPSessionID() string {
-	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		panic(err)
-	}
-	return hex.EncodeToString(b)
-}

@@ -123,32 +123,3 @@ func Error(message string, kvs ...interface{}) {
 	log(LevelError, message, kvs...)
 }
 
-// WithFields returns a FieldLogger with preset fields
-func WithFields(kvs ...interface{}) *FieldLogger {
-	return &FieldLogger{fields: kvs}
-}
-
-// FieldLogger is a logger with preset fields
-type FieldLogger struct {
-	fields []interface{}
-}
-
-// Debug logs a debug message with preset fields
-func (l *FieldLogger) Debug(message string, kvs ...interface{}) {
-	log(LevelDebug, message, append(l.fields, kvs...)...)
-}
-
-// Info logs an info message with preset fields
-func (l *FieldLogger) Info(message string, kvs ...interface{}) {
-	log(LevelInfo, message, append(l.fields, kvs...)...)
-}
-
-// Warn logs a warning message with preset fields
-func (l *FieldLogger) Warn(message string, kvs ...interface{}) {
-	log(LevelWarn, message, append(l.fields, kvs...)...)
-}
-
-// Error logs an error message with preset fields
-func (l *FieldLogger) Error(message string, kvs ...interface{}) {
-	log(LevelError, message, append(l.fields, kvs...)...)
-}

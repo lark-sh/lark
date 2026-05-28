@@ -85,7 +85,6 @@ package proxy
 import (
 	"bytes"
 	"errors"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -995,18 +994,6 @@ func (c *ClientConn) sendLarkAuthError(errMsg string) {
 	}
 	data, _ := sonic.Marshal(response)
 	c.sendDirect(data, true)
-}
-
-// handleFirebaseAuth validates auth and sends Auth OK response
-// Called asynchronously when Firebase client sends auth message
-// formatFirebaseRequestID converts a Firebase request ID (float64) to string
-func formatFirebaseRequestID(id float64) string {
-	return strconv.Itoa(int(id))
-}
-
-// parseInt parses a string to int, returning error if not a valid integer
-func parseInt(s string) (int, error) {
-	return strconv.Atoi(s)
 }
 
 // isAuthMessage checks if a message is an auth message that should be handled locally
