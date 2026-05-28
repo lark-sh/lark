@@ -534,7 +534,16 @@ func (s *Server) runWebTransport(port int) error {
 	}
 	defer udpConn.Close()
 
-	// Create WebTransport server
+	// Create WebTransport server.
+	//
+	// ConfigureHTTP3Server is mandatory and easy to miss: webtransport-go's
+	// Server.Serve does NOT call it for us. Without it, the H3 SETTINGS frame
+	// goes out with ENABLE_CONNECT_PROTOCOL=1 and H3_DATAGRAM=1 but no
+	// SETTINGS_WEBTRANSPORT_MAX_SESSIONS (0x2b603742) — Chrome reads that,
+	// concludes WebTransport isn't advertised, and aborts the session with
+	// net::ERR_METHOD_NOT_SUPPORTED before ever sending its extended CONNECT.
+	// ConfigureHTTP3Server also installs a ConnContext hook that wtServer.Upgrade
+	// needs to retrieve the underlying QUIC conn from the request context.
 	wtServer := &webtransport.Server{
 		H3: &http3.Server{
 			TLSConfig:       s.tlsConfig,
@@ -545,6 +554,7 @@ func (s *Server) runWebTransport(port int) error {
 		},
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
+	webtransport.ConfigureHTTP3Server(wtServer.H3)
 	s.wtServer = wtServer
 
 	// HTTP handler for WebTransport
