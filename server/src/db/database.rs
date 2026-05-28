@@ -5047,9 +5047,20 @@ impl Database {
         volatile: bool,
         writer_client_id: Option<&str>,
     ) {
+        // Canonicalize `event.path` before any downstream consumer sees it.
+        // `find_affected_shared_views` does raw string-prefix matching against
+        // `by_path` keys (which are themselves normalized at subscribe time);
+        // both sides must use the same canonical form or the prefix match
+        // silently misses. Tree storage canonicalizes via `Path::parse`, so a
+        // non-normalized callsite (e.g. firebase_adapter's translate_merge
+        // building `"//posts/X"` from `format!("/{}", "/posts/X")` when the
+        // base path is "/" and the key is `/`-prefixed would still store correctly but
+        // never notify its subscribers.
+        let path = crate::db::normalize_path(path);
+
         let event = MutationEvent {
             mutation_type: mutation_type.to_string(),
-            path: path.to_string(),
+            path,
             old_value: None, // We don't track old values for now
             new_value,
             updates,

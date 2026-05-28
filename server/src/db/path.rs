@@ -183,23 +183,28 @@ impl From<String> for Path {
     }
 }
 
-/// Normalize a path string: ensure leading slash, remove trailing slash.
+/// Normalize a path string: collapse any leading or trailing slashes to a
+/// single leading slash and no trailing slash.
 ///
-/// "" -> "/"
-/// "players" -> "/players"
-/// "/players/" -> "/players"
+/// ```text
+/// ""              -> "/"
+/// "/"             -> "/"
+/// "players"       -> "/players"
+/// "/players/"     -> "/players"
+/// "//players"     -> "/players"
+/// "//players//"   -> "/players"
+/// ```
+///
+/// **Internal empty segments are preserved** (e.g. `"/a//b"` stays `"/a//b"`):
+/// `validate_path` rejects those at the write boundary, so a request that
+/// reaches here has already been validated. Silently collapsing them would
+/// hide a future validate_path regression that lets one slip through.
 pub fn normalize_path(path: &str) -> String {
-    let n = path.len();
-    if n == 0 || path == "/" {
+    if path.is_empty() || path == "/" {
         return "/".to_string();
     }
 
-    // Fast path: already normalized
-    if path.starts_with('/') && !path.ends_with('/') {
-        return path.to_string();
-    }
-
-    // Trim leading and trailing slashes
+    // Trim leading and trailing slashes — any number of either.
     let trimmed = path.trim_matches('/');
     if trimmed.is_empty() {
         return "/".to_string();
@@ -375,6 +380,33 @@ mod tests {
     #[test]
     fn test_normalize_nested_with_trailing_slash() {
         assert_eq!(normalize_path("/players/abc/"), "/players/abc");
+    }
+
+    #[test]
+    fn test_normalize_collapses_doubled_leading_slashes() {
+        // Regression: an earlier "fast path" returned `"//foo"` unchanged
+        // because it satisfied `starts_with('/') && !ends_with('/')`. The
+        // doubled-slash form then leaked into `MutationEvent.path` where
+        // `find_affected_shared_views` does raw string-prefix matching,
+        // silently missing every subscription on `/foo`.
+        assert_eq!(normalize_path("//players"), "/players");
+        assert_eq!(normalize_path("///players"), "/players");
+        assert_eq!(normalize_path("//players//"), "/players");
+        assert_eq!(normalize_path("//posts/post1"), "/posts/post1");
+        assert_eq!(
+            normalize_path("//user-posts/user1/post1"),
+            "/user-posts/user1/post1"
+        );
+    }
+
+    #[test]
+    fn test_normalize_preserves_internal_empty_segments() {
+        // Validate-path rejects these at the write boundary; not silently
+        // collapsing them here means a future regression that lets one slip
+        // through stays visible (and routable to the same wrong place) rather
+        // than getting masked by canonicalization.
+        assert_eq!(normalize_path("/a//b"), "/a//b");
+        assert_eq!(normalize_path("/a//b/"), "/a//b");
     }
 
     // =========================================================================
