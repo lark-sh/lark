@@ -139,6 +139,24 @@ pub async fn verify_before_kill(
                         }
                     }
                 }
+                Some(ServerEvent::Nack {
+                    request_id, error, ..
+                }) => {
+                    // The server rejected the read outright (e.g. an invalid or
+                    // over-deep path). Surface it as a distinct violation rather
+                    // than letting the pending entry fall through to a 10s
+                    // "timeout" — a NACK on a supposedly-committed path is a real
+                    // signal, and a wrong one masquerading as a timeout is worse.
+                    if let Some((path, expected)) = pending_reads.remove(&request_id) {
+                        warn!("PRE-KILL: ONCE read for {} was NACKed: {}", path, error);
+                        result.missing_committed.push(ViolationInfo {
+                            path,
+                            expected_type: value_type_summary(&expected),
+                            actual_type: format!("NACK: {error}"),
+                            ack_age_secs: None,
+                        });
+                    }
+                }
                 Some(ServerEvent::Heartbeat) => {
                     let _ = client.send_heartbeat_ack().await;
                 }

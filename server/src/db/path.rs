@@ -5,6 +5,16 @@ use std::sync::Arc;
 /// Maximum bytes allowed for a single key segment.
 pub const MAX_KEY_BYTES: usize = 768;
 
+/// Maximum number of segments (depth) allowed in a path.
+///
+/// Per-segment size is capped by [`MAX_KEY_BYTES`], but without a depth cap a
+/// single message-sized path like `/a/a/a/…` would parse into millions of
+/// `Arc<str>` segments — CPU/allocation amplification bounded only by the
+/// transport message size. Enforced at the boundary in [`validate_path`]
+/// (allocation-free), the same place [`MAX_KEY_BYTES`] is enforced, rather than
+/// in the infallible [`Path::parse`].
+pub const MAX_PATH_DEPTH: usize = 32;
+
 /// A path in the database tree.
 ///
 /// Paths are sequences of string segments like "/users/abc/name".
@@ -282,10 +292,43 @@ pub fn validate_key(key: &str) -> Result<(), KeyError> {
     Ok(())
 }
 
-/// Validate all segments of a path.
+/// Number of segments in a path string, computed without allocating a `Path`
+/// (unlike `Path::parse(path).len()`). Uses the same tokenization as
+/// `Path::parse`/`validate_path`: trim surrounding slashes, then split on '/'.
+pub fn path_depth(path: &str) -> usize {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        0
+    } else {
+        trimmed.split('/').count()
+    }
+}
+
+/// Validate all segments of a path, and that the path is not too deep.
+///
+/// Operates directly on the string slice — it does **not** allocate a `Path`.
+/// This matters for the depth cap: a hostile `/a/a/a/…` path sized to the
+/// message limit would otherwise parse into millions of `Arc<str>` segments
+/// before any check ran. Here we walk the segments lazily and bail as soon as
+/// the depth exceeds [`MAX_PATH_DEPTH`], so the work is bounded to ~33 segments
+/// regardless of the input length.
 pub fn validate_path(path: &str) -> Result<(), KeyError> {
-    let parsed = Path::parse(path);
-    for segment in parsed.segments() {
+    // Mirror `Path::parse`: trim surrounding slashes, then split on '/'. Empty
+    // (root) is valid; internal empty segments are caught by `validate_key`.
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let mut depth = 0;
+    for segment in trimmed.split('/') {
+        depth += 1;
+        if depth > MAX_PATH_DEPTH {
+            return Err(KeyError {
+                key: String::new(),
+                reason: format!("path exceeds maximum depth of {} segments", MAX_PATH_DEPTH),
+            });
+        }
         validate_key(segment)?;
     }
     Ok(())
@@ -577,6 +620,74 @@ mod tests {
     #[test]
     fn test_validate_path_control_char() {
         assert!(validate_path("/users/ab\x00c").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_empty_and_root_ok() {
+        // Both the empty string and "/" denote the root and carry no segments.
+        assert!(validate_path("").is_ok());
+        assert!(validate_path("/").is_ok());
+        assert!(validate_path("///").is_ok()); // all-slashes trims to empty
+    }
+
+    #[test]
+    fn test_validate_path_agrees_with_path_parse_tokenization() {
+        // `validate_path` deliberately re-implements `Path::parse`'s tokenization
+        // (trim surrounding slashes, split on '/') without allocating, so it can
+        // bail early on depth. This guards that the two stay in lockstep: for any
+        // input within the depth cap, accepting iff every parsed segment is a
+        // valid key. If a future edit diverges the tokenizers, this fails.
+        let cases = [
+            "",
+            "/",
+            "//",
+            "/users",
+            "users",
+            "/users/",
+            "//users//",
+            "/users/abc/name",
+            "/users/123/.priority",
+            "/a//b",        // internal empty → invalid
+            "users//abc",   // internal empty → invalid
+            "/a/b#c/d",     // invalid char in a middle segment
+            "/ok/ab.c",     // dot in middle → invalid
+            "/space bar/x", // spaces are allowed
+        ];
+        for input in cases {
+            let parsed = Path::parse(input);
+            // Reference decision: valid iff within depth and all segments valid.
+            let expected = parsed.segments().len() <= MAX_PATH_DEPTH
+                && parsed.segments().iter().all(|s| validate_key(s).is_ok());
+            assert_eq!(
+                validate_path(input).is_ok(),
+                expected,
+                "validate_path disagreed with Path::parse tokenization for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_path_at_max_depth_ok() {
+        // Exactly MAX_PATH_DEPTH segments is allowed.
+        let path = format!("/{}", vec!["a"; MAX_PATH_DEPTH].join("/"));
+        assert!(validate_path(&path).is_ok());
+    }
+
+    #[test]
+    fn test_validate_path_exceeding_max_depth_rejected() {
+        // One past the cap is rejected with a depth error.
+        let path = format!("/{}", vec!["a"; MAX_PATH_DEPTH + 1].join("/"));
+        let err = validate_path(&path).expect_err("over-deep path must be rejected");
+        assert!(err.reason.contains("maximum depth"), "got: {}", err.reason);
+    }
+
+    #[test]
+    fn test_validate_path_pathologically_deep_rejected() {
+        // The amplification case: a huge path must be rejected (and, by
+        // construction, validate_path bails after ~MAX_PATH_DEPTH segments
+        // rather than allocating one Arc<str> per segment).
+        let path = format!("/{}", vec!["a"; 100_000].join("/"));
+        assert!(validate_path(&path).is_err());
     }
 
     #[test]
