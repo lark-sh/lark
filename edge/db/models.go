@@ -16,9 +16,13 @@ type Project struct {
 	AutoCreate            bool   `json:"auto_create"`
 	FirebaseCompatEnabled bool   `json:"firebase_compat_enabled"`
 	FirebaseProjectID     string `json:"firebase_project_id"`
-	ConfigVersion         int64  `json:"config_version"`
-	CreatedAt             int64  `json:"created_at"`
-	UpdatedAt             int64  `json:"updated_at"`
+	// Enabled gates whether databases for this project may run. When false,
+	// the server refuses to start the project's databases and evicts any that
+	// are already running. Not exposed through the admin API.
+	Enabled       bool  `json:"-"`
+	ConfigVersion int64 `json:"config_version"`
+	CreatedAt     int64 `json:"created_at"`
+	UpdatedAt     int64 `json:"updated_at"`
 }
 
 // Server represents a backend database server.

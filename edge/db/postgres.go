@@ -269,13 +269,13 @@ func (db *PostgresDB) GetProjectByID(ctx context.Context, id string) (*Project, 
 	err := db.pool.QueryRow(ctx, `
 		SELECT id, name, secret_key, admin_secret_key, rules_json,
 		       ephemeral, auto_create, firebase_compat_enabled,
-		       firebase_project_id,
+		       firebase_project_id, enabled,
 		       config_version, created_at, updated_at
 		FROM projects WHERE id = $1
 	`, id).Scan(
 		&p.ID, &p.Name, &p.SecretKey, &p.AdminSecretKey, &p.RulesJSON,
 		&p.Ephemeral, &p.AutoCreate, &p.FirebaseCompatEnabled,
-		&p.FirebaseProjectID,
+		&p.FirebaseProjectID, &p.Enabled,
 		&p.ConfigVersion, &p.CreatedAt, &p.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -291,7 +291,7 @@ func (db *PostgresDB) ListProjects(ctx context.Context) ([]*Project, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT id, name, secret_key, admin_secret_key, rules_json,
 		       ephemeral, auto_create, firebase_compat_enabled,
-		       firebase_project_id,
+		       firebase_project_id, enabled,
 		       config_version, created_at, updated_at
 		FROM projects ORDER BY created_at ASC
 	`)
@@ -306,7 +306,7 @@ func (db *PostgresDB) ListProjects(ctx context.Context) ([]*Project, error) {
 		err := rows.Scan(
 			&p.ID, &p.Name, &p.SecretKey, &p.AdminSecretKey, &p.RulesJSON,
 			&p.Ephemeral, &p.AutoCreate, &p.FirebaseCompatEnabled,
-			&p.FirebaseProjectID,
+			&p.FirebaseProjectID, &p.Enabled,
 			&p.ConfigVersion, &p.CreatedAt, &p.UpdatedAt,
 		)
 		if err != nil {
@@ -327,16 +327,18 @@ func (db *PostgresDB) CreateProject(ctx context.Context, p *Project) error {
 	if p.ConfigVersion == 0 {
 		p.ConfigVersion = 1
 	}
+	// New projects start enabled.
+	p.Enabled = true
 	_, err := db.pool.Exec(ctx, `
 		INSERT INTO projects (id, name, secret_key, admin_secret_key, rules_json,
 		                     ephemeral, auth_required, auto_create, firebase_compat_enabled,
-		                     firebase_project_id,
+		                     firebase_project_id, enabled,
 		                     config_version, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 	`,
 		p.ID, p.Name, p.SecretKey, p.AdminSecretKey, p.RulesJSON,
 		p.Ephemeral, false /* auth_required */, p.AutoCreate, p.FirebaseCompatEnabled,
-		p.FirebaseProjectID,
+		p.FirebaseProjectID, p.Enabled,
 		p.ConfigVersion, p.CreatedAt, p.UpdatedAt,
 	)
 	return err

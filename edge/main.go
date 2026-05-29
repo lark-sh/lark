@@ -358,6 +358,7 @@ func (a *configProviderAdapter) GetProjectConfig(projectID string) (*backend.Pro
 		AdminSecretKey:    project.AdminSecretKey,
 		FirebaseProjectID: project.FirebaseProjectID,
 		Ephemeral:         project.Ephemeral,
+		Enabled:           project.Enabled,
 		ConfigVersion:     project.ConfigVersion,
 		Settings:          nil,
 	}, nil

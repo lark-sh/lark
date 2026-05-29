@@ -430,6 +430,12 @@ pub struct ProjectConfig {
     #[serde(default)]
     pub ephemeral: Option<bool>,
 
+    /// Whether this project is enabled. When `Some(false)`, the server refuses
+    /// to start the project's databases and evicts any already running. `None`
+    /// means the proxy didn't send the field — treated as enabled.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+
     /// Additional settings
     #[serde(default)]
     pub settings: HashMap<String, serde_json::Value>,

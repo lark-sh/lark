@@ -55,7 +55,7 @@ pub struct CoreHandlerConfig {
 }
 
 /// Simplified project config for per-core use.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct LocalProjectConfig {
     /// Version from the most recent accepted CONFIG_PUSH. 0 for unversioned
     /// configs (legacy proxies). Used to reject stale/duplicate pushes.
@@ -64,6 +64,23 @@ pub struct LocalProjectConfig {
     pub secret_key: Option<String>,
     pub admin_secret_key: Option<String>,
     pub ephemeral: bool,
+    /// Whether this project may run databases. When `false`, the server refuses
+    /// to start its databases and evicts running ones. Defaults to `true`, so a
+    /// missing or unversioned config does not disable a project.
+    pub enabled: bool,
+}
+
+impl Default for LocalProjectConfig {
+    fn default() -> Self {
+        Self {
+            config_version: 0,
+            rules: None,
+            secret_key: None,
+            admin_secret_key: None,
+            ephemeral: false,
+            enabled: true,
+        }
+    }
 }
 
 // =============================================================================
@@ -374,12 +391,15 @@ impl CoreHandler {
             None // No rules configured = intentionally open
         };
 
+        // Absent `enabled` (older proxies) is treated as enabled.
+        let enabled = config.enabled.unwrap_or(true);
         let cached_config = LocalProjectConfig {
             config_version: config.config_version,
             rules: evaluator,
             secret_key: config.secret_key.clone(),
             admin_secret_key: config.admin_secret_key.clone(),
             ephemeral: config.ephemeral.unwrap_or(false),
+            enabled,
         };
 
         let has_rules = cached_config.rules.is_some();
@@ -402,19 +422,37 @@ impl CoreHandler {
             .map(|(id, handle)| (id.clone(), handle.clone()))
             .collect();
 
-        for (db_id, handle) in &affected_dbs {
-            let eval = new_evaluator.as_deref().cloned();
-            handle.update_evaluator(eval);
-            debug!(
-                "  CONFIG_PUSH: pushed new rules to running database {}",
-                db_id
-            );
+        if enabled {
+            for (db_id, handle) in &affected_dbs {
+                let eval = new_evaluator.as_deref().cloned();
+                handle.update_evaluator(eval);
+                debug!(
+                    "  CONFIG_PUSH: pushed new rules to running database {}",
+                    db_id
+                );
+            }
+        } else {
+            // Project disabled: shut down any running databases for it without
+            // purging on-disk data, and NACK their clients. Newly-arriving and
+            // pending connects are refused by the startup gate in
+            // process_connect.
+            for (full_id, _) in &affected_dbs {
+                self.shutdown_disabled_database(full_id);
+            }
+            if !affected_dbs.is_empty() {
+                debug!(
+                    "  CONFIG_PUSH: project {} disabled, evicted {} running database(s)",
+                    project_id,
+                    affected_dbs.len()
+                );
+            }
         }
 
         debug!(
-            "CONFIG_PUSH stored: project={} version={} rules={} ephemeral={} core={} hot_reloaded_dbs={}",
+            "CONFIG_PUSH stored: project={} version={} enabled={} rules={} ephemeral={} core={} affected_dbs={}",
             project_id,
             config.config_version,
+            enabled,
             has_rules,
             ephemeral,
             self.config.core_id,
@@ -613,6 +651,48 @@ impl CoreHandler {
         );
     }
 
+    /// Shut down a running database whose project is disabled.
+    ///
+    /// Drops the handle so the db task exits, marks it explicitly evicted, and
+    /// force-closes attached clients after sending each a `PROJECT_DISABLED`
+    /// NACK. Does not purge on-disk data. `full_id` is the `project/database`
+    /// key.
+    fn shutdown_disabled_database(&self, full_id: &str) {
+        let was_loaded = self.databases.borrow_mut().remove(full_id).is_some();
+        if was_loaded {
+            self.evicted_databases
+                .borrow_mut()
+                .insert(full_id.to_string());
+        }
+
+        let mut to_close = Vec::new();
+        self.client_databases
+            .borrow_mut()
+            .retain(|_, (db_id, client)| {
+                if db_id == full_id {
+                    to_close.push(client.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        for client in &to_close {
+            if let Ok(data) =
+                ServerMessage::nack("", error::PROJECT_DISABLED, "project is disabled").encode()
+            {
+                let _ = client.try_send(data.into(), false);
+            }
+            client.close();
+        }
+        debug!(
+            "  shutdown disabled database {} on core {} (loaded={}, clients_closed={})",
+            full_id,
+            self.config.core_id,
+            was_loaded,
+            to_close.len()
+        );
+    }
+
     /// Handle shutdown request.
     pub fn handle_shutdown(&self, _grace_period_secs: u32) {
         *self.shutting_down.borrow_mut() = true;
@@ -664,6 +744,31 @@ impl CoreHandler {
                 "database is at its connection limit",
             )
             .encode()
+            {
+                let _ = client.try_send(data.into(), false);
+            }
+            client.close();
+            return None;
+        }
+
+        // Refuse to start or join a database whose project is disabled. Only
+        // blocks when a config is cached and explicitly disabled; clients with
+        // no cached config (emulator/local) are allowed. This is the single
+        // funnel for both immediate and pending-config-drained connects.
+        let project_id = parse_project_id(&database_id);
+        let project_disabled = self
+            .project_configs
+            .borrow()
+            .get(&project_id)
+            .map(|cfg| !cfg.enabled)
+            .unwrap_or(false);
+        if project_disabled {
+            warn!(
+                "Rejecting client {} - project {} is disabled",
+                client.id, project_id
+            );
+            if let Ok(data) =
+                ServerMessage::nack("", error::PROJECT_DISABLED, "project is disabled").encode()
             {
                 let _ = client.try_send(data.into(), false);
             }
@@ -1618,6 +1723,124 @@ mod tests {
                 );
                 assert!(handler.client_databases.borrow().contains_key(&client.id));
                 assert!(handler.databases.borrow().contains_key("my-project/room-a"));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_config_push_absent_enabled_defaults_to_enabled() {
+        let handler = make_test_handler();
+
+        // Older proxies omit `enabled`; the server must treat that as enabled.
+        let config = ProjectConfig {
+            enabled: None,
+            ..Default::default()
+        };
+        handler.handle_config_push("legacy-project", config);
+
+        let configs = handler.project_configs.borrow();
+        let cached = configs.get("legacy-project").unwrap();
+        assert!(
+            cached.enabled,
+            "Absent `enabled` must default to enabled, not disabled"
+        );
+    }
+
+    #[test]
+    fn test_config_push_enabled_false_is_stored() {
+        let handler = make_test_handler();
+
+        let config = ProjectConfig {
+            enabled: Some(false),
+            config_version: 1,
+            ..Default::default()
+        };
+        handler.handle_config_push("paused-project", config);
+
+        let configs = handler.project_configs.borrow();
+        let cached = configs.get("paused-project").unwrap();
+        assert!(!cached.enabled, "enabled=false must be stored as disabled");
+    }
+
+    #[test]
+    fn test_config_push_disabled_evicts_running_database() {
+        // Creating a database spawns tasks via glommio::spawn_local, so the
+        // test needs a LocalExecutor in scope.
+        glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+            .spawn(|| async {
+                let handler = make_test_handler();
+
+                // Bring a database online for the project.
+                let client = Rc::new(VirtualClient::new_for_test(1, "pay-project", "room-a"));
+                ProxyHandler::on_connect(&handler, client.clone());
+                assert!(
+                    handler
+                        .databases
+                        .borrow()
+                        .contains_key("pay-project/room-a")
+                );
+                assert!(handler.client_databases.borrow().contains_key(&client.id));
+
+                // A CONFIG_PUSH with enabled=false must evict the running
+                // database (without purge) and drop its clients.
+                let config = ProjectConfig {
+                    enabled: Some(false),
+                    config_version: 1,
+                    ..Default::default()
+                };
+                handler.handle_config_push("pay-project", config);
+
+                assert!(
+                    !handler
+                        .databases
+                        .borrow()
+                        .contains_key("pay-project/room-a"),
+                    "disabled project's running database should be evicted"
+                );
+                assert!(
+                    !handler.client_databases.borrow().contains_key(&client.id),
+                    "evicted database's clients should be dropped"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_connect_to_disabled_project_is_refused() {
+        glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+            .spawn(|| async {
+                let handler = make_test_handler();
+
+                // Project is disabled before any client connects.
+                let config = ProjectConfig {
+                    enabled: Some(false),
+                    config_version: 1,
+                    ..Default::default()
+                };
+                handler.handle_config_push("disabled-project", config);
+
+                let client = Rc::new(VirtualClient::new_for_test(1, "disabled-project", "room-a"));
+                let result = ProxyHandler::on_connect(&handler, client.clone());
+
+                assert!(
+                    result.database_loaded.is_none(),
+                    "no database should be created for a disabled project"
+                );
+                assert!(
+                    !handler
+                        .databases
+                        .borrow()
+                        .contains_key("disabled-project/room-a"),
+                    "disabled project must not start a database"
+                );
+                assert!(
+                    !handler.client_databases.borrow().contains_key(&client.id),
+                    "client connecting to a disabled project must be refused"
+                );
             })
             .unwrap()
             .join()

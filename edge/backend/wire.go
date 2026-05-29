@@ -745,6 +745,7 @@ type ProjectConfig struct {
 	AdminSecretKey    string         `json:"admin_secret_key"`
 	FirebaseProjectID string         `json:"firebase_project_id,omitempty"`
 	Ephemeral         bool           `json:"ephemeral"`
+	Enabled           bool           `json:"enabled"` // when false, the server refuses to run this project's databases
 	ConfigVersion     int64          `json:"config_version"`
 	Settings          map[string]any `json:"settings,omitempty"`
 }
