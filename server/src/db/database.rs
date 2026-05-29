@@ -5081,6 +5081,29 @@ impl Database {
                     ));
                 }
 
+                // 1b. Total depth: path + value nesting must stay within the cap,
+                //     same as the live SET/UPDATE handlers. Otherwise a deferred
+                //     write could land nodes deeper than a read can address.
+                let depth_ok = match (action, &msg.value) {
+                    ("s", Some(v)) => {
+                        crate::db::path_depth(path_str) + json_value_depth(v)
+                            <= crate::db::MAX_PATH_DEPTH
+                    }
+                    ("u", Some(Value::Object(map))) => map.iter().all(|(k, val)| {
+                        let full = format!("{}/{}", path_str.trim_end_matches('/'), k);
+                        crate::db::path_depth(&full) + json_value_depth(val)
+                            <= crate::db::MAX_PATH_DEPTH
+                    }),
+                    _ => true,
+                };
+                if !depth_ok {
+                    return Some(ServerMessage::nack(
+                        request_id,
+                        error::INVALID_DATA,
+                        "write exceeds maximum path depth",
+                    ));
+                }
+
                 // 2. Security rules. Evaluate onDisconnect writes
                 //    against rules when they're established, using the
                 //    registering client's auth — do the same so a deferred write
@@ -6423,6 +6446,37 @@ mod tests {
                 Some(json!("v"))
             );
             assert_eq!(db.tree.read().unwrap().get_value_str("/locked"), None);
+        })
+    }
+
+    #[test]
+    fn test_on_disconnect_rejects_total_depth_over_cap() {
+        // onDisconnect applies deferred writes directly to the tree, so it must
+        // enforce the same path+value depth cap as the live write handlers —
+        // otherwise it could register a write that lands data deeper than a read
+        // can address.
+        block_on(async {
+            let mut db = Database::new("test".to_string(), "test-project".to_string(), true);
+            let (conn, _messages) = MockConnection::new();
+            db.add_client_internal("client1", None, "conn1", conn);
+
+            // path "/deep" (1) + value nested MAX_PATH_DEPTH deep → one past cap.
+            let msg = ClientMessage {
+                path: Some("/deep".to_string()),
+                action: Some("s".to_string()),
+                value: Some(nest_value(crate::db::MAX_PATH_DEPTH)),
+                request_id: Some("r1".to_string()),
+                ..Default::default()
+            };
+            let resp = db
+                .handle_on_disconnect("client1", &msg)
+                .await
+                .expect("resp");
+            assert_eq!(resp.error.as_deref(), Some(error::INVALID_DATA));
+
+            // Firing disconnect must apply nothing (the action was never registered).
+            db.handle_disconnect("client1").await;
+            assert_eq!(db.tree.read().unwrap().get_value_str("/deep"), None);
         })
     }
 
