@@ -397,11 +397,20 @@ impl OperationGenerator {
         }
     }
 
-    /// Deep nesting: 50+ levels deep.
+    /// Deep nesting, right up to the server's depth cap.
+    ///
+    /// Total tree depth = path segments + value nesting, and the server rejects
+    /// writes past `MAX_PATH_DEPTH` (32). The path here is two
+    /// segments (`/deep/-test-…`), leaving room for `max_value_depth` levels of
+    /// value nesting and still committing. Stay within that so we exercise the
+    /// deep path without generating writes the server (correctly) rejects.
     fn deep_nesting<R: Rng>(&mut self, rng: &mut R) -> Operation {
-        let depth = rng.gen_range(30..60);
+        const MAX_PATH_DEPTH: usize = 32; // mirrors server/src/db/path.rs
         let item_id = rng.gen_range(0..20);
         let path = format!("/deep/-test-abcdefg-{}", item_id);
+        let path_segments = 2; // "deep" + "-test-abcdefg-N"
+        let max_value_depth = MAX_PATH_DEPTH - path_segments;
+        let depth = rng.gen_range((max_value_depth / 2)..=max_value_depth);
         let leaf: i32 = rng.gen_range(0..10000);
         let mut value = json!(leaf);
         for i in (0..depth).rev() {

@@ -208,8 +208,21 @@ pub const MAX_STRING_SIZE: usize = 10 * 1024 * 1024;
 /// Maximum size for read responses (256 MB)
 pub const MAX_RESPONSE_SIZE: usize = 256 * 1024 * 1024;
 
-/// Maximum nesting depth for JSON values (matches Firebase's 32-level limit)
+/// Maximum nesting depth for JSON values (matches Firebase's 32-level limit).
+///
+/// This is the value-nesting half of the same "32 levels deep" rule that
+/// [`crate::db::MAX_PATH_DEPTH`] enforces on path segments. The write handlers
+/// reject when `path_depth + value_depth > MAX_PATH_DEPTH`, so the two must
+/// agree — otherwise total tree depth and per-value depth would diverge. The
+/// assertion below fails the build if anyone bumps one without the other.
+/// (Kept as a separate constant rather than aliased so `protocol` doesn't take
+/// a structural dependency on `db`.)
 pub const MAX_JSON_DEPTH: usize = 32;
+
+const _: () = assert!(
+    MAX_JSON_DEPTH == crate::db::MAX_PATH_DEPTH,
+    "MAX_JSON_DEPTH must equal MAX_PATH_DEPTH — they encode the same Firebase 32-level limit"
+);
 
 // =============================================================================
 // Message Parsing Errors

@@ -3228,6 +3228,23 @@ impl Database {
                     "invalid path or key",
                 ));
             }
+
+            // Reject ops whose landing path + value nesting would exceed the
+            // depth cap (same rule the single-op SET/UPDATE handlers enforce).
+            let too_deep = match (op.op.as_str(), &op.value) {
+                ("s" | "set", Some(value)) => {
+                    crate::db::path_depth(&op.path) + json_value_depth(value)
+                        > crate::db::MAX_PATH_DEPTH
+                }
+                ("u" | "update", Some(Value::Object(map))) => map.iter().any(|(key, val)| {
+                    let full = format!("{}/{}", op.path.trim_end_matches('/'), key);
+                    crate::db::path_depth(&full) + json_value_depth(val) > crate::db::MAX_PATH_DEPTH
+                }),
+                _ => false,
+            };
+            if too_deep {
+                return self.nack_too_deep(client_id, request_id);
+            }
         }
 
         // First, check permissions for all write operations
@@ -3745,6 +3762,19 @@ impl Database {
         ))
     }
 
+    /// Record and build the NACK for a write whose landing path plus value
+    /// nesting would exceed [`crate::db::MAX_PATH_DEPTH`]. Without this, a deeply
+    /// nested value at a shallow path could create tree nodes whose own path
+    /// exceeds the depth cap — writable but never readable back by path.
+    fn nack_too_deep(&mut self, client_id: &str, request_id: &str) -> Option<ServerMessage> {
+        self.record_nacked_write(client_id, request_id);
+        Some(ServerMessage::nack(
+            request_id,
+            error::INVALID_DATA,
+            "write exceeds maximum path depth",
+        ))
+    }
+
     async fn handle_set(
         &mut self,
         client_id: &str,
@@ -3764,6 +3794,15 @@ impl Database {
                 .is_some_and(|v| validate_value_keys(v).is_err())
         {
             return self.nack_invalid_key(client_id, request_id);
+        }
+
+        // The path is within the depth cap (validate_path), but the value lands
+        // *under* it — reject if path + value nesting would exceed the cap, so
+        // nothing gets written that a same-depth read couldn't later reach.
+        if let Some(v) = &msg.value
+            && crate::db::path_depth(path_str) + json_value_depth(v) > crate::db::MAX_PATH_DEPTH
+        {
+            return self.nack_too_deep(client_id, request_id);
         }
 
         // Check for tainted write (depends on a nacked write) - silently ignore
@@ -4018,6 +4057,12 @@ impl Database {
                 let full = format!("{}/{}", path_str.trim_end_matches('/'), key);
                 if crate::db::validate_path(&full).is_err() || validate_value_keys(val).is_err() {
                     return self.nack_invalid_key(client_id, request_id);
+                }
+                // Each child value lands under `full`; reject if the deepest leaf
+                // would exceed the depth cap (see handle_set).
+                if crate::db::path_depth(&full) + json_value_depth(val) > crate::db::MAX_PATH_DEPTH
+                {
+                    return self.nack_too_deep(client_id, request_id);
                 }
             }
         }
@@ -5724,6 +5769,17 @@ impl Database {
 /// Server-value and priority sentinels (`.sv`, `.priority`, `.value`) pass
 /// because `validate_key` permits a leading dot. Arrays carry no string keys, so
 /// we just recurse into their elements.
+/// Maximum object/array nesting depth of a JSON value: a scalar is 0,
+/// `{"a": 1}` is 1, `{"a": {"b": 1}}` is 2. Added to a write's landing-path
+/// depth, this is how deep in the tree the value's deepest leaf will sit.
+fn json_value_depth(value: &Value) -> usize {
+    match value {
+        Value::Object(map) => 1 + map.values().map(json_value_depth).max().unwrap_or(0),
+        Value::Array(items) => 1 + items.iter().map(json_value_depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
 fn validate_value_keys(value: &Value) -> Result<(), crate::db::KeyError> {
     match value {
         Value::Object(map) => {
@@ -6201,6 +6257,100 @@ mod tests {
                 db.tree.read().unwrap().get_value_str("/users/abc"),
                 Some(json!({"name": "Alice"}))
             );
+        })
+    }
+
+    /// Nest `levels` objects (`{d0: {d1: ... {d{levels-1}: "leaf"}}}`).
+    /// `json_value_depth` of the result is `levels`.
+    fn nest_value(levels: usize) -> Value {
+        let mut value = json!("leaf");
+        for i in (0..levels).rev() {
+            let mut m = serde_json::Map::new();
+            m.insert(format!("d{i}"), value);
+            value = Value::Object(m);
+        }
+        value
+    }
+
+    #[test]
+    fn test_set_rejects_total_depth_over_cap() {
+        // The chaos-monkey shape: a deeply-nested value at a shallow path. The
+        // path passes validate_path, but path + value nesting exceeds the depth
+        // cap, so the leaf would be unreadable by path — reject the write.
+        block_on(async {
+            let mut db = Database::new("test".to_string(), "test-project".to_string(), true);
+            let (conn, _messages) = MockConnection::new();
+            db.add_client_internal("client1", None, "conn1", conn);
+
+            // path "/deep" = 1 segment; value nested MAX_PATH_DEPTH deep →
+            // total MAX_PATH_DEPTH + 1, one past the cap.
+            let msg = ClientMessage {
+                op: "s".to_string(),
+                path: Some("/deep".to_string()),
+                value: Some(nest_value(crate::db::MAX_PATH_DEPTH)),
+                request_id: Some("r1".to_string()),
+                ..Default::default()
+            };
+            let resp = db.handle_set("client1", &msg, false).await.expect("resp");
+            assert_eq!(resp.error.as_deref(), Some(error::INVALID_DATA));
+            assert_eq!(
+                db.tree.read().unwrap().get_value_str("/deep"),
+                None,
+                "over-deep write must not commit"
+            );
+        })
+    }
+
+    #[test]
+    fn test_set_accepts_total_depth_at_cap() {
+        // path(1) + value(MAX_PATH_DEPTH - 1) == MAX_PATH_DEPTH exactly → allowed.
+        block_on(async {
+            let mut db = Database::new("test".to_string(), "test-project".to_string(), true);
+            let (conn, _messages) = MockConnection::new();
+            db.add_client_internal("client1", None, "conn1", conn);
+
+            let msg = ClientMessage {
+                op: "s".to_string(),
+                path: Some("/deep".to_string()),
+                value: Some(nest_value(crate::db::MAX_PATH_DEPTH - 1)),
+                request_id: Some("r1".to_string()),
+                ..Default::default()
+            };
+            let resp = db.handle_set("client1", &msg, false).await.expect("resp");
+            assert!(
+                resp.nack.is_none(),
+                "a write landing exactly at the depth cap must be accepted"
+            );
+            assert!(db.tree.read().unwrap().get_value_str("/deep").is_some());
+        })
+    }
+
+    #[test]
+    fn test_update_rejects_total_depth_over_cap() {
+        // UPDATE composes base + child key + value nesting; the sum must respect
+        // the cap just like SET.
+        block_on(async {
+            let mut db = Database::new("test".to_string(), "test-project".to_string(), true);
+            let (conn, _messages) = MockConnection::new();
+            db.add_client_internal("client1", None, "conn1", conn);
+
+            // base "/a" (1) + key "b" (1) + value nested (MAX_PATH_DEPTH - 1) →
+            // total MAX_PATH_DEPTH + 1.
+            let mut map = serde_json::Map::new();
+            map.insert("b".to_string(), nest_value(crate::db::MAX_PATH_DEPTH - 1));
+            let msg = ClientMessage {
+                op: "u".to_string(),
+                path: Some("/a".to_string()),
+                value: Some(Value::Object(map)),
+                request_id: Some("r1".to_string()),
+                ..Default::default()
+            };
+            let resp = db
+                .handle_update("client1", &msg, false)
+                .await
+                .expect("resp");
+            assert_eq!(resp.error.as_deref(), Some(error::INVALID_DATA));
+            assert_eq!(db.tree.read().unwrap().get_value_str("/a/b"), None);
         })
     }
 
