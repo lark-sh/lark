@@ -67,6 +67,7 @@ func (db *LocalDB) GetProjectByID(ctx context.Context, projectID string) (*Proje
 		Ephemeral:             true,
 		AutoCreate:            true,
 		FirebaseCompatEnabled: true,
+		Enabled:               true,
 		ConfigVersion:         1,
 	}, nil
 }

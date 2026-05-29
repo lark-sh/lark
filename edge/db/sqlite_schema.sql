@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS projects (
     auto_create INTEGER NOT NULL DEFAULT 1,
     firebase_compat_enabled INTEGER NOT NULL DEFAULT 1,
     firebase_project_id TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
     config_version INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL

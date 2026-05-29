@@ -74,6 +74,54 @@ func TestSqlite_GetProjectByID_Found(t *testing.T) {
 	}
 }
 
+// A project seeded without an explicit `enabled` column must read back as
+// enabled — the schema default protects against existing rows / older writers
+// accidentally disabling projects.
+func TestSqlite_GetProjectByID_EnabledDefaultsTrue(t *testing.T) {
+	db := openMemorySqlite(t)
+	seedSqliteProject(t, db, "p1", true)
+	p, err := db.GetProjectByID(context.Background(), "p1")
+	if err != nil {
+		t.Fatalf("GetProjectByID: %v", err)
+	}
+	if !p.Enabled {
+		t.Errorf("Enabled should default to true, got %+v", p)
+	}
+}
+
+// CreateProject marks new projects enabled, and the value round-trips.
+func TestSqlite_CreateProject_EnabledRoundTrips(t *testing.T) {
+	db := openMemorySqlite(t)
+	p := &Project{ID: "p1", Name: "P1", SecretKey: "sk", AdminSecretKey: "ask"}
+	if err := db.CreateProject(context.Background(), p); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	if !p.Enabled {
+		t.Errorf("CreateProject should set Enabled=true on the struct, got %+v", p)
+	}
+
+	got, err := db.GetProjectByID(context.Background(), "p1")
+	if err != nil {
+		t.Fatalf("GetProjectByID: %v", err)
+	}
+	if !got.Enabled {
+		t.Errorf("created project should read back enabled, got %+v", got)
+	}
+
+	// Disabling via a direct write round-trips to false.
+	if _, err := db.sql.ExecContext(context.Background(),
+		`UPDATE projects SET enabled = 0 WHERE id = ?`, "p1"); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	got, err = db.GetProjectByID(context.Background(), "p1")
+	if err != nil {
+		t.Fatalf("GetProjectByID after disable: %v", err)
+	}
+	if got.Enabled {
+		t.Errorf("disabled project should read back disabled, got %+v", got)
+	}
+}
+
 func TestSqlite_AssignDatabase_NoHealthyServer(t *testing.T) {
 	db := openMemorySqlite(t)
 	seedSqliteProject(t, db, "p1", true)

@@ -187,6 +187,8 @@ pub mod error {
     pub const RATE_LIMITED: &str = "rate_limited";
     /// Segment or storage unavailable - client should retry
     pub const UNAVAILABLE: &str = "unavailable";
+    /// Project is disabled; its databases will not start and connections are refused.
+    pub const PROJECT_DISABLED: &str = "project_disabled";
 }
 
 // =============================================================================
