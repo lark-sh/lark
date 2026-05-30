@@ -14,9 +14,10 @@ const BootstrapEmail = "admin@local"
 
 // BootstrapProjectID / BootstrapProjectName name the default project
 // created on first boot when no projects exist. Settings are aimed at
-// the "I just want to play with this" path: wide-open rules, persistent
-// (not ephemeral), and Firebase-compat on so existing Firebase SDK code
-// can point at the subdomain and just work.
+// the "I just want to play with this" path: time-limited starter rules
+// (open now, locked down after defaultStarterRulesTTL), persistent (not
+// ephemeral), and Firebase-compat on so existing Firebase SDK code can
+// point at the subdomain and just work.
 const (
 	BootstrapProjectID   = "default"
 	BootstrapProjectName = "Default"
@@ -71,10 +72,11 @@ func BootstrapAdminIfEmpty(ctx context.Context, store db.Store) (email, password
 // projects exist. Returns true if a project was actually created. Idempotent.
 //
 // The default project is non-ephemeral, auto-creates databases on
-// connect, has Firebase compat on, and ships permissive rules — the
-// fastest "point a Firebase SDK at the subdomain and write something"
-// path. Operators who want different defaults can edit or delete this
-// project via the dashboard.
+// connect, has Firebase compat on, and ships time-limited starter rules
+// (see defaultStarterRules) — the fastest "point a Firebase SDK at the
+// subdomain and write something" path, without leaving the project open
+// forever if it's forgotten. Operators who want different defaults can
+// edit or delete this project via the dashboard.
 func BootstrapDefaultProjectIfEmpty(ctx context.Context, store db.Store) (bool, error) {
 	projects, err := store.ListProjects(ctx)
 	if err != nil {
@@ -89,7 +91,7 @@ func BootstrapDefaultProjectIfEmpty(ctx context.Context, store db.Store) (bool, 
 		Name:                  BootstrapProjectName,
 		SecretKey:             randomToken(16),
 		AdminSecretKey:        randomToken(16),
-		RulesJSON:             `{"rules":{".read":true,".write":true}}`,
+		RulesJSON:             defaultStarterRules(),
 		Ephemeral:             false,
 		AutoCreate:            true,
 		FirebaseCompatEnabled: true,
