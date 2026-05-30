@@ -574,10 +574,10 @@ export function DatabaseEditor() {
             </p>
             <button
               type="button"
-              onClick={() => handleUpdate({ newValue: {}, path: [] })}
+              onClick={() => handleUpdate({ newValue: { hello: 'world' }, path: [] })}
               className="text-sm text-blue-600 hover:text-blue-800"
             >
-              Initialize with empty object
+              Initialize with sample data
             </button>
           </div>
         )
