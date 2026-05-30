@@ -2,13 +2,30 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/lark-sh/lark/edge/db"
 	"github.com/lark-sh/lark/edge/jwt"
 	"github.com/lark-sh/lark/edge/logger"
 )
+
+// defaultStarterRulesTTL is how long the auto-generated starter rules stay open
+// before they lock down. Wide open for quick development, then deny everything so a project that gets spun
+// up and forgotten doesn't stay world-readable/writable forever.
+const defaultStarterRulesTTL = 14 * 24 * time.Hour
+
+// defaultStarterRules builds the permissive-but-expiring rule set applied to a
+// project when the caller doesn't supply their own. Every read and write is
+// gated on `now < <expiry>`, where `now` is the server timestamp in
+// milliseconds (matching the rules evaluator's `now`). Once the window passes
+// the rules deny everything until the operator sets real rules.
+func defaultStarterRules() string {
+	expiry := time.Now().Add(defaultStarterRulesTTL).UnixMilli()
+	return fmt.Sprintf(`{"rules":{".read":"now < %d",".write":"now < %d"}}`, expiry, expiry)
+}
 
 type adminProjectListResponse struct {
 	Projects []*db.Project `json:"projects"`
@@ -69,7 +86,7 @@ func (s *Server) handleAdminCreateProject(w http.ResponseWriter, r *http.Request
 	}
 	rules := req.RulesJSON
 	if rules == "" {
-		rules = `{"rules":{".read":true,".write":true}}`
+		rules = defaultStarterRules()
 	}
 
 	project := &db.Project{
