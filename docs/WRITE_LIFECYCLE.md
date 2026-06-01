@@ -138,7 +138,7 @@ impl ProxyHandler for CoreHandler {
 
 ### InboxMessage Structure
 
-**File:** `server/src/db/database.rs`
+**File:** `server/src/db/database/mod.rs`
 
 ```rust
 pub struct InboxMessage {
@@ -161,7 +161,7 @@ The `InboxMessage` uses flags instead of enum variants for simpler single-thread
 
 ## 3. Database Processing (Main Loop)
 
-**File:** `server/src/db/database.rs`
+**File:** `server/src/db/database/run.rs`
 
 ### Message Loop Architecture
 
@@ -246,7 +246,7 @@ async fn handle_message_internal(&mut self, msg: &InboxMessage) {
 
 ## 4. Write Validation
 
-**File:** `server/src/db/database.rs`
+**Files:** `server/src/db/database/handlers.rs`, `server/src/db/database/run.rs`
 
 ### Deduplication
 
@@ -288,7 +288,7 @@ let value = self.process_server_values(value, path_str);
 
 ## 5. Authorization (Rules Evaluation)
 
-**Files:** `server/src/db/database.rs`, `server/src/rules/`
+**Files:** `server/src/db/database/auth.rs`, `server/src/rules/`
 
 ### can_write() with Lazy Promotion
 
@@ -404,7 +404,7 @@ if !self.can_write(client_id, path_str, Some(NewData::from_set(path_str.into(), 
 
 ### Volatile Write Path (Fast)
 
-**File:** `server/src/db/database.rs`
+**File:** `server/src/db/database/handlers.rs`
 
 Volatile writes skip the tree and WAL entirely:
 
@@ -526,7 +526,7 @@ self.record_processed_write(client_id, &request_id);
 
 ## 7. Event Broadcasting
 
-**File:** `server/src/db/database.rs`
+**File:** `server/src/db/database/broadcast.rs`
 
 ### broadcast_mutation()
 
@@ -578,7 +578,7 @@ async fn broadcast_mutation(
 
 ### View Identification
 
-**File:** `server/src/db/subscription.rs`
+**File:** `server/src/db/subscription/events.rs`
 
 The ViewManager finds all subscriptions affected by a mutation:
 
@@ -606,7 +606,7 @@ For each affected view, returns `AffectedViewInfo`:
 
 ### Broadcast Buffer Architecture
 
-**File:** `server/src/db/subscription.rs`
+**File:** `server/src/db/subscription/mod.rs`
 
 Thread-local reusable buffers minimize allocations:
 
@@ -674,7 +674,7 @@ The proxy receives one BROADCAST message and fans out to all listed clients, ins
 
 ### Volatile Batch Flushing
 
-**File:** `server/src/db/database.rs`
+**File:** `server/src/db/database/broadcast.rs`
 
 Volatile writes are batched and flushed at different rates:
 
@@ -753,18 +753,18 @@ fn flush_volatile_slow(&mut self) {
 
 | Optimization | Location | Benefit |
 |--------------|----------|---------|
-| **Arc-wrapped auth** | `database.rs` | O(1) auth cloning during rules eval |
+| **Arc-wrapped auth** | `database/auth.rs` | O(1) auth cloning during rules eval |
 | **ArcValue COW** | `arc_value.rs` | O(1) tree cloning, in-place mutation |
-| **Broadcast buffers** | `subscription.rs` | One encode → N client sends |
+| **Broadcast buffers** | `subscription/mod.rs` | One encode → N client sends |
 | **Fast event encoding** | `messages.rs` | Direct string concat, no JSON serialize |
-| **Volatile batching** | `subscription.rs` | 5-25x reduction in event sends |
-| **Tiered flush rates** | `database.rs` | 20Hz fast / 4Hz slow clients |
-| **Lazy blob promotion** | `database.rs` | Only loads blob data when a read accesses it |
+| **Volatile batching** | `subscription/volatile.rs` | 5-25x reduction in event sends |
+| **Tiered flush rates** | `database/broadcast.rs` | 20Hz fast / 4Hz slow clients |
+| **Lazy blob promotion** | `database/promotion.rs` | Only loads blob data when a read accesses it |
 | **Lazy newData** | `rules/snapshot.rs` | UPDATE rules cascade builds snapshots on demand instead of materializing `merged_data` per ancestor — no eager `tree.get_value` walks for rules that don't read `newData.*` |
 | **writes_at validate** | `rules/snapshot.rs` | `.validate` fires only on children being written, not on tree-existing untouched siblings |
 | **Message batching** | `proxy.rs` | 256KB or 3ms → reduced syscalls |
-| **View batch processing** | `database.rs` | 10 views per batch, yield between |
-| **Deduplication** | `database.rs` | IndexSet with O(1) eviction |
+| **View batch processing** | `database/broadcast.rs` | 10 views per batch, yield between |
+| **Deduplication** | `database/run.rs` | IndexSet with O(1) eviction |
 
 ## Latency Tracking
 

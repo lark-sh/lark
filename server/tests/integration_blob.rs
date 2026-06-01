@@ -1594,7 +1594,7 @@ fn test_blob_update_create_then_update_player_permissions() {
 
 /// Speculative SET ( `transaction()` first attempt — `h:""` plus
 /// `hash_provided=true`) against a path that's null in the in-memory tree
-/// must succeed. The pre-fix check at `database.rs` was `old_value.is_some()`,
+/// must succeed. The pre-fix check at `database/promotion.rs` was `old_value.is_some()`,
 /// which returned true for paths promoted as "we checked, doesn't exist" —
 /// the marker `promote_path_unchecked` installs as `Some(Value::Null)` on
 /// `PathNotFound`. A client whose listener had received a null
@@ -2112,7 +2112,7 @@ fn test_blob_root_update_with_multipath_keys_replays_to_descendants() {
 ///      *real Object* containing only the UPDATE's new keys (the prior
 ///      Sentinel-with-children data is gone in-memory),
 ///   3. and `promote_path_deep`'s "Object parent → write Null marker, skip
-///      blob promotion" short-circuit (database.rs:~1294) treats this partial
+///      blob promotion" short-circuit (database/promotion.rs) treats this partial
 ///      Object as authoritative, so subsequent reads of the destroyed
 ///      children return Null instead of self-healing from blob+WAL.
 ///
