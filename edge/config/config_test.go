@@ -186,8 +186,8 @@ func TestBooleanParsing(t *testing.T) {
 
 func TestIntegerParsing(t *testing.T) {
 	tests := []struct {
-		value   string
-		want    int
+		value    string
+		want     int
 		default_ int
 	}{
 		{"100", 100, 30},

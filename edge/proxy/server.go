@@ -85,7 +85,7 @@ type Server struct {
 	// Client tracking
 	clients   sync.Map // clientID -> *ClientConn
 	nextID    atomic.Uint32
-	freeIDs   []uint32   // recycled client IDs
+	freeIDs   []uint32 // recycled client IDs
 	freeIDsMu sync.Mutex
 
 	// Connection metrics (for proxy_metrics emission)

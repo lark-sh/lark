@@ -48,7 +48,7 @@
 // session and delegates thread safety to it.
 //
 // # Goal
-// 
+//
 // The goal of this package is just to implement enough LongPolling support to get a legacy Firebase client to switch from LP->WS
 // We aren't really trying to support Long Polling as a first-class transport option.
 package proxy
@@ -352,7 +352,7 @@ type LongPollPool struct {
 
 	// Track recently closed sessions so we can send 'close' instead of 'error'
 	// This prevents the SDK from hammering us with retries
-	closedMu      sync.RWMutex
+	closedMu       sync.RWMutex
 	closedSessions map[string]time.Time // session ID -> when closed
 
 	idleTimeout time.Duration
@@ -967,4 +967,3 @@ func parseSegmentedData(query map[string][]string) ([][]byte, error) {
 	// For now, treat as single message
 	return [][]byte{decoded}, nil
 }
-

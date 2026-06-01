@@ -20,35 +20,35 @@
 //
 // # Proxy → Backend Messages
 //
-//	CONNECT (0x01): New client connection
-//	  Payload: protocol(1B) + projectLen(1B) + project + dbLen(1B) + database + authJSON
+//		CONNECT (0x01): New client connection
+//		  Payload: protocol(1B) + projectLen(1B) + project + dbLen(1B) + database + authJSON
 //
-//	DATA (0x02): Client message data
-//	  Payload: raw message bytes
+//		DATA (0x02): Client message data
+//		  Payload: raw message bytes
 //
-//	DISCONNECT (0x03): Client disconnected
-//	  Payload: reason(1B)
+//		DISCONNECT (0x03): Client disconnected
+//		  Payload: reason(1B)
 //
-//	HELLO (0x04): Connection handshake
-//	  Payload: version(4B, big-endian)
+//		HELLO (0x04): Connection handshake
+//		  Payload: version(4B, big-endian)
 //
-//  HELLO_AUTH (0x0A): Shared secret exchange
+//	 HELLO_AUTH (0x0A): Shared secret exchange
 //
-//	AUTH_CHANGED (0x05): Client auth updated (late authentication)
-//	  Payload: authJSON
+//		AUTH_CHANGED (0x05): Client auth updated (late authentication)
+//		  Payload: authJSON
 //
-//	HEARTBEAT_ACK (0x06): Response to server heartbeat
-//	  Payload: serverID + timestamp
+//		HEARTBEAT_ACK (0x06): Response to server heartbeat
+//		  Payload: serverID + timestamp
 //
-//	CONFIG_PUSH (0x07): Push project configuration to server
-//	  Payload: configJSON
+//		CONFIG_PUSH (0x07): Push project configuration to server
+//		  Payload: configJSON
 //
-//	EVICT_DATABASE (0x08): Request database eviction
-//	  Payload: projectLen(1B) + project + dbLen(1B) + database + flags(1B)
-//	  Flags: bit 0 = PURGE_DATA (delete on-disk data for persistent dbs)
+//		EVICT_DATABASE (0x08): Request database eviction
+//		  Payload: projectLen(1B) + project + dbLen(1B) + database + flags(1B)
+//		  Flags: bit 0 = PURGE_DATA (delete on-disk data for persistent dbs)
 //
-//	SHUTDOWN (0x09): Graceful shutdown request
-//	  Payload: (empty)
+//		SHUTDOWN (0x09): Graceful shutdown request
+//		  Payload: (empty)
 //
 // # Backend → Proxy Messages
 //
@@ -192,7 +192,7 @@ type Message struct {
 
 // ConnectPayload is the payload for CONNECT messages
 type ConnectPayload struct {
-	Protocol   byte   // ProtocolWebSocket or ProtocolWebTransport
+	Protocol   byte // ProtocolWebSocket or ProtocolWebTransport
 	ProjectID  string
 	DatabaseID string
 	Metadata   []byte // Optional JSON metadata (IP, headers, etc.)
@@ -325,7 +325,7 @@ func DecodeAuthPayload(data []byte) (*AuthPayload, error) {
 
 // DataPayload is the payload for backend -> proxy DATA messages
 type DataPayload struct {
-	Flags byte   // FlagReliable or FlagUnreliable
+	Flags byte // FlagReliable or FlagUnreliable
 	Data  []byte
 }
 

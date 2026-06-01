@@ -53,8 +53,8 @@ help:
 	@echo ""
 	@echo "  make check       cargo check --workspace (in Linux container)."
 	@echo "  make test        cargo test --lib (the common case)."
-	@echo "  make test-all    Full integration suite (./test-everything.sh)."
-	@echo "  make fmt         cargo fmt --all."
+	@echo "  make test-all    Full integration suite (./test-everything.sh) + go test ./... (edge)."
+	@echo "  make fmt         cargo fmt --all + go fmt ./... (edge)."
 	@echo "  make lint        cargo clippy with -D warnings."
 	@echo ""
 	@echo "  make build         Release binaries for lark-server + lark-edge."
@@ -104,10 +104,12 @@ test: dev-image
 .PHONY: test-all
 test-all: dev-image
 	$(DOCKER_RUN) ./test-everything.sh
+	cd edge && go test ./...
 
 .PHONY: fmt
 fmt: dev-image
 	$(DOCKER_RUN) cargo fmt --all
+	cd edge && go fmt ./...
 
 .PHONY: lint
 lint: dev-image

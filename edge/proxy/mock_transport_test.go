@@ -8,9 +8,9 @@ import (
 
 // MockTransport implements ClientTransport for testing
 type MockTransport struct {
-	mu           sync.Mutex
-	sentMessages []sentMessage
-	closed       bool
+	mu            sync.Mutex
+	sentMessages  []sentMessage
+	closed        bool
 	transportType byte
 }
 

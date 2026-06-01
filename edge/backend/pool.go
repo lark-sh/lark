@@ -29,8 +29,9 @@
 //
 // 1. Each connection has a readLoop that receives wire protocol messages
 // 2. Client-bound messages are dispatched inline in readLoop:
-//    - Look up client via ClientRegistry
-//    - Call client.Deliver() (non-blocking)
+//   - Look up client via ClientRegistry
+//   - Call client.Deliver() (non-blocking)
+//
 // 3. Control messages (HEARTBEAT, DATABASE_LOADED, etc.) go to controlChan
 //
 // # Eviction Batching
@@ -183,10 +184,10 @@ type EvictionRequest struct {
 
 // CoreMetrics holds metrics for a single core
 type CoreMetrics struct {
-	Load      uint16
-	Clients   uint32
-	MemMB     uint32
-	LastSeen  time.Time
+	Load     uint16
+	Clients  uint32
+	MemMB    uint32
+	LastSeen time.Time
 }
 
 // Pool manages connections to backend servers
@@ -293,15 +294,15 @@ func (p *Pool) AddBackend(serverID, address string) error {
 	logger.Debug("Server topology discovered", "server_id", serverID, "cores", nrCores, "first_core", firstCoreID)
 
 	backend := &Backend{
-		ServerID:       serverID,
-		Address:        address,
-		nrCores:        nrCores,
-		coreConns:      make([][]*Conn, nrCores),
-		coreNext:       make([]int, nrCores),
-		clientToCore:   make(map[uint32]int),
-		coreProjects:   make([]map[string]bool, nrCores),
-		projectCores:   make(map[string]map[int]bool),
-		coreMetrics:    make([]CoreMetrics, nrCores),
+		ServerID:     serverID,
+		Address:      address,
+		nrCores:      nrCores,
+		coreConns:    make([][]*Conn, nrCores),
+		coreNext:     make([]int, nrCores),
+		clientToCore: make(map[uint32]int),
+		coreProjects: make([]map[string]bool, nrCores),
+		projectCores: make(map[string]map[int]bool),
+		coreMetrics:  make([]CoreMetrics, nrCores),
 		pool:         p,
 		inbox:        make(chan *inboxMessage, 3000000),
 		controlChan:  make(chan *ControlMessage, 10000),
@@ -446,7 +447,6 @@ func (p *Pool) Close() {
 	}
 }
 
-
 // inboxMessage wraps a message with its target core ID
 type inboxMessage struct {
 	msg    *Message
@@ -458,14 +458,14 @@ type Backend struct {
 	ServerID string
 	Address  string // host:port
 
-	mu          sync.RWMutex
-	nrCores     int        // Number of cores on this server
-	coreConns   [][]*Conn  // Per-core connection lists: coreConns[coreID] = [conn1, conn2, ...]
-	coreNext    []int      // Round-robin index per core
+	mu           sync.RWMutex
+	nrCores      int            // Number of cores on this server
+	coreConns    [][]*Conn      // Per-core connection lists: coreConns[coreID] = [conn1, conn2, ...]
+	coreNext     []int          // Round-robin index per core
 	clientToCore map[uint32]int // Maps client ID to their assigned core
 
 	// Per-core project tracking for targeted CONFIG_PUSH
-	coreProjects []map[string]bool      // coreProjects[coreID][projectID] = true
+	coreProjects []map[string]bool       // coreProjects[coreID][projectID] = true
 	projectCores map[string]map[int]bool // projectCores[projectID][coreID] = true
 
 	// Per-core metrics for heartbeat aggregation
@@ -814,7 +814,6 @@ func (b *Backend) flushBatch(batch []*inboxMessage) {
 	b.mu.Unlock()
 	wg.Wait()
 }
-
 
 // handleConnDeath is called when a connection dies
 func (b *Backend) handleConnDeath(conn *Conn) {

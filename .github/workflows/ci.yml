@@ -49,7 +49,7 @@ jobs:
         run: cargo test --workspace --lib
 
   go:
-    name: Go edge — vet, test
+    name: Go edge — fmt, vet, test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,6 +58,19 @@ jobs:
         with:
           go-version-file: edge/go.mod
           cache-dependency-path: edge/go.sum
+
+      # Mirrors `make fmt` (go fmt ./...). gofmt -l lists files that aren't
+      # formatted without rewriting them; any output means the diff would be
+      # non-empty, so fail the job.
+      - name: Format check
+        working-directory: edge
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-formatted (run 'make fmt'):"
+            echo "$unformatted"
+            exit 1
+          fi
 
       # Note: edge/dashboard/embed.go does `//go:embed all:dist`; the committed
       # placeholder edge/dashboard/dist/index.html satisfies it without a full

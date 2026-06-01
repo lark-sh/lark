@@ -131,8 +131,8 @@ func mockServer(t *testing.T, nrCores uint8) (net.Listener, func()) {
 			resp := make([]byte, 41)
 			binary.BigEndian.PutUint32(resp[0:4], 37) // length = 1+1+1+2+32
 			resp[4] = MsgTypeHelloAck
-			resp[5] = coreCounter % nrCores // CoreID (round-robin)
-			resp[6] = nrCores               // NrCores
+			resp[5] = coreCounter % nrCores          // CoreID (round-robin)
+			resp[6] = nrCores                        // NrCores
 			binary.BigEndian.PutUint16(resp[7:9], 1) // ServerVersion
 			// resp[9:41] nonce (zero is fine; this mock doesn't verify the auth reply)
 
