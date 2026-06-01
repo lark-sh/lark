@@ -808,7 +808,7 @@ fn test_clear_volatile_for_path_prevents_stale_flush() {
     assert!(view.pending_volatile_batch.contains_key("/player2"));
 
     // Flush — only player2's data should be sent, not player1's stale cursor
-    let sent = vm.flush_volatile_fast();
+    let (sent, _bytes) = vm.flush_volatile_fast();
     assert_eq!(sent, 1);
     assert_eq!(conn.count(), 1);
 }
@@ -850,8 +850,9 @@ fn test_flush_volatile_fast_sends_to_fast_clients() {
     vm.buffer_volatile("/cursors/player1", Bytes::from(r#"{"x": 100}"#), "client3");
 
     // Flush to fast clients only
-    let sent = vm.flush_volatile_fast();
+    let (sent, bytes) = vm.flush_volatile_fast();
     assert_eq!(sent, 1); // Only fast client
+    assert!(bytes > 0); // Egress metered for the fast recipient
 
     // Fast client received, slow did not
     assert_eq!(fast_conn.count(), 1);
@@ -876,8 +877,9 @@ fn test_flush_volatile_slow_sends_and_clears() {
     vm.buffer_volatile("/cursors/player1", Bytes::from(r#"{"x": 100}"#), "client2");
 
     // Flush to slow clients
-    let sent = vm.flush_volatile_slow();
+    let (sent, bytes) = vm.flush_volatile_slow();
     assert_eq!(sent, 1);
+    assert!(bytes > 0); // Egress metered for the slow recipient
     assert_eq!(slow_conn.count(), 1);
 
     // Batch is cleared
@@ -908,8 +910,10 @@ fn test_flush_volatile_encode_once() {
     vm.buffer_volatile("/cursors/player1", Bytes::from(r#"{"x": 100}"#), "writer");
 
     // Flush to fast clients
-    let sent = vm.flush_volatile_fast();
+    let (sent, bytes) = vm.flush_volatile_fast();
     assert_eq!(sent, 100);
+    // Egress is metered per recipient: one encoded payload × 100 clients.
+    assert!(bytes > 0);
 
     // With BROADCAST, one connection sends the payload with all client IDs.
     // The mock's send_broadcast_raw increments count by the number of clients.

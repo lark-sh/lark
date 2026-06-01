@@ -97,6 +97,10 @@ export interface DashboardSummary {
   total_reads: number;
   total_events: number;
   avg_latency_us: number;
+  // Volatile portions, tracked separately from the durable totals above.
+  total_volatile_writes: number;
+  total_volatile_bytes_in: number;
+  total_volatile_bytes_out: number;
 }
 
 export interface TimeseriesPoint {

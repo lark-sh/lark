@@ -105,6 +105,9 @@ type DatabaseMetricsRow struct {
 	BytesOut             int64     `json:"bytes_out"`
 	Writes               int64     `json:"writes"`
 	Reads                int64     `json:"reads"`
+	VolatileWrites       int64     `json:"volatile_writes"`
+	VolatileBytesIn      int64     `json:"volatile_bytes_in"`
+	VolatileBytesOut     int64     `json:"volatile_bytes_out"`
 	EventsSent           int64     `json:"events_sent"`
 	PermissionDenials    int       `json:"permission_denials"`
 	ConnectionRejections int       `json:"connection_rejections"`
@@ -125,6 +128,9 @@ type ProjectMetricsRow struct {
 	BytesOut             int64     `json:"bytes_out"`
 	Writes               int64     `json:"writes"`
 	Reads                int64     `json:"reads"`
+	VolatileWrites       int64     `json:"volatile_writes"`
+	VolatileBytesIn      int64     `json:"volatile_bytes_in"`
+	VolatileBytesOut     int64     `json:"volatile_bytes_out"`
 	EventsSent           int64     `json:"events_sent"`
 	PermissionDenials    int       `json:"permission_denials"`
 	ConnectionRejections int       `json:"connection_rejections"`

@@ -323,11 +323,15 @@ impl Database {
         }
 
         // Send directly via stored connections
-        let event_count = self.view_manager.flush_volatile_fast();
+        let (event_count, bytes_sent) = self.view_manager.flush_volatile_fast();
 
         // Record events sent
         if event_count > 0 {
             self.metrics.record_events_sent(event_count as u64);
+        }
+        // Record volatile fan-out egress (durable read_bytes never sees this path)
+        if bytes_sent > 0 {
+            self.metrics.record_volatile_outbound_bytes(bytes_sent);
         }
     }
 
@@ -339,11 +343,15 @@ impl Database {
         }
 
         // Send directly via stored connections and clear batch
-        let event_count = self.view_manager.flush_volatile_slow();
+        let (event_count, bytes_sent) = self.view_manager.flush_volatile_slow();
 
         // Record events sent
         if event_count > 0 {
             self.metrics.record_events_sent(event_count as u64);
+        }
+        // Record volatile fan-out egress (durable read_bytes never sees this path)
+        if bytes_sent > 0 {
+            self.metrics.record_volatile_outbound_bytes(bytes_sent);
         }
     }
 }

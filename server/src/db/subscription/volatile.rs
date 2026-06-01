@@ -101,9 +101,11 @@ impl ViewManager {
 
     /// Flush volatile batches to fast clients (called every 50ms).
     /// Does NOT clear the batch - slow clients may still need it.
-    /// Returns the number of clients that received messages.
-    pub fn flush_volatile_fast(&mut self) -> usize {
+    /// Returns `(clients_sent, bytes_sent)`, where bytes is the total outbound
+    /// payload across all recipients (used for volatile egress metering).
+    pub fn flush_volatile_fast(&mut self) -> (usize, u64) {
         let mut sent_count = 0;
+        let mut bytes_sent: u64 = 0;
 
         for view_key in &self.pending_volatile_views {
             if let Some(view) = self.shared_views.get(view_key) {
@@ -143,8 +145,9 @@ impl ViewManager {
                 let mut firebase_base: Option<Vec<u8>> = None;
 
                 // Use thread-local broadcast buffers for single-pass payload building
-                sent_count += with_broadcast_buffers(|buffers| {
+                let (count, bytes) = with_broadcast_buffers(|buffers| {
                     let mut direct_sent = 0;
+                    let mut direct_bytes: u64 = 0;
 
                     for client_id in &view.fast_subscribers {
                         if let Some(subscriber) = view.subscribers.get(client_id) {
@@ -171,6 +174,7 @@ impl ViewManager {
                                         .is_ok()
                                     {
                                         direct_sent += 1;
+                                        direct_bytes += fb_bytes.len() as u64;
                                     }
                                     continue;
                                 }
@@ -191,6 +195,7 @@ impl ViewManager {
 
                     // Send BROADCAST for each buffer
                     let mut broadcast_sent = 0;
+                    let mut broadcast_bytes: u64 = 0;
                     for ((_, is_firebase), buffer) in buffers.iter_mut() {
                         if buffer.is_empty() {
                             continue;
@@ -210,22 +215,28 @@ impl ViewManager {
                             lark_base.as_slice()
                         };
 
-                        broadcast_sent += buffer.send(message, flags);
+                        let n = buffer.send(message, flags);
+                        broadcast_sent += n;
+                        broadcast_bytes += message.len() as u64 * n as u64;
                     }
 
-                    direct_sent + broadcast_sent
+                    (direct_sent + broadcast_sent, direct_bytes + broadcast_bytes)
                 });
+                sent_count += count;
+                bytes_sent += bytes;
             }
         }
 
-        sent_count
+        (sent_count, bytes_sent)
     }
 
     /// Flush volatile batches to slow clients (called every 250ms).
     /// Clears the batch after sending.
-    /// Returns the number of clients that received messages.
-    pub fn flush_volatile_slow(&mut self) -> usize {
+    /// Returns `(clients_sent, bytes_sent)`, where bytes is the total outbound
+    /// payload across all recipients (used for volatile egress metering).
+    pub fn flush_volatile_slow(&mut self) -> (usize, u64) {
         let mut sent_count = 0;
+        let mut bytes_sent: u64 = 0;
 
         // Collect keys to clear after iteration
         let keys: Vec<_> = self.pending_volatile_views.iter().cloned().collect();
@@ -266,8 +277,9 @@ impl ViewManager {
                             let mut firebase_base: Option<Vec<u8>> = None;
 
                             // Use thread-local broadcast buffers for single-pass payload building
-                            sent_count += with_broadcast_buffers(|buffers| {
+                            let (count, bytes) = with_broadcast_buffers(|buffers| {
                                 let mut direct_sent = 0;
+                                let mut direct_bytes: u64 = 0;
 
                                 for client_id in &view.slow_subscribers {
                                     if let Some(subscriber) = view.subscribers.get(client_id) {
@@ -294,6 +306,7 @@ impl ViewManager {
                                                     .is_ok()
                                                 {
                                                     direct_sent += 1;
+                                                    direct_bytes += fb_bytes.len() as u64;
                                                 }
                                                 continue;
                                             }
@@ -314,6 +327,7 @@ impl ViewManager {
 
                                 // Send BROADCAST for each buffer
                                 let mut broadcast_sent = 0;
+                                let mut broadcast_bytes: u64 = 0;
                                 for ((_, is_firebase), buffer) in buffers.iter_mut() {
                                     if buffer.is_empty() {
                                         continue;
@@ -333,11 +347,15 @@ impl ViewManager {
                                         lark_base.as_slice()
                                     };
 
-                                    broadcast_sent += buffer.send(message, flags);
+                                    let n = buffer.send(message, flags);
+                                    broadcast_sent += n;
+                                    broadcast_bytes += message.len() as u64 * n as u64;
                                 }
 
-                                direct_sent + broadcast_sent
+                                (direct_sent + broadcast_sent, direct_bytes + broadcast_bytes)
                             });
+                            sent_count += count;
+                            bytes_sent += bytes;
                         }
                     }
                 }
@@ -350,7 +368,7 @@ impl ViewManager {
         // Clear pending volatile views set
         self.pending_volatile_views.clear();
 
-        sent_count
+        (sent_count, bytes_sent)
     }
 
     /// Get view count (for testing).

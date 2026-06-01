@@ -204,8 +204,8 @@ impl Database {
             self.view_manager
                 .buffer_volatile(path_str, value_bytes, client_id);
 
-            // Record write metrics for volatile writes too
-            self.metrics.record_write(msg.payload_size);
+            // Meter into the volatile buckets (kept separate from durable writes).
+            self.metrics.record_volatile_write(msg.payload_size);
 
             // No ack for volatile writes
             return None;
@@ -480,8 +480,14 @@ impl Database {
             self.record_processed_write(client_id, request_id);
         }
 
-        // Record write metrics using raw payload size captured at parse time
-        self.metrics.record_write(msg.payload_size);
+        // Record write metrics using raw payload size captured at parse time.
+        // Bucket by the same wire flag that gated WAL/broadcast above so the
+        // metric matches the path this write actually took.
+        if volatile {
+            self.metrics.record_volatile_write(msg.payload_size);
+        } else {
+            self.metrics.record_write(msg.payload_size);
+        }
 
         // Return ack
         if !msg.is_volatile() && !request_id.is_empty() {
@@ -567,8 +573,13 @@ impl Database {
             self.record_processed_write(client_id, request_id);
         }
 
-        // Record write metrics (remove is 0 bytes)
-        self.metrics.record_write(0);
+        // Record write metrics (remove is 0 bytes). Bucket by the same wire flag
+        // that gated WAL/broadcast above.
+        if volatile {
+            self.metrics.record_volatile_write(0);
+        } else {
+            self.metrics.record_write(0);
+        }
 
         // Return ack
         if !request_id.is_empty() {
