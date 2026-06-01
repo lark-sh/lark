@@ -40,6 +40,11 @@ type dashboardSummary struct {
 	TotalReads    int64 `json:"total_reads"`
 	TotalEvents   int64 `json:"total_events"`
 	AvgLatencyUs  int   `json:"avg_latency_us"`
+
+	// Volatile portions, tracked separately from the durable totals above.
+	TotalVolatileWrites   int64 `json:"total_volatile_writes"`
+	TotalVolatileBytesIn  int64 `json:"total_volatile_bytes_in"`
+	TotalVolatileBytesOut int64 `json:"total_volatile_bytes_out"`
 }
 
 type dashboardTimeRange struct {
@@ -174,6 +179,9 @@ func computeSummary(metrics []*db.ProjectMetricsRow) dashboardSummary {
 		s.TotalWrites += m.Writes
 		s.TotalReads += m.Reads
 		s.TotalEvents += m.EventsSent
+		s.TotalVolatileWrites += m.VolatileWrites
+		s.TotalVolatileBytesIn += m.VolatileBytesIn
+		s.TotalVolatileBytesOut += m.VolatileBytesOut
 		if m.P50LatencyUs > 0 {
 			latencySum += int64(m.P50LatencyUs)
 			latencyCount++

@@ -71,9 +71,9 @@ func TestDashboard_AggregatesMetrics(t *testing.T) {
 
 	now := time.Now().UTC()
 	rows := []*db.DatabaseMetricsRow{
-		{Timestamp: now.Add(-30 * time.Minute), ProjectID: "p1", DatabaseID: "db1", CCU: 5, PeakCCU: 5, BytesIn: 100, BytesOut: 200, Writes: 10, Reads: 20, EventsSent: 5, P50LatencyUs: 1000, P99LatencyUs: 5000},
-		{Timestamp: now.Add(-20 * time.Minute), ProjectID: "p1", DatabaseID: "db1", CCU: 8, PeakCCU: 10, BytesIn: 150, BytesOut: 250, Writes: 15, Reads: 25, EventsSent: 7, P50LatencyUs: 1200, P99LatencyUs: 6000},
-		{Timestamp: now.Add(-10 * time.Minute), ProjectID: "p1", DatabaseID: "db1", CCU: 3, PeakCCU: 8, BytesIn: 50, BytesOut: 100, Writes: 5, Reads: 10, EventsSent: 2, P50LatencyUs: 800, P99LatencyUs: 4000},
+		{Timestamp: now.Add(-30 * time.Minute), ProjectID: "p1", DatabaseID: "db1", CCU: 5, PeakCCU: 5, BytesIn: 100, BytesOut: 200, Writes: 10, Reads: 20, VolatileWrites: 1, VolatileBytesIn: 8, VolatileBytesOut: 80, EventsSent: 5, P50LatencyUs: 1000, P99LatencyUs: 5000},
+		{Timestamp: now.Add(-20 * time.Minute), ProjectID: "p1", DatabaseID: "db1", CCU: 8, PeakCCU: 10, BytesIn: 150, BytesOut: 250, Writes: 15, Reads: 25, VolatileWrites: 2, VolatileBytesIn: 16, VolatileBytesOut: 160, EventsSent: 7, P50LatencyUs: 1200, P99LatencyUs: 6000},
+		{Timestamp: now.Add(-10 * time.Minute), ProjectID: "p1", DatabaseID: "db1", CCU: 3, PeakCCU: 8, BytesIn: 50, BytesOut: 100, Writes: 5, Reads: 10, VolatileWrites: 3, VolatileBytesIn: 24, VolatileBytesOut: 240, EventsSent: 2, P50LatencyUs: 800, P99LatencyUs: 4000},
 	}
 	seedMetrics(t, store, "p1", rows)
 
@@ -98,6 +98,15 @@ func TestDashboard_AggregatesMetrics(t *testing.T) {
 	}
 	if resp.Summary.TotalWrites != 30 {
 		t.Errorf("total_writes: got %d, want 30", resp.Summary.TotalWrites)
+	}
+	if resp.Summary.TotalVolatileWrites != 6 {
+		t.Errorf("total_volatile_writes: got %d, want 6", resp.Summary.TotalVolatileWrites)
+	}
+	if resp.Summary.TotalVolatileBytesIn != 48 {
+		t.Errorf("total_volatile_bytes_in: got %d, want 48", resp.Summary.TotalVolatileBytesIn)
+	}
+	if resp.Summary.TotalVolatileBytesOut != 480 {
+		t.Errorf("total_volatile_bytes_out: got %d, want 480", resp.Summary.TotalVolatileBytesOut)
 	}
 	if resp.Summary.AvgLatencyUs != 1000 {
 		// (1000 + 1200 + 800) / 3 = 1000

@@ -86,9 +86,17 @@ export function ProjectDashboard() {
   }
 
   const { summary, timeseries, recent_events } = dashboard;
+  // Headline values are grand totals (durable + volatile); the durable totals
+  // are now durable-only, so the subtitles break out the volatile portion.
   const totalBandwidth =
-    (summary?.total_bytes_in ?? 0) + (summary?.total_bytes_out ?? 0);
-  const totalOps = (summary?.total_writes ?? 0) + (summary?.total_reads ?? 0);
+    (summary?.total_bytes_in ?? 0) +
+    (summary?.total_bytes_out ?? 0) +
+    (summary?.total_volatile_bytes_in ?? 0) +
+    (summary?.total_volatile_bytes_out ?? 0);
+  const totalOps =
+    (summary?.total_writes ?? 0) +
+    (summary?.total_reads ?? 0) +
+    (summary?.total_volatile_writes ?? 0);
   const avgLatencyMs = summary?.avg_latency_us ? summary.avg_latency_us / 1000 : 0;
 
   return (
@@ -134,14 +142,14 @@ export function ProjectDashboard() {
           <StatsCard
             title="Bandwidth"
             value={formatBytes(totalBandwidth)}
-            subtitle={`${formatBytes(summary?.total_bytes_in ?? 0)} in / ${formatBytes(summary?.total_bytes_out ?? 0)} out`}
+            subtitle={`${formatBytes(summary?.total_bytes_in ?? 0)} in / ${formatBytes(summary?.total_bytes_out ?? 0)} out · vol ${formatBytes(summary?.total_volatile_bytes_in ?? 0)} in / ${formatBytes(summary?.total_volatile_bytes_out ?? 0)} out`}
             active={metric === 'bandwidth'}
             onClick={() => setMetric('bandwidth')}
           />
           <StatsCard
             title="Operations"
             value={formatNumber(totalOps)}
-            subtitle={`${formatNumber(summary?.total_writes ?? 0)} writes / ${formatNumber(summary?.total_reads ?? 0)} reads / ${formatNumber(summary?.total_events ?? 0)} events`}
+            subtitle={`${formatNumber(summary?.total_writes ?? 0)} writes / ${formatNumber(summary?.total_reads ?? 0)} reads / ${formatNumber(summary?.total_events ?? 0)} events · vol ${formatNumber(summary?.total_volatile_writes ?? 0)} writes`}
             active={metric === 'operations'}
             onClick={() => setMetric('operations')}
           />

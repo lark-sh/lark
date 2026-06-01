@@ -45,6 +45,9 @@ type IncomingMetrics struct {
 	Transactions      int64  `json:"transactions"`
 	WriteBytes        int64  `json:"write_bytes"`
 	ReadBytes         int64  `json:"read_bytes"`
+	VolatileWrites    int64  `json:"volatile_writes"`
+	VolatileBytesIn   int64  `json:"volatile_bytes_in"`
+	VolatileBytesOut  int64  `json:"volatile_bytes_out"`
 	EventsSent        int64  `json:"events_sent"`
 	CCU               int32  `json:"ccu"`
 	Subscriptions     int32  `json:"subscriptions"`
@@ -66,11 +69,16 @@ type bucketKey struct {
 // databaseMetrics accumulates metrics for a single (project, database) over
 // one flush window.
 type databaseMetrics struct {
-	// Counters (reset on flush — SUM over the window)
+	// Counters (reset on flush — SUM over the window). Bytes/Writes are
+	// durable-only; volatile traffic is metered in the Volatile* counters so
+	// the durable figures stay clean for billing/display.
 	BytesIn           atomic.Int64
 	BytesOut          atomic.Int64
 	Writes            atomic.Int64
 	Reads             atomic.Int64
+	VolatileWrites    atomic.Int64
+	VolatileBytesIn   atomic.Int64
+	VolatileBytesOut  atomic.Int64
 	EventsSent        atomic.Int64
 	PermissionDenials atomic.Int32
 
@@ -210,6 +218,9 @@ func (m *MetricsAggregator) IngestMetrics(metrics *IncomingMetrics) {
 	b.BytesOut.Add(metrics.ReadBytes)
 	b.Writes.Add(metrics.Writes)
 	b.Reads.Add(metrics.Reads)
+	b.VolatileWrites.Add(metrics.VolatileWrites)
+	b.VolatileBytesIn.Add(metrics.VolatileBytesIn)
+	b.VolatileBytesOut.Add(metrics.VolatileBytesOut)
 	b.EventsSent.Add(metrics.EventsSent)
 	b.PermissionDenials.Add(metrics.PermissionDenials)
 
@@ -418,6 +429,9 @@ func (m *MetricsAggregator) Flush(ctx context.Context) error {
 		bytesOut := b.BytesOut.Swap(0)
 		writes := b.Writes.Swap(0)
 		reads := b.Reads.Swap(0)
+		volatileWrites := b.VolatileWrites.Swap(0)
+		volatileBytesIn := b.VolatileBytesIn.Swap(0)
+		volatileBytesOut := b.VolatileBytesOut.Swap(0)
 		eventsSent := b.EventsSent.Swap(0)
 		permissionDenials := b.PermissionDenials.Swap(0)
 		latencySum := b.LatencySum.Swap(0)
@@ -425,8 +439,10 @@ func (m *MetricsAggregator) Flush(ctx context.Context) error {
 		b.LatencyMax.Store(0)
 		dataSizeBytes := b.DataSizeBytes.Load() // gauge — don't reset
 
-		// Skip if no activity
-		if writes == 0 && reads == 0 && eventsSent == 0 && bytesIn == 0 && bytesOut == 0 {
+		// Skip if no activity. Volatile-only windows must still flush, so the
+		// volatile counters count as activity too.
+		if writes == 0 && reads == 0 && eventsSent == 0 && bytesIn == 0 && bytesOut == 0 &&
+			volatileWrites == 0 && volatileBytesIn == 0 && volatileBytesOut == 0 {
 			continue
 		}
 
@@ -446,6 +462,9 @@ func (m *MetricsAggregator) Flush(ctx context.Context) error {
 			BytesOut:             bytesOut,
 			Writes:               writes,
 			Reads:                reads,
+			VolatileWrites:       volatileWrites,
+			VolatileBytesIn:      volatileBytesIn,
+			VolatileBytesOut:     volatileBytesOut,
 			EventsSent:           eventsSent,
 			PermissionDenials:    int(permissionDenials),
 			ConnectionRejections: 0, // TODO: Track this

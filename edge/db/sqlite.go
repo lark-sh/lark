@@ -968,10 +968,10 @@ func (db *SqliteDB) InsertDatabaseMetricsBatch(ctx context.Context, metrics []*D
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO database_metrics (
 			ts, project_id, database_id, ccu, peak_ccu, bytes_in, bytes_out,
-			writes, reads, events_sent,
+			writes, reads, volatile_writes, volatile_bytes_in, volatile_bytes_out, events_sent,
 			permission_denials, connection_rejections,
 			data_size_bytes, p50_latency_us, p99_latency_us
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -981,7 +981,7 @@ func (db *SqliteDB) InsertDatabaseMetricsBatch(ctx context.Context, metrics []*D
 	for _, m := range metrics {
 		_, err := stmt.ExecContext(ctx,
 			m.Timestamp.UnixMilli(), m.ProjectID, m.DatabaseID, m.CCU, m.PeakCCU, m.BytesIn, m.BytesOut,
-			m.Writes, m.Reads, m.EventsSent,
+			m.Writes, m.Reads, m.VolatileWrites, m.VolatileBytesIn, m.VolatileBytesOut, m.EventsSent,
 			m.PermissionDenials, m.ConnectionRejections,
 			m.DataSizeBytes, m.P50LatencyUs, m.P99LatencyUs,
 		)
@@ -1015,7 +1015,9 @@ func (db *SqliteDB) GetProjectMetricsRange(ctx context.Context, projectID string
 	rows, err := db.sql.QueryContext(ctx, `
 		SELECT ts, project_id,
 		       SUM(ccu), SUM(peak_ccu), SUM(bytes_in), SUM(bytes_out),
-		       SUM(writes), SUM(reads), SUM(events_sent),
+		       SUM(writes), SUM(reads),
+		       SUM(volatile_writes), SUM(volatile_bytes_in), SUM(volatile_bytes_out),
+		       SUM(events_sent),
 		       SUM(permission_denials), SUM(connection_rejections),
 		       COALESCE(AVG(NULLIF(p50_latency_us, 0)), 0),
 		       COALESCE(AVG(NULLIF(p99_latency_us, 0)), 0)
@@ -1036,7 +1038,8 @@ func (db *SqliteDB) GetProjectMetricsRange(ctx context.Context, projectID string
 		var p50, p99 float64
 		err := rows.Scan(
 			&ts, &m.ProjectID, &m.CCU, &m.PeakCCU, &m.BytesIn, &m.BytesOut,
-			&m.Writes, &m.Reads, &m.EventsSent, &m.PermissionDenials, &m.ConnectionRejections,
+			&m.Writes, &m.Reads, &m.VolatileWrites, &m.VolatileBytesIn, &m.VolatileBytesOut,
+			&m.EventsSent, &m.PermissionDenials, &m.ConnectionRejections,
 			&p50, &p99,
 		)
 		if err != nil {

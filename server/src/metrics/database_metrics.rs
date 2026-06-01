@@ -31,14 +31,24 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 /// Lightweight metrics counters for a single database.
 /// All operations are lock-free atomic increments.
 pub struct DatabaseMetrics {
-    // Operation counts (reset on emit)
+    // Operation counts (reset on emit). These count DURABLE writes only;
+    // volatile writes are tracked separately below.
     writes: AtomicU64,
     reads: AtomicU64,
     transactions: AtomicU64,
 
-    // Byte counts (reset on emit)
+    // Byte counts (reset on emit). Durable-only, mirroring `writes`/`read_bytes`.
     write_bytes: AtomicU64,
     read_bytes: AtomicU64,
+
+    // Volatile counts (reset on emit). Volatile writes skip the WAL and fan out
+    // to subscribers; they're metered in their own buckets so durable usage
+    // (billed/displayed via the counters above) stays clean. `volatile_bytes_in`
+    // is inbound write payload; `volatile_bytes_out` is the fan-out egress that
+    // the durable `read_bytes` path never sees.
+    volatile_writes: AtomicU64,
+    volatile_bytes_in: AtomicU64,
+    volatile_bytes_out: AtomicU64,
 
     // Event counts (reset on emit)
     events_sent: AtomicU64,
@@ -74,6 +84,9 @@ impl DatabaseMetrics {
             transactions: AtomicU64::new(0),
             write_bytes: AtomicU64::new(0),
             read_bytes: AtomicU64::new(0),
+            volatile_writes: AtomicU64::new(0),
+            volatile_bytes_in: AtomicU64::new(0),
+            volatile_bytes_out: AtomicU64::new(0),
             events_sent: AtomicU64::new(0),
             permission_denials: AtomicU32::new(0),
             size_rejections: AtomicU32::new(0),
@@ -90,11 +103,28 @@ impl DatabaseMetrics {
     // Recording methods (called on every operation - must be fast)
     // =========================================================================
 
-    /// Record a write operation (SET, UPDATE, REMOVE).
+    /// Record a durable write operation (SET, UPDATE, REMOVE).
     #[inline]
     pub fn record_write(&self, bytes: usize) {
         self.writes.fetch_add(1, Ordering::Relaxed);
         self.write_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Record a volatile write operation. Mirrors [`record_write`] but into the
+    /// volatile buckets, so durable write counts/bytes exclude volatile traffic.
+    #[inline]
+    pub fn record_volatile_write(&self, bytes: usize) {
+        self.volatile_writes.fetch_add(1, Ordering::Relaxed);
+        self.volatile_bytes_in
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Record outbound bytes from volatile fan-out (batched flush to
+    /// subscribers). This is the volatile analogue of [`record_outbound_bytes`];
+    /// the durable `read_bytes` path never observes these sends.
+    #[inline]
+    pub fn record_volatile_outbound_bytes(&self, bytes: u64) {
+        self.volatile_bytes_out.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Record operation latency (TCP receive to processing complete).
@@ -203,15 +233,24 @@ impl DatabaseMetrics {
         let writes = self.writes.swap(0, Ordering::Relaxed);
         let reads = self.reads.swap(0, Ordering::Relaxed);
         let events = self.events_sent.swap(0, Ordering::Relaxed);
+        let volatile_writes = self.volatile_writes.swap(0, Ordering::Relaxed);
+        let volatile_bytes_out = self.volatile_bytes_out.swap(0, Ordering::Relaxed);
 
-        // Skip if no activity
-        if writes == 0 && reads == 0 && events == 0 {
+        // Skip if no activity. Volatile-only windows (durable counters all zero)
+        // must still emit, so include the volatile signals here.
+        if writes == 0
+            && reads == 0
+            && events == 0
+            && volatile_writes == 0
+            && volatile_bytes_out == 0
+        {
             return None;
         }
 
         let transactions = self.transactions.swap(0, Ordering::Relaxed);
         let write_bytes = self.write_bytes.swap(0, Ordering::Relaxed);
         let read_bytes = self.read_bytes.swap(0, Ordering::Relaxed);
+        let volatile_bytes_in = self.volatile_bytes_in.swap(0, Ordering::Relaxed);
 
         let permission_denials = self.permission_denials.swap(0, Ordering::Relaxed);
         let size_rejections = self.size_rejections.swap(0, Ordering::Relaxed);
@@ -231,6 +270,9 @@ impl DatabaseMetrics {
             transactions,
             write_bytes,
             read_bytes,
+            volatile_writes,
+            volatile_bytes_in,
+            volatile_bytes_out,
             events_sent: events,
             permission_denials,
             size_rejections,
@@ -263,6 +305,9 @@ pub struct DatabaseMetricsSnapshot {
     pub transactions: u64,
     pub write_bytes: u64,
     pub read_bytes: u64,
+    pub volatile_writes: u64,
+    pub volatile_bytes_in: u64,
+    pub volatile_bytes_out: u64,
     pub events_sent: u64,
 
     // Error counters
@@ -290,7 +335,7 @@ impl DatabaseMetricsSnapshot {
             .unwrap_or(0);
 
         format!(
-            r#"{{"type":"db_metrics","ts":{},"server":"{}","core":{},"project":"{}","database":"{}","writes":{},"reads":{},"transactions":{},"write_bytes":{},"read_bytes":{},"events_sent":{},"ccu":{},"subscriptions":{},"data_size_bytes":{},"latency_avg_us":{},"latency_max_us":{},"permission_denials":{},"size_rejections":{}}}"#,
+            r#"{{"type":"db_metrics","ts":{},"server":"{}","core":{},"project":"{}","database":"{}","writes":{},"reads":{},"transactions":{},"write_bytes":{},"read_bytes":{},"volatile_writes":{},"volatile_bytes_in":{},"volatile_bytes_out":{},"events_sent":{},"ccu":{},"subscriptions":{},"data_size_bytes":{},"latency_avg_us":{},"latency_max_us":{},"permission_denials":{},"size_rejections":{}}}"#,
             ts,
             server,
             core_id,
@@ -301,6 +346,9 @@ impl DatabaseMetricsSnapshot {
             self.transactions,
             self.write_bytes,
             self.read_bytes,
+            self.volatile_writes,
+            self.volatile_bytes_in,
+            self.volatile_bytes_out,
             self.events_sent,
             self.current_ccu,
             self.current_subscriptions,
@@ -328,6 +376,44 @@ mod tests {
 
         assert_eq!(snapshot.writes, 2);
         assert_eq!(snapshot.write_bytes, 3072);
+    }
+
+    #[test]
+    fn test_record_volatile_write_is_separate_from_durable() {
+        let metrics = DatabaseMetrics::new();
+
+        metrics.record_write(1000);
+        metrics.record_volatile_write(256);
+        metrics.record_volatile_write(256);
+        metrics.record_volatile_outbound_bytes(4096);
+
+        let snapshot = metrics.emit_and_reset().unwrap();
+
+        // Durable buckets exclude volatile.
+        assert_eq!(snapshot.writes, 1);
+        assert_eq!(snapshot.write_bytes, 1000);
+        assert_eq!(snapshot.read_bytes, 0);
+
+        // Volatile buckets are tracked on their own.
+        assert_eq!(snapshot.volatile_writes, 2);
+        assert_eq!(snapshot.volatile_bytes_in, 512);
+        assert_eq!(snapshot.volatile_bytes_out, 4096);
+    }
+
+    #[test]
+    fn test_volatile_only_window_still_emits() {
+        let metrics = DatabaseMetrics::new();
+
+        // No durable writes/reads/events — only volatile activity.
+        metrics.record_volatile_write(128);
+        metrics.record_volatile_outbound_bytes(2048);
+
+        let snapshot = metrics
+            .emit_and_reset()
+            .expect("volatile-only activity should still emit");
+        assert_eq!(snapshot.writes, 0);
+        assert_eq!(snapshot.volatile_writes, 1);
+        assert_eq!(snapshot.volatile_bytes_out, 2048);
     }
 
     #[test]
@@ -445,6 +531,9 @@ mod tests {
             transactions: 10,
             write_bytes: 50000,
             read_bytes: 100000,
+            volatile_writes: 40,
+            volatile_bytes_in: 8000,
+            volatile_bytes_out: 64000,
             events_sent: 500,
             permission_denials: 2,
             size_rejections: 1,
