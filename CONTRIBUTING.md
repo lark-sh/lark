@@ -88,7 +88,7 @@ Common extension points (the relevant source files are noted inline):
 
 - **A new wire operation:** define the message in
   `server/src/protocol/messages.rs`, add it to `InboxMessage` and handle it in the
-  `run()` loop in `server/src/db/database.rs`, then add tests under
+  `run()` loop in `server/src/db/database/run.rs`, then add tests under
   `server/tests/integration_*.rs`.
 - **A rules built-in:** add a method on `DataSnapshot`
   (`server/src/rules/snapshot.rs`) and dispatch it in
@@ -240,7 +240,7 @@ interesting bit is `SortKey` (`server/src/db/value.rs`), which wraps
 `ArcValue` with mixed-type ordering (null < bool < number <
 string < object).
 
-**`InboxMessage`** (`server/src/db/database.rs`)
+**`InboxMessage`** (`server/src/db/database/mod.rs`)
 
 The single enum carrying work into a database. Every wire-protocol op
 (set, update, delete, subscribe, transaction, ondisconnect, etc.) plus

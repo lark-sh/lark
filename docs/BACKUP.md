@@ -113,7 +113,7 @@ fallback when neither is available.
 
 On startup, lark-server opens each `blob.lark`, reads its `blob.generation` and
 `sequence`, and replays any WAL entries newer than `sequence` forward
-(`load_from_disk` / `load_wal_entries` in `server/src/db/database.rs`). **Restore
+(`load_from_disk` / `load_wal_entries` in `server/src/db/database/persistence.rs`). **Restore
 uses the exact same path as a normal startup** — there is no separate recovery
 mode. A backup is just a database that hasn't been opened yet.
 
