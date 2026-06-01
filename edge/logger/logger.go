@@ -122,4 +122,3 @@ func Warn(message string, kvs ...interface{}) {
 func Error(message string, kvs ...interface{}) {
 	log(LevelError, message, kvs...)
 }
-

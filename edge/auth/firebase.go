@@ -40,12 +40,12 @@ var (
 // FirebaseClaims represents the claims in a Firebase ID token.
 type FirebaseClaims struct {
 	jwt.RegisteredClaims
-	AuthTime int64         `json:"auth_time"`         // Time of authentication
-	Firebase FirebaseInfo  `json:"firebase"`          // Firebase-specific info
-	UID      string        `json:"user_id"`           // User ID (also in sub)
-	Email    string        `json:"email,omitempty"`   // User's email
-	Name     string        `json:"name,omitempty"`    // User's display name
-	Picture  string        `json:"picture,omitempty"` // User's profile picture URL
+	AuthTime int64        `json:"auth_time"`         // Time of authentication
+	Firebase FirebaseInfo `json:"firebase"`          // Firebase-specific info
+	UID      string       `json:"user_id"`           // User ID (also in sub)
+	Email    string       `json:"email,omitempty"`   // User's email
+	Name     string       `json:"name,omitempty"`    // User's display name
+	Picture  string       `json:"picture,omitempty"` // User's profile picture URL
 }
 
 // FirebaseInfo contains Firebase-specific authentication info.

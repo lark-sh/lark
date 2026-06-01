@@ -20,10 +20,10 @@ import (
 // right now") are omitted in v1 — the timeseries' final point is good
 // enough for most rendering purposes.
 type adminDashboardResponse struct {
-	Project    dashboardProject     `json:"project"`
-	Summary    *dashboardSummary    `json:"summary,omitempty"`
-	TimeRange  dashboardTimeRange   `json:"time_range"`
-	Timeseries []dashboardPoint     `json:"timeseries"`
+	Project      dashboardProject    `json:"project"`
+	Summary      *dashboardSummary   `json:"summary,omitempty"`
+	TimeRange    dashboardTimeRange  `json:"time_range"`
+	Timeseries   []dashboardPoint    `json:"timeseries"`
 	RecentEvents []*db.DatabaseEvent `json:"recent_events"`
 }
 
@@ -48,15 +48,15 @@ type dashboardTimeRange struct {
 }
 
 type dashboardPoint struct {
-	Timestamp     time.Time `json:"ts"`
-	CCU           int       `json:"ccu"`
-	BytesIn       int64     `json:"bytes_in"`
-	BytesOut      int64     `json:"bytes_out"`
-	Writes        int64     `json:"writes"`
-	Reads         int64     `json:"reads"`
-	EventsSent    int64     `json:"events_sent"`
-	P50LatencyUs  int       `json:"p50_latency_us"`
-	P99LatencyUs  int       `json:"p99_latency_us"`
+	Timestamp    time.Time `json:"ts"`
+	CCU          int       `json:"ccu"`
+	BytesIn      int64     `json:"bytes_in"`
+	BytesOut     int64     `json:"bytes_out"`
+	Writes       int64     `json:"writes"`
+	Reads        int64     `json:"reads"`
+	EventsSent   int64     `json:"events_sent"`
+	P50LatencyUs int       `json:"p50_latency_us"`
+	P99LatencyUs int       `json:"p99_latency_us"`
 }
 
 const (
@@ -97,9 +97,9 @@ func (s *Server) handleAdminProjectDashboard(w http.ResponseWriter, r *http.Requ
 	}
 
 	resp := adminDashboardResponse{
-		Project: dashboardProject{ID: project.ID, Name: project.Name},
-		TimeRange: dashboardTimeRange{Start: start, End: end},
-		Timeseries: buildTimeseries(metrics),
+		Project:      dashboardProject{ID: project.ID, Name: project.Name},
+		TimeRange:    dashboardTimeRange{Start: start, End: end},
+		Timeseries:   buildTimeseries(metrics),
 		RecentEvents: events,
 	}
 	if len(metrics) > 0 {

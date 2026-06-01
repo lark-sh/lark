@@ -70,7 +70,6 @@ func init() {
 	}
 }
 
-
 // Conn represents a single connection to a backend server
 type Conn struct {
 	conn    net.Conn

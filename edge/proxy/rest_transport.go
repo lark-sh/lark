@@ -63,9 +63,9 @@ import (
 )
 
 var (
-	ErrRESTTimeout       = errors.New("REST request timed out")
-	ErrRESTClientClosed  = errors.New("REST client closed")
-	ErrResponseMismatch  = errors.New("unexpected response format")
+	ErrRESTTimeout      = errors.New("REST request timed out")
+	ErrRESTClientClosed = errors.New("REST client closed")
+	ErrResponseMismatch = errors.New("unexpected response format")
 )
 
 // RESTTransport implements ClientTransport for REST clients.

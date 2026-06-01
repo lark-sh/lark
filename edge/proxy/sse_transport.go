@@ -80,8 +80,8 @@ type SSETransport struct {
 	databaseID string
 	client     *ClientConn
 
-	eventCh   chan []byte     // All events streamed here
-	doneCh    chan struct{}   // Closed when connection should end
+	eventCh   chan []byte   // All events streamed here
+	doneCh    chan struct{} // Closed when connection should end
 	closeOnce sync.Once
 
 	mu     sync.Mutex

@@ -437,4 +437,3 @@ func printBootstrapBanner(dashURL, email, password string) {
 	fmt.Fprintln(os.Stderr, bar)
 	fmt.Fprintln(os.Stderr)
 }
-

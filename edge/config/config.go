@@ -81,8 +81,8 @@ type Config struct {
 	BackendAddrs []string // List of backend server addresses for direct connection
 
 	// Coordinator settings
-	CoordinatorAddr string // Address of coordinator API (for routing lookups if not self)
-	IsSelfCoordinator bool  // If true, this proxy handles coordinator duties
+	CoordinatorAddr   string // Address of coordinator API (for routing lookups if not self)
+	IsSelfCoordinator bool   // If true, this proxy handles coordinator duties
 
 	// Domain settings
 	LarkDBDomain string // e.g., "larkdb.net" for *.larkdb.net routing
