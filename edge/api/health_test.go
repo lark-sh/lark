@@ -18,6 +18,8 @@ func (m *mockPool) GetHealthyBackendIDs() []string {
 	return m.backends
 }
 
+func (m *mockPool) TriggerDiscovery() {}
+
 func TestHealthEndpoint(t *testing.T) {
 	cfg := &config.Config{
 		HeartbeatTimeout: 30,
