@@ -56,5 +56,13 @@ func (s *Server) handleRegisterServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Kick off a discovery pass so this edge connects to the new server
+	// immediately and marks it healthy, rather than waiting for the next
+	// periodic discovery tick. Runs in the background; we don't block the
+	// registration response on the connection handshake.
+	if s.pool != nil {
+		s.pool.TriggerDiscovery()
+	}
+
 	s.writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

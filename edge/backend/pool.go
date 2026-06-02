@@ -205,6 +205,14 @@ type Pool struct {
 	// Client notifier for backend events that require client disconnection
 	clientNotifier ClientNotifier
 
+	// Server discovery source, stored when the discovery loop starts so a
+	// server registration can trigger an immediate discovery pass instead of
+	// waiting for the next periodic tick. discoveryMu serializes discovery
+	// passes so the periodic loop and registration-triggered passes can't
+	// race to AddBackend the same server.
+	discovery   ServerDiscovery
+	discoveryMu sync.Mutex
+
 	// Config
 	connectTimeout time.Duration
 	writeTimeout   time.Duration
@@ -257,6 +265,17 @@ func (p *Pool) AddBackend(serverID, address string) error {
 
 	if p.closed {
 		return ErrPoolClosed
+	}
+
+	// Idempotency guard: another caller (the discovery loop, a
+	// registration-triggered pass, or on-demand routing via
+	// GetOrCreateBackend) may have already added this server while we waited
+	// for the lock. Re-check under the lock so we don't dial a second time and
+	// overwrite the live backend, which would orphan its connections and
+	// goroutines. Reconnects always RemoveBackend first, so a present entry is
+	// always a healthy one we should keep.
+	if _, exists := p.backends[serverID]; exists {
+		return nil
 	}
 
 	// First, establish one connection to learn the server topology
@@ -911,7 +930,7 @@ func (b *Backend) controlLoop() {
 
 		case <-heartbeatTicker.C:
 			// Periodically write aggregated heartbeat to DB
-			b.maybeWriteHeartbeatToDB()
+			b.maybeWriteHeartbeatToDB(false)
 
 		case <-b.done:
 			return
@@ -961,7 +980,17 @@ func (b *Backend) handleHeartbeat(msg *ControlMessage) {
 			LastSeen: time.Now(),
 		}
 	}
+	// First heartbeat from this backend: we've never written its metrics to
+	// the DB, so the server is still 'pending' and invisible to routing.
+	firstHeartbeat := b.lastDBHeartbeat.IsZero()
 	b.mu.Unlock()
+
+	// Flush to the DB immediately on the first heartbeat so the server flips
+	// pending->active right away, instead of waiting up to 10s for the next
+	// controlLoop tick. Steady-state writes are still handled by that tick.
+	if firstHeartbeat {
+		b.maybeWriteHeartbeatToDB(false)
+	}
 
 	// Send HEARTBEAT_ACK back
 	// This needs to go to the specific connection that sent the heartbeat
@@ -987,10 +1016,13 @@ func (b *Backend) sendHeartbeatAck(coreID int) {
 	b.mu.RUnlock()
 }
 
-// maybeWriteHeartbeatToDB writes aggregated heartbeat to the database if enough time has passed
-func (b *Backend) maybeWriteHeartbeatToDB() {
+// maybeWriteHeartbeatToDB writes aggregated heartbeat to the database. Unless
+// force is set, it skips if the last write was under 10s ago to avoid hammering
+// the DB. force is used to re-assert the server's 'active' status immediately
+// after a registration resets the row to 'pending' (see discoverServers).
+func (b *Backend) maybeWriteHeartbeatToDB(force bool) {
 	b.mu.Lock()
-	if time.Since(b.lastDBHeartbeat) < 10*time.Second {
+	if !force && time.Since(b.lastDBHeartbeat) < 10*time.Second {
 		b.mu.Unlock()
 		return
 	}
@@ -1324,9 +1356,15 @@ func (p *Pool) StartDiscoveryLoop(discovery ServerDiscovery, interval time.Durat
 		interval = 15 * time.Second
 	}
 
+	// Store the discovery source so TriggerDiscovery can run an out-of-band
+	// pass when a server registers.
+	p.mu.Lock()
+	p.discovery = discovery
+	p.mu.Unlock()
+
 	go func() {
 		// Run immediately on startup
-		p.discoverServers(discovery)
+		p.runDiscovery(discovery, false)
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -1334,7 +1372,7 @@ func (p *Pool) StartDiscoveryLoop(discovery ServerDiscovery, interval time.Durat
 		for {
 			select {
 			case <-ticker.C:
-				p.discoverServers(discovery)
+				p.runDiscovery(discovery, false)
 			}
 		}
 	}()
@@ -1342,9 +1380,37 @@ func (p *Pool) StartDiscoveryLoop(discovery ServerDiscovery, interval time.Durat
 	logger.Info("Server discovery loop started", "interval", interval)
 }
 
+// TriggerDiscovery runs a single discovery pass out of band, in the
+// background. The registration handler calls this when a server registers so
+// the edge connects to it immediately rather than waiting for the next
+// periodic discovery tick (up to `interval` away). No-op if the discovery
+// loop hasn't been started (e.g. local mode).
+func (p *Pool) TriggerDiscovery() {
+	p.mu.RLock()
+	discovery := p.discovery
+	p.mu.RUnlock()
+
+	if discovery == nil {
+		return
+	}
+	// forceReactivate: registration just reset this server's DB row to
+	// 'pending'. If we already hold a healthy connection to it, re-assert
+	// 'active' immediately rather than waiting for the next heartbeat tick.
+	go p.runDiscovery(discovery, true)
+}
+
+// runDiscovery serializes discovery passes via discoveryMu so the periodic
+// loop and registration-triggered passes can't concurrently AddBackend the
+// same newly-registered server.
+func (p *Pool) runDiscovery(discovery ServerDiscovery, forceReactivate bool) {
+	p.discoveryMu.Lock()
+	defer p.discoveryMu.Unlock()
+	p.discoverServers(discovery, forceReactivate)
+}
+
 // discoverServers queries the database for servers and connects to any new ones
 // Also removes unhealthy backends so they can be reconnected
-func (p *Pool) discoverServers(discovery ServerDiscovery) {
+func (p *Pool) discoverServers(discovery ServerDiscovery, forceReactivate bool) {
 	servers, err := discovery.GetServersForDiscovery()
 	if err != nil {
 		logger.Error("Discovery error", "error", err)
@@ -1367,6 +1433,11 @@ func (p *Pool) discoverServers(discovery ServerDiscovery) {
 				logger.Warn("Backend has no healthy connections, removing for reconnect", "server_id", s.ServerID)
 				p.RemoveBackend(s.ServerID)
 				exists = false
+			} else if forceReactivate {
+				// We already hold a healthy connection. A registration just
+				// reset this server's row to 'pending'; re-assert 'active' now
+				// so routing isn't blocked until the next heartbeat tick.
+				existing.maybeWriteHeartbeatToDB(true)
 			}
 		}
 

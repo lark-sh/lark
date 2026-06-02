@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -62,6 +63,116 @@ func TestPoolGetBackendNotFound(t *testing.T) {
 	_, err := pool.GetBackend("nonexistent")
 	if err != ErrNoConnections {
 		t.Errorf("expected ErrNoConnections, got %v", err)
+	}
+}
+
+// countingDiscovery is a ServerDiscovery that records how many discovery
+// passes ran and returns no servers (so runDiscovery never dials).
+type countingDiscovery struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (d *countingDiscovery) GetServersForDiscovery() ([]ServerInfo, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.calls++
+	return nil, nil
+}
+
+func (d *countingDiscovery) count() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.calls
+}
+
+// recordingConfigProvider counts UpdateServerHeartbeat calls — each one is a DB
+// write that flips a server 'active'.
+type recordingConfigProvider struct {
+	mu         sync.Mutex
+	heartbeats int
+}
+
+func (r *recordingConfigProvider) GetProjectConfig(string) (*ProjectConfig, error) {
+	return nil, nil
+}
+func (r *recordingConfigProvider) EvictDatabases([]EvictionRequest) error { return nil }
+func (r *recordingConfigProvider) UpdateServerHeartbeat(_ string, _, _, _ int) error {
+	r.mu.Lock()
+	r.heartbeats++
+	r.mu.Unlock()
+	return nil
+}
+func (r *recordingConfigProvider) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.heartbeats
+}
+
+func TestMaybeWriteHeartbeatToDBForce(t *testing.T) {
+	cp := &recordingConfigProvider{}
+	pool := NewPool(2, "test-secret")
+	defer pool.Close()
+	pool.SetConfigProvider(cp)
+
+	b := &Backend{
+		ServerID:    "s1",
+		pool:        pool,
+		coreMetrics: []CoreMetrics{{Clients: 1, LastSeen: time.Now()}},
+	}
+
+	// First write (lastDBHeartbeat zero) goes through and flips the server active.
+	b.maybeWriteHeartbeatToDB(false)
+	if got := cp.count(); got != 1 {
+		t.Fatalf("first write: got %d heartbeat writes, want 1", got)
+	}
+
+	// A non-forced write within 10s is rate-limited away.
+	b.maybeWriteHeartbeatToDB(false)
+	if got := cp.count(); got != 1 {
+		t.Fatalf("non-forced write within 10s should be skipped, got %d", got)
+	}
+
+	// A forced write bypasses the 10s guard. This is what re-asserts 'active'
+	// immediately after a registration resets the server row to 'pending'.
+	b.maybeWriteHeartbeatToDB(true)
+	if got := cp.count(); got != 2 {
+		t.Fatalf("forced write should bypass the 10s guard, got %d", got)
+	}
+}
+
+func TestTriggerDiscoveryNoopWithoutDiscovery(t *testing.T) {
+	pool := NewPool(2, "test-secret")
+	defer pool.Close()
+
+	// No discovery loop started: TriggerDiscovery must be a safe no-op
+	// (e.g. local mode never starts discovery).
+	pool.TriggerDiscovery()
+}
+
+func TestTriggerDiscoveryRunsPass(t *testing.T) {
+	pool := NewPool(2, "test-secret")
+	defer pool.Close()
+
+	disc := &countingDiscovery{}
+	// Wire the discovery source directly (white-box) so we don't also spin up
+	// the periodic loop goroutine and race its immediate pass into the count.
+	pool.mu.Lock()
+	pool.discovery = disc
+	pool.mu.Unlock()
+
+	pool.TriggerDiscovery()
+
+	// TriggerDiscovery runs the pass in a goroutine; wait for it.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if disc.count() >= 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := disc.count(); got != 1 {
+		t.Errorf("expected exactly 1 discovery pass, got %d", got)
 	}
 }
 
@@ -222,6 +333,67 @@ func TestGetOrCreateBackendNew(t *testing.T) {
 
 	if backend1 != backend2 {
 		t.Error("Expected same backend instance")
+	}
+}
+
+func TestAddBackendIsIdempotent(t *testing.T) {
+	listener, cleanup := mockServer(t, 2)
+	defer cleanup()
+
+	pool := NewPool(1, "test-secret")
+	defer pool.Close()
+
+	addr := listener.Addr().String()
+
+	if err := pool.AddBackend("dup-server", addr); err != nil {
+		t.Fatalf("AddBackend failed: %v", err)
+	}
+	first, err := pool.GetBackend("dup-server")
+	if err != nil {
+		t.Fatalf("GetBackend failed: %v", err)
+	}
+
+	// A second AddBackend for the same server must not dial again or replace
+	// the live backend — it should no-op and leave the original in place.
+	if err := pool.AddBackend("dup-server", addr); err != nil {
+		t.Fatalf("second AddBackend failed: %v", err)
+	}
+	second, err := pool.GetBackend("dup-server")
+	if err != nil {
+		t.Fatalf("GetBackend (2nd) failed: %v", err)
+	}
+	if first != second {
+		t.Error("second AddBackend replaced the live backend instead of no-oping")
+	}
+}
+
+func TestAddBackendConcurrentSameServer(t *testing.T) {
+	listener, cleanup := mockServer(t, 2)
+	defer cleanup()
+
+	pool := NewPool(1, "test-secret")
+	defer pool.Close()
+
+	addr := listener.Addr().String()
+
+	// Race several callers adding the same brand-new server (mirrors the
+	// discovery loop, a registration push, and on-demand routing colliding).
+	// Exactly one backend instance must win; the rest must no-op.
+	const n = 8
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			if err := pool.AddBackend("race-server", addr); err != nil {
+				t.Errorf("AddBackend failed: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if _, err := pool.GetBackend("race-server"); err != nil {
+		t.Fatalf("expected exactly one backend after concurrent adds: %v", err)
 	}
 }
 

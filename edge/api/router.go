@@ -40,9 +40,14 @@ type Server struct {
 	loginThrottle *loginThrottle
 }
 
-// BackendPool is the interface for checking backend health
+// BackendPool is the interface for checking backend health and kicking off
+// server discovery.
 type BackendPool interface {
 	GetHealthyBackendIDs() []string
+	// TriggerDiscovery runs a discovery pass out of band so a freshly
+	// registered server is connected to (and marked healthy) immediately
+	// rather than on the next periodic discovery tick.
+	TriggerDiscovery()
 }
 
 // New creates a new API server
