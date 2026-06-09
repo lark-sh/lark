@@ -8,7 +8,7 @@ If you're migrating an existing Firebase app to Lark, this is roughly the same c
 
 ## What you'll need
 
-- **Node 18–20** and **npm ≥ 9** (the quickstart is quite old) (Use `nvm install 22` and `nvm use 22`)
+- **Node 18 or newer** and **npm ≥ 9** (e.g. `nvm install 22` and `nvm use 22`)
 - **Docker** + `make` (for the local Lark stack)
 - A **Firebase project** in the Firebase console — free tier, used only for Auth
 - ~5 minutes

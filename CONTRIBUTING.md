@@ -32,7 +32,8 @@ sign a CLA** before their first contribution is merged:
 
 ### Prerequisites
 
-- **Rust** — latest stable (1.78+).
+- **Rust** — the toolchain is pinned in `rust-toolchain.toml`; rustup installs
+  the right version automatically the first time you build.
 - **Docker** — required on macOS: Glommio uses `io_uring` (Linux-only), so the
   Makefile transparently runs Rust commands inside a Linux dev container.
 - **Node.js** — for building the dashboard SPA.

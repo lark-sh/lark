@@ -48,6 +48,13 @@ jobs:
       - name: Test (lib)
         run: cargo test --workspace --lib
 
+      # integration_compact shells out to the lark-compact binary; the Build
+      # step above already produced it (it's a workspace member). The slow
+      # `#[ignore]` storage-worker tests stay out of PR CI — `make test-all`
+      # runs them.
+      - name: Test (integration)
+        run: cargo test --workspace --tests
+
   go:
     name: Go edge — fmt, vet, test
     runs-on: ubuntu-latest
