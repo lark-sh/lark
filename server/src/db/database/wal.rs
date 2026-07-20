@@ -32,7 +32,7 @@ impl Database {
             // Attempt a test write (no-op WAL entry) + sync
             let test_entry = WalEntry::set("/__wal_recovery_test", Value::Bool(true));
             match writer.append_one(&test_entry) {
-                Ok(_) => match writer.sync().await {
+                Ok(_) => match writer.sync(fsync_on_wal_flush()).await {
                     Ok(_) => {
                         self.wal_failed = false;
                         self.wal_dirty = false;
@@ -151,7 +151,6 @@ impl Database {
         }
     }
 
-    /// Write an UPDATE operation to the WAL (async).
     /// Write an UPDATE operation to the WAL (in-memory buffer only, no I/O).
     /// Returns false if serialization failed (caller should NACK).
     pub(super) fn wal_write_update(
@@ -216,8 +215,11 @@ impl Database {
         }
     }
 
-    /// Sync the WAL to disk (async).
-    /// Uses async I/O to avoid blocking other databases on the core.
+    /// Flush the buffered WAL entries to the WAL file (async).
+    ///
+    /// Whether this also issues an `fdatasync` (durable on the device) or only
+    /// writes to the OS page cache is governed by `FSYNC_ON_WAL_FLUSH`. Uses
+    /// async I/O to avoid blocking other databases on the core.
     pub(super) async fn sync_wal(&mut self) {
         if !self.wal_dirty {
             return;
@@ -228,7 +230,7 @@ impl Database {
 
         if let Some(ref mut writer) = self.wal_writer {
             let start = Instant::now();
-            match writer.sync().await {
+            match writer.sync(fsync_on_wal_flush()).await {
                 Ok(rotated) => {
                     let duration = start.elapsed();
                     self.wal_dirty = false;

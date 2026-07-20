@@ -231,7 +231,8 @@ impl Database {
             self.tree.write().unwrap().set(&path, value.clone());
         }
 
-        // Write to WAL for durability (async)
+        // Append to the WAL for durability — buffered in memory here; flushed
+        // (and fdatasync'd, if enabled) on the next WAL sync. See sync_wal.
         self.wal_write_set(path_str, &value);
 
         // Broadcast to subscribers via ViewManager
@@ -459,7 +460,8 @@ impl Database {
             self.tree.write().unwrap().update(&path, &updates);
         }
 
-        // Write to WAL for durability (non-volatile writes only, async)
+        // Append to the WAL for durability (non-volatile writes only) — buffered
+        // in memory here; flushed on the next WAL sync. See sync_wal.
         if !volatile {
             self.wal_write_update(path_str, &updates);
         }
@@ -559,7 +561,8 @@ impl Database {
         // Clear sentinel tracking at and below the deleted path — those nodes are gone
         self.remove_sentinel_paths_below(path_str);
 
-        // Write to WAL for durability (non-volatile writes only, async)
+        // Append to the WAL for durability (non-volatile writes only) — buffered
+        // in memory here; flushed on the next WAL sync. See sync_wal.
         if !volatile {
             self.wal_write_delete(path_str);
         }
