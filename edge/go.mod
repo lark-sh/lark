@@ -12,8 +12,8 @@ require (
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/klauspost/compress v1.18.6
 	github.com/libdns/cloudflare v0.2.2
-	github.com/quic-go/quic-go v0.59.1
-	github.com/quic-go/webtransport-go v0.10.0
+	github.com/quic-go/quic-go v0.60.0
+	github.com/quic-go/webtransport-go v0.11.1
 	golang.org/x/crypto v0.52.0
 	modernc.org/sqlite v1.50.1
 )
