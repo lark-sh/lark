@@ -4,9 +4,9 @@ How to get logs and metrics out of a self-hosted Lark deployment.
 
 Lark gives you two observability primitives:
 
-- **Logs** — both binaries write structured logs to **stdout**. Point `docker logs` / journald /
+- **Logs**: both binaries write structured logs to **stdout**. Point `docker logs`, journald, or
   your log aggregator at them.
-- **Metrics** — `lark-server` tracks per-database usage (writes, reads, bytes, CCU, latency, on-disk
+- **Metrics**: `lark-server` tracks per-database usage (writes, reads, bytes, CCU, latency, on-disk
   size, etc.) and the admin dashboard charts it. In the bundled deployments this **works out of the box**;
   larger or bare-metal setups have a couple of options, covered below.
 
@@ -46,8 +46,8 @@ This is controlled by one environment variable on **lark-server**:
 `<LARK_COORDINATOR_URL>/internal/metrics`. It's best-effort: if lark-edge is briefly unreachable the
 samples are dropped (logged, never blocking the database).
 
-Note that it may take ~5 minutes for the first metrics to show up in the Dashboard, this is expected. Also note that metrics are saved to the 
-lark-edge backing database (SQLite or PostgreSQL), and these do add up over time.
+The first metrics can take ~5 minutes to show up in the dashboard, which is expected. Metrics are
+saved to the lark-edge backing database (SQLite or PostgreSQL), and they do add up over time.
 
 ---
 
@@ -64,14 +64,14 @@ Both components log to stdout:
 
 ## Larger / bare-metal setups: shipping metrics with Vector
 
-`LARK_METRICS_PUSH` is the right answer for a single lark-server talking to a lark-edge. You may want a
-log/metrics shipper like [Vector](https://vector.dev) instead when you want to:
+`LARK_METRICS_PUSH` is the right answer for a single lark-server talking to a lark-edge. A
+log/metrics shipper like [Vector](https://vector.dev) is a better fit when you want to:
 
-- **Fan metrics out off-site** — into Prometheus/Grafana, Datadog, BetterStack, etc., not just Lark's
-  own dashboard.
-- **Run on bare metal / systemd** where you already operate a log pipeline and prefer one path for
+- Fan metrics out off-site, into Prometheus/Grafana, Datadog, BetterStack, and so on, not just
+  Lark's own dashboard.
+- Run on bare metal or systemd where you already operate a log pipeline and prefer one path for
   everything.
-- **Decouple** metric delivery from the database process (buffering, retries, multiple sinks).
+- Decouple metric delivery from the database process (buffering, retries, multiple sinks).
 
 Because `lark-server` also writes every metric sample to **stdout** as a JSON line, a shipper can pick
 them up there regardless of `LARK_METRICS_PUSH`. Each line looks like:
@@ -102,9 +102,9 @@ Samples are emitted every ~60s per **active** database (idle databases emit noth
 If you'd rather Vector deliver metrics to the dashboard (e.g. for buffering across a flaky link), leave
 `LARK_METRICS_PUSH=false` and have Vector POST the same payload to lark-edge's internal endpoint. The
 contract: keep stdout lines where `type == "db_metrics"`, batch them into a JSON **array**, and POST to
-`http://<edge-host>:<internal-port>/internal/metrics` (the internal listener — `:8081` in the bundled
-compose; keep it off the public internet) with an `Authorization: Bearer <SERVER_SECRET>` header — the
-endpoint is authenticated and rejects unauthenticated posts with `401`. Here's an example Vector config:
+`http://<edge-host>:<internal-port>/internal/metrics` (the internal listener, `:8081` in the bundled
+compose; keep it off the public internet) with an `Authorization: Bearer <SERVER_SECRET>` header. The
+endpoint is authenticated and rejects unauthenticated posts with `401`. An example Vector config:
 
 ```toml
 [sources.lark]
@@ -163,7 +163,7 @@ row per active database. The dashboard rolls these up to project level on read. 
 | `peak_ccu` | **max** of the per-emit CCU samples |
 | `ccu` | the **last** sample in the window |
 | `data_size_bytes` | the **last** sample (gauge) |
-| `p50/p99_latency_us` | averaged (approximate — display only) |
+| `p50/p99_latency_us` | averaged (approximate; display only) |
 
 ---
 

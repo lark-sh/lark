@@ -1,17 +1,21 @@
 # Production Deployment
 
+> **Public-facing quickstart:** if you just want a hosted basic deployment up quickly,
+> [`deploy/fly/`](../deploy/fly/README.md) does all of this on Fly.io with one
+> script.
+
 The [README quick start](../README.md#quick-start) (`make up`) is a good starting point for local
 development and testing. However, if you want to run Lark in a production environment, you'll
 need to do a little more work. There are three tiers of deployment, in increasing order of
 complexity:
 
 1. **[Tier 1 — Single host, hardened](#tier-1--single-host-hardened):** one machine,
-  one `lark-edge` + one `lark-server`, real TLS, real secrets, persistent storage,
+  one `lark-edge` + one `lark-server`, real TLS, secrets, persistent storage,
   backups. Suitable for small-to-medium production loads.
 2. **[Tier 2 — Scale the gateway](#tier-2--scale-the-gateway):** *multiple
   `lark-edge` gateways, a single `lark-server`*, with a shared Postgres control
   plane. This scales client connections and gives you gateway-level redundancy
-  while keeping the data tier simple — **one data directory**. This is the "larger
+  while keeping the data tier simple: **one data directory**. This is the "larger
   deployment" most people actually need, and it's the ceiling this guide covers
   concretely. In practice with a large enough bare metal server you can handle up to 
   50k CCU with this tier.
@@ -25,7 +29,7 @@ complexity:
 ## Architecture
 
 Lark is two main pieces plus a control plane. The diagram below shows a **Tier 2**
-deployment — multiple `lark-edge` gateways in front of a single `lark-server` —
+deployment (multiple `lark-edge` gateways in front of a single `lark-server`),
 which is the shape most production deployments take:
 
 ```
@@ -35,7 +39,7 @@ which is the shape most production deployments take:
                ┌────────────────┴────────────────┐
                ▼                                  ▼
      ┌──────────────────┐    ···    ┌──────────────────┐
-     │     lark-edge    │           │     lark-edge    │   Public tier — N gateways
+     │     lark-edge    │           │     lark-edge    │   Public tier: N gateways
      │   (Go gateway)   │           │   (Go gateway)   │   behind DNS RR / a load
      │   coordinator    │           │   coordinator    │   balancer, all sharing
      │  admin dashboard │           │  admin dashboard │   one SERVER_SECRET
@@ -46,7 +50,7 @@ which is the shape most production deployments take:
               ┌───────────────┴───────────────┐
               ▼                                ▼
     ┌──────────────────┐            ┌──────────────────┐
-    │ Postgres / SQLite│            │    lark-server   │   Database tier — ONE
+    │ Postgres / SQLite│            │    lark-server   │   Database tier: ONE
     │                  │            │      (Rust)      │   node (Tiers 1–2)
     │ control plane:   │            │     TCP 2727     │   - thread-per-core
     │ projects, users, │            │                  │   - WAL + blob, LOCAL disk
@@ -66,39 +70,39 @@ the admin dashboard (`/admin/`) and holds all control-plane state (projects,
 admin users, server routing, per-project settings) in its metadata store.
 
 **`lark-server` (the engine)** holds the actual database contents (in-memory tree
-+ WAL + blob on disk) and speaks Lark's wire protocol over plain TCP on its
++ WAL + blob on disk) and speaks Lark's wire protocol over TCP on its
 `--proxy-port` (default 2727). On startup it **registers** itself with the
 coordinator's internal endpoint; the coordinator then routes databases to it via
 consistent hashing. Booting another `lark-server` does get it into the hash ring
-automatically — but the *data does not move with it*, which is why care is needed
+automatically, but the *data does not move with it*, which is why care is needed
 when moving to a Tier 3 setup.
 
 ### Storage: local disk only
 
-This is the single most important operational fact about `lark-server`:
+This is the important operational fact about `lark-server`:
 
 **Each `lark-server` reads and writes its `LARK_DATA_DIR` as exclusively-owned,
-local storage — ideally local NVMe.** The blob format does many small random
+local storage, ideally local NVMe.** The blob format does many small random
 reads and the engine assumes low-latency, exclusively-owned files.
 
 - **Use local NVMe (or equivalent low-latency local block storage).**
-- **Do _not_ put `LARK_DATA_DIR` on a shared/network filesystem** — CephFS, NFS,
-  EBS multi-attach, GlusterFS, etc. You will have a bad time: the small-random-read
+- **Do _not_ put `LARK_DATA_DIR` on a shared/network filesystem** (CephFS, NFS,
+  EBS multi-attach, GlusterFS). You will have a bad time: the small-random-read
   access pattern is pathological over network storage, and Lark assumes a single
   process exclusively owns each data directory.
 - A consequence: a database's data lives on exactly one node's local disk. There
-  is no shared pool that any `lark-server` can serve any database from. This is
-  precisely why adding/removing servers requires data migration.
+  is no shared pool that any `lark-server` can serve any database from. That's
+  why adding or removing servers requires data migration.
 
 ### Components and ports
 
 | Component | Setting | Default | Protocol | Exposure |
 |---|---|---|---|---|
-| `lark-edge` client listener | `HTTPS_LISTEN_ADDR` | `:443` | TCP | **Public** — REST + WebSocket |
-| `lark-edge` WebTransport | `WT_LISTEN_ADDR` (+ `WT_PORTS`) | `:8444` | UDP | **Public** — WebTransport/QUIC |
-| `lark-edge` internal listener | `INTERNAL_LISTEN_ADDR` | `:8080` | TCP | **Private** — server registration + metrics ingest |
+| `lark-edge` client listener | `HTTPS_LISTEN_ADDR` | `:443` | TCP | **Public**: REST + WebSocket |
+| `lark-edge` WebTransport | `WT_LISTEN_ADDR` (+ `WT_PORTS`) | `:8444` | UDP | **Public**: WebTransport/QUIC |
+| `lark-edge` internal listener | `INTERNAL_LISTEN_ADDR` | `:8080` | TCP | **Private**: server registration + metrics ingest |
 | `lark-edge` admin dashboard | path `/admin/` on the client listener | — | TCP | protected by admin auth; restrict at network layer too |
-| `lark-server` wire protocol | `--proxy-port` / `LARK_PROXY_PORT` | `2727` | TCP | **Private** — only `lark-edge` should reach it |
+| `lark-server` wire protocol | `--proxy-port` / `LARK_PROXY_PORT` | `2727` | TCP | **Private**: only `lark-edge` should reach it |
 
 The two **private** rows are the critical firewall boundary: `lark-server`'s
 `2727` and `lark-edge`'s internal listener must be reachable only from within your
@@ -115,9 +119,6 @@ Both server-to-server channels are also **authenticated** with the shared
   require an `Authorization: Bearer <SERVER_SECRET>` header; without it they return
   `401`, so a caller that reaches the internal port still can't register a rogue
   backend or poison metrics.
-
-Treat this as defense-in-depth, not a license to expose these ports — keep them
-private *and* set a strong secret.
 
 ### DNS: clients connect to a per-database hostname
 
@@ -136,24 +137,24 @@ requirement, from Tier 1 onward:
 **Point a wildcard DNS record `*.<LARKDB_DOMAIN>` at your `lark-edge` gateway(s).**
 The client resolves `<project>.<domain>` on its own and connects there, so that
 name *must* land on a gateway. With a single gateway (Tier 1) that's one wildcard
-A/AAAA record. With multiple gateways (Tier 2), use **round-robin DNS** — one
+A/AAAA record. With multiple gateways (Tier 2), use **round-robin DNS**: one
 A/AAAA record per gateway public IP on the same `*.<LARKDB_DOMAIN>` name.
 
-Your TLS certificate has to cover that wildcard too — but you normally don't
+Your TLS certificate has to cover that wildcard too, but you normally don't
 configure that separately. When CertMagic is enabled and you leave
 `CERTMAGIC_DOMAINS` **unset**, it automatically manages certs for both
 `*.<LARKDB_DOMAIN>` (the per-database client hostnames) **and** the apex
 `<LARKDB_DOMAIN>` (where the admin dashboard is served, `<LARKDB_DOMAIN>/admin/`).
 So in the common case you only set `LARKDB_DOMAIN`.
 
-Set `CERTMAGIC_DOMAINS` explicitly only to manage *additional* names — e.g. a
+Set `CERTMAGIC_DOMAINS` explicitly only to manage *additional* names, such as a
 separate API hostname. Note that doing so **replaces** the auto-derived list
 rather than adding to it, so you must include `*.<LARKDB_DOMAIN>` and the apex
 yourself. (Lark's own cloud does this: `LARKDB_DOMAIN=larkdb.net` with
 `CERTMAGIC_DOMAINS="db.lark.sh,*.larkdb.net"` to add the `db.lark.sh` API host.)
 
 Wildcard issuance uses the **DNS-01** challenge, and this build wires
-**Cloudflare** specifically — `CLOUDFLARE_API_TOKEN` is **required** whenever
+**Cloudflare** specifically: `CLOUDFLARE_API_TOKEN` is **required** whenever
 CertMagic is enabled. If your DNS isn't on Cloudflare, supply a wildcard cert via
 `TLS_CERT_FILE` / `TLS_KEY_FILE` or terminate TLS at a load balancer instead.
 
@@ -163,13 +164,13 @@ CertMagic is enabled. If your DNS isn't on Cloudflare, supply a wildcard cert vi
 `ADMIN_API_ENABLED` (when off, the routes and SPA aren't mounted at all). Two
 operational points:
 
-- **Treat it as internal tooling.** The OSS admin panel is meant for operators —
-  it is *not* designed as a self-service end-user control surface.
-  Even though it has its own authentication, it's best to keep it off the public internet: put
-  it behind your VPN / management network / an IP allowlist.
-- **With multiple gateways, enable it on exactly one.** Run `ADMIN_API_ENABLED=true`
-  on a single designated gateway — ideally one kept out of the public
-  client-traffic rotation — and `false` on the rest. You don't lose anything by
+- Treat it as internal tooling. The OSS admin panel is meant for operators, not
+  as a self-service end-user control surface. Even though it has its own
+  authentication, it's best to keep it off the public internet: put it behind
+  your VPN, management network, or an IP allowlist.
+- With multiple gateways, enable it on exactly one. Run `ADMIN_API_ENABLED=true`
+  on a single designated gateway (ideally one kept out of the public
+  client-traffic rotation) and `false` on the rest. You don't lose anything by
   doing so: admin writes land in the shared metadata store and propagate to every
   gateway via Postgres `NOTIFY` (`project_config_changed` / `database_evicted`),
   so the other gateways pick up config and routing changes automatically.
@@ -178,13 +179,13 @@ operational points:
 
 `lark-edge`'s control-plane state lives in `DATABASE_URL`:
 
-- **SQLite** (`sqlite:///data/lark.db`) — the default. Fine for **a single
+- **SQLite** (`sqlite:///data/lark.db`): the default. Fine for **a single
   `lark-edge` instance**. Simplest to operate; state is one file.
-- **Postgres** (`postgres://…`) — **required once you run more than one
+- **Postgres** (`postgres://…`): **required once you run more than one
   `lark-edge`**, because the coordinators share project/routing/user state. The
   moment you want a second gateway (for HA or to spread client load), switch to
-  Postgres. This is the single most important config change going from Tier 1 to
-  Tier 2.
+  Postgres. This is the config change that matters most when moving from Tier 1
+  to Tier 2.
 
 ---
 
@@ -228,7 +229,7 @@ environment:
   DATABASE_URL: "sqlite:///data/lark.db"
 ```
 
-CertMagic stores certificates under `CERTMAGIC_STORAGE` (default `./certs`) — put
+CertMagic stores certificates under `CERTMAGIC_STORAGE` (default `./certs`). Put
 that on a persistent volume so you don't re-issue on every restart. (Use
 `CERTMAGIC_STAGING: "true"` while testing to avoid Let's Encrypt rate limits.) The
 wildcard cert is obtained via the DNS-01 challenge, which is why
@@ -249,31 +250,31 @@ capacity and redundancy. The shape:
 - A firewall that exposes only the public `lark-edge` listeners.
 
 At this tier, `lark-server` and `lark-edge` are best run **directly on the host via systemd, not in
-a container** — `lark-server` uses Linux `io_uring` (Glommio thread-per-core) and benefits
+a container**. `lark-server` uses Linux `io_uring` (Glommio thread-per-core) and benefits
 from raw `memlock` limits and CPU affinity that are awkward to grant inside a
 container.
 
 ### Host requirements (`lark-server`)
 
-- **Linux kernel ≥ 5.8** — `io_uring` support is mandatory; the process will not
+- **Linux kernel ≥ 5.8**: `io_uring` support is mandatory; the process will not
   run otherwise.
-- **`memlock` unlimited** — `io_uring` registers locked memory. The systemd unit
+- **`memlock` unlimited**: `io_uring` registers locked memory. The systemd unit
   below sets `LimitMEMLOCK=infinity`.
-- **High file-descriptor limits** — many concurrent connections (`LimitNOFILE`).
+- **High file-descriptor limits**: many concurrent connections (`LimitNOFILE`).
 - Persistent, fast storage for `LARK_DATA_DIR` (local NVMe is ideal; the blob
   format does small random reads).
 
 ### Networking and discovery
 
-1. Put all nodes on a private network (VLAN, VPC, WireGuard/Tailscale — your
-   choice).
+1. Put all nodes on a private network: VLAN, VPC, WireGuard, Tailscale, whatever
+   you already run.
 2. Give the `lark-server` a `--private-ip` on that network. It registers with the
    coordinator as `private_ip:proxy_port`, so the coordinator (and only the
    coordinator) can reach it on `2727`.
 3. Point the `lark-server` at a coordinator's **internal** endpoint via
    `--coordinator` / `LARK_COORDINATOR_URL` (e.g. `http://10.0.0.20:8080`).
    Registration and heartbeats are persisted to the shared Postgres, so **every**
-   `lark-edge` learns about the server from the database — you only need to point
+   `lark-edge` learns about the server from the database. You only need to point
    it at one gateway's internal endpoint (or an internal load balancer across
    them).
 4. Firewall rules:
@@ -381,8 +382,8 @@ CLOUDFLARE_API_TOKEN="<token>"      # required when CERTMAGIC_ENABLED (DNS-01)
 
 Every `lark-edge` and `lark-server` in the deployment must share the **same**
 `SERVER_SECRET`. Running a second `lark-edge` is just another instance with the
-same env pointed at the same Postgres — they coordinate through it — **except
-`ADMIN_API_ENABLED`, which should be `true` on only one gateway** (see
+same env pointed at the same Postgres; they coordinate through it. The one
+exception is **`ADMIN_API_ENABLED`, which should be `true` on only one gateway** (see
 [The admin dashboard](#the-admin-dashboard)). Front the gateways with round-robin
 DNS or a load balancer on the wildcard hostname (see
 [DNS](#dns-clients-connect-to-a-per-database-hostname)).
@@ -396,30 +397,32 @@ DNS or a load balancer on the wildcard hostname (see
 ## Tier 3 — Scale the data tier
 
 > **Covered conceptually.** This section explains the model and the problems you
-> must solve, not a turnkey recipe — the right answer is deployment-specific.
+> must solve, not a turnkey recipe; the right answer is deployment-specific.
 > Exhaust vertical scaling (a bigger `lark-server` box: more cores, more RAM, more
 > NVMe) before going here.
 
 Tier 3 is running **more than one `lark-server`**. The coordinator consistent-hashes
 each `(project, database)` to one server, so adding nodes spreads databases across
-them — in principle, linear scale-out of total data size and write throughput.
+them, giving you in principle linear scale-out of total data size and write
+throughput.
 
 What makes this a different class of problem from Tier 2 is the
 [local-disk-only](#storage-local-disk-only) reality:
 
-- **Each database lives on exactly one node's local disk.** There is no shared
-  pool. A server can only serve databases whose data directory is physically
-  present on its own NVMe.
-- **Changing the node count reshuffles the hash ring.** Consistent hashing
-  minimizes how many databases move when you add or remove a node, but the ones
-  that move get *reassigned to a node that doesn't have their files*. Until you
-  migrate those data directories, the new owner has no data for them.
-- **Therefore, scaling the server count is a data-migration operation, not just a
-  config change.** Roughly: identify which `{project}/{database}` directories are
-  reassigned by the new topology, back them up / quiesce them, copy them to the newly-assigned 
-  node, then bring that node into the ring. Done wrong, a reassigned database appears empty on its 
-  new owner while its data sits stranded on the old one.
-- **Backups now span N hosts.** The [BACKUP.md](BACKUP.md) procedure is per-data-
+- Each database lives on exactly one node's local disk. There is no shared pool.
+  A server can only serve databases whose data directory is physically present
+  on its own NVMe.
+- Changing the node count reshuffles the hash ring. Consistent hashing minimizes
+  how many databases move when you add or remove a node, but the ones that move
+  get *reassigned to a node that doesn't have their files*. Until you migrate
+  those data directories, the new owner has no data for them.
+- Scaling the server count is therefore a data-migration operation, not just a
+  config change. Roughly: identify which `{project}/{database}` directories are
+  reassigned by the new topology, back them up or quiesce them, copy them to the
+  newly-assigned node, then bring that node into the ring. Done wrong, a
+  reassigned database appears empty on its new owner while its data sits
+  stranded on the old one.
+- Backups now span N hosts. The [BACKUP.md](BACKUP.md) procedure is per-data-
   directory; at Tier 3 you run it across every node and need a strategy that
   captures all of them (and ideally tracks which databases live where).
 
@@ -427,22 +430,22 @@ What makes this a different class of problem from Tier 2 is the
 
 ## Operational concerns
 
-- **Backups** — see [BACKUP.md](BACKUP.md). You need both the `lark-server`
+- **Backups**: see [BACKUP.md](BACKUP.md). You need both the `lark-server`
   `LARK_DATA_DIR` (database contents) and the `lark-edge` metadata store
   (projects, routing, users). Backing up only one leaves an incomplete restore.
-- **Compaction** — `lark-server`'s in-process storage worker keeps the blob
+- **Compaction**: `lark-server`'s in-process storage worker keeps the blob
   reasonably current automatically. Full re-compaction (space reclamation) is the
   separate `lark-compact` tool, run when a blob has accumulated significant wasted
   space; it coordinates with the server via the `.compacting` marker (see
   [BACKUP.md](BACKUP.md) and CONTRIBUTING's [Storage section](../CONTRIBUTING.md#storage)).
-- **Observability** — with `LARK_METRICS_PUSH=true`, `lark-server` pushes
+- **Observability**: with `LARK_METRICS_PUSH=true`, `lark-server` pushes
   per-database metrics straight to `lark-edge`'s internal endpoint and the admin
   dashboard's Monitoring tab works with no extra setup (this is set in the bundled
   compose + Fly configs). Leave it off to rely on an external log shipper scraping
   stdout instead. Either way, enable `--debug-timing` / `LARK_DEBUG_TIMING` for
   latency breakdowns when diagnosing. Full details, including the Vector path for
-  bare-metal / off-site metrics, are in [OBSERVABILITY.md](OBSERVABILITY.md).
-- **Upgrades** — deploy node-by-node. The on-disk blob carries a
+  bare-metal and off-site metrics, are in [OBSERVABILITY.md](OBSERVABILITY.md).
+- **Upgrades**: deploy node-by-node. The on-disk blob carries a
   `blob.generation`; a server restart re-opens its data and replays WAL forward
   (same path as restore). Roll `lark-server` nodes one at a time so the coordinator
   reroutes around each during its brief restart.
@@ -463,9 +466,9 @@ non-default values a real deployment needs.
 | `LARK_SERVER_ID` | `--id` | — | **Required.** Unique server identifier (e.g. `db-1`). |
 | `SERVER_SECRET` | `--server-secret` | — | **Required.** Shared secret authenticating the edge↔server proxy handshake (HMAC over a per-connection nonce); must match every gateway's `SERVER_SECRET`. Prefer setting it via the environment, not the flag, so it isn't exposed in `ps`. |
 | `LARK_HOSTNAME` | `--hostname` | — | **Required.** Public hostname label; not used for client routing in the Tier-2 topology. |
-| `LARK_PRIVATE_IP` | `--private-ip` | — | Address `lark-edge` dials back on — what the server registers as (`private_ip:proxy_port`). Set on any multi-host deploy. |
+| `LARK_PRIVATE_IP` | `--private-ip` | — | Address `lark-edge` dials back on, i.e. what the server registers as (`private_ip:proxy_port`). Set on any multi-host deploy. |
 | `LARK_COORDINATOR_URL` | `--coordinator` | — | `lark-edge`'s **internal** endpoint for registration + metrics push (e.g. `http://10.0.0.20:8080`). |
-| `LARK_DATA_DIR` | `--data-dir` | — (in-memory) | Persistence directory. **Local NVMe only** — never a shared/network FS. Unset = ephemeral. |
+| `LARK_DATA_DIR` | `--data-dir` | — (in-memory) | Persistence directory. **Local NVMe only**, never a shared/network FS. Unset = ephemeral. |
 | `LARK_PROXY_PORT` | `--proxy-port` | `2727` | Wire-protocol TCP port (each core binds with `SO_REUSEPORT`). **Private.** |
 | `LARK_PROXY_BIND` | `--proxy-bind` | `0.0.0.0` | Bind host for the proxy listener. Use `[::]` on IPv6-only private nets (e.g. Fly 6PN). |
 | `LARK_PUBLIC_IP` | `--public-ip` | `127.0.0.1` | Public IP advertised for UDP clients. |
@@ -478,8 +481,8 @@ non-default values a real deployment needs.
 | `LARK_FSYNC_ON_WAL_FLUSH` | `--fsync-on-wal-flush` | `false` | `fdatasync` each WAL flush (`true`) vs. OS page cache only (`false`). Enable for durability across power loss. See [Durability](#durability). |
 | `LARK_DEBUG_TIMING` | `--debug-timing` | `false` | Detailed message-latency tracking (diagnostics). |
 | `RUST_LOG` | — | `info` | Log filter (e.g. `debug`, `lark_server=debug`). |
-| `LARK_EMULATOR` | `--emulator` | `false` | **Dev/test only** — accepts the `owner` token. |
-| `LARK_TEMPLATE_PATH` | `--template` | — | **Dev/test only** — load-testing template directory. |
+| `LARK_EMULATOR` | `--emulator` | `false` | **Dev/test only**: accepts the `owner` token. |
+| `LARK_TEMPLATE_PATH` | `--template` | — | **Dev/test only**: load-testing template directory. |
 
 #### Durability
 
@@ -490,12 +493,12 @@ latency for crash safety:
 | Goal | `LARK_WAL_SYNC_INTERVAL_MS` | `LARK_FSYNC_ON_WAL_FLUSH` | Behavior |
 |---|---|---|---|
 | **Default** (throughput) | `2000` | `false` | Writes are ACKed immediately; the buffer flushes to the OS page cache every 2s. Survives a **process** crash, but a **power loss** can lose up to ~2s of acknowledged writes plus anything the kernel hasn't written back. |
-| **Power-safe** | `2000` | `true` | Same 2s window, but each flush is `fdatasync`'d — data in a completed flush survives power loss. |
+| **Power-safe** | `2000` | `true` | Same 2s window, but each flush is `fdatasync`'d, so data in a completed flush survives power loss. |
 | **Synchronous** | `0` | `false` | Each write is flushed to the page cache before its ACK. No in-memory loss window; survives process crash but not power loss. |
-| **Strict** | `0` | `true` | Each write is flushed **and** `fdatasync`'d before its ACK — a delivered ACK means the write is durable on the device. Highest per-write latency. |
+| **Strict** | `0` | `true` | Each write is flushed **and** `fdatasync`'d before its ACK, so a delivered ACK means the write is durable on the device. Highest per-write latency. |
 
 Because the interval is in-memory buffering (not batching for throughput on a
-single connection), lowering it — or setting `0` — increases the fsync/flush
+single connection), lowering it or setting it to `0` increases the fsync/flush
 rate and therefore write latency. Pick the weakest setting that meets your
 data-loss tolerance. These are process-wide (all databases on the node share
 them), set once at startup.
@@ -515,8 +518,8 @@ them), set once at startup.
 | `DISABLE_TLS` | `false` | Serve plain HTTP (dev only; browsers exempt `*.localhost`). |
 | `CERTMAGIC_ENABLED` | `false` | Automatic Let's Encrypt wildcard certs (DNS-01). |
 | `CERTMAGIC_EMAIL` | — | Let's Encrypt account email (when CertMagic on). |
-| `CERTMAGIC_DOMAINS` | auto: `*.<domain>` + apex | Override managed domains. **Replaces** the auto list — include the wildcard + apex yourself. |
-| `CERTMAGIC_STORAGE` | `./certs` | Cert cache path — put on a persistent volume. |
+| `CERTMAGIC_DOMAINS` | auto: `*.<domain>` + apex | Override managed domains. **Replaces** the auto list, so include the wildcard + apex yourself. |
+| `CERTMAGIC_STORAGE` | `./certs` | Cert cache path; put on a persistent volume. |
 | `CERTMAGIC_STAGING` | `false` | Use LE staging (testing; avoids rate limits). |
 | `CERTMAGIC_RESOLVERS` | — | Custom DNS resolvers for the ACME challenge (e.g. `8.8.8.8:53,1.1.1.1:53`). |
 | `CLOUDFLARE_API_TOKEN` | — | **Required when `CERTMAGIC_ENABLED`** (DNS-01 via Cloudflare). |
@@ -529,12 +532,12 @@ them), set once at startup.
 | `BATCH_MAX_SIZE` | `65536` | Bytes buffered before a forced flush. |
 | `BATCH_MAX_MESSAGES` | `100` | Messages buffered before a forced flush. |
 | `DEBUG` | `false` | Debug-level logging. |
-| `PPROF_ENABLED` | `false` | Start the `net/http/pprof` debug profiler. **Loopback only** (`127.0.0.1:6060`) and off by default — it exposes heap dumps (which can hold secrets/tenant data) and an on-demand CPU profiler. To profile a remote node, enable it and SSH-tunnel / `fly proxy` to `6060`; never expose the port. |
-| `LOCAL_MODE` | `false` | **Dev only** — bypass the control-plane DB, use an in-memory backend (implies `DISABLE_TLS`). Enables open rules, hardcoded dev secrets, and the `owner` admin token — refuses to start bound to a non-loopback address unless `LOCAL_MODE_ALLOW_PUBLIC_BIND=true`. |
-| `LOCAL_MODE_ALLOW_PUBLIC_BIND` | `false` | **Dev only** — acknowledge binding `LOCAL_MODE`'s open surface to a non-loopback address. Needed when running `LOCAL_MODE` in a container (host port-mapping requires binding all interfaces). Never set on an untrusted network. |
-| `LOCAL_BACKEND_ADDR` | `localhost:7779` | **Dev only** — backend address in `LOCAL_MODE`. |
-| `LOCAL_PROJECT_ID` | `test-project` | **Dev only** — project ID used in `LOCAL_MODE`. |
+| `PPROF_ENABLED` | `false` | Start the `net/http/pprof` debug profiler. **Loopback only** (`127.0.0.1:6060`) and off by default, because it exposes heap dumps (which can hold secrets/tenant data) and an on-demand CPU profiler. To profile a remote node, enable it and SSH-tunnel or `fly proxy` to `6060`; never expose the port. |
+| `LOCAL_MODE` | `false` | **Dev only**: bypass the control-plane DB, use an in-memory backend (implies `DISABLE_TLS`). Enables open rules, hardcoded dev secrets, and the `owner` admin token. Refuses to start bound to a non-loopback address unless `LOCAL_MODE_ALLOW_PUBLIC_BIND=true`. |
+| `LOCAL_MODE_ALLOW_PUBLIC_BIND` | `false` | **Dev only**: acknowledge binding `LOCAL_MODE`'s open surface to a non-loopback address. Needed when running `LOCAL_MODE` in a container (host port-mapping requires binding all interfaces). Never set on an untrusted network. |
+| `LOCAL_BACKEND_ADDR` | `localhost:7779` | **Dev only**: backend address in `LOCAL_MODE`. |
+| `LOCAL_PROJECT_ID` | `test-project` | **Dev only**: project ID used in `LOCAL_MODE`. |
 
-> `BACKEND_ADDRS`, `COORDINATOR_ADDR`, and `IS_COORDINATOR` exist for advanced /
+> `BACKEND_ADDRS`, `COORDINATOR_ADDR`, and `IS_COORDINATOR` exist for advanced or
 > non-self-coordinator topologies and are left at their defaults in the standard
 > Tier 1–2 deployments described above.

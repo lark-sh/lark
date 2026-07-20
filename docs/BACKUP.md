@@ -9,9 +9,9 @@ cleanly consistent, and why it's safe.
 
 A complete Lark backup has two parts:
 
-1. **lark-server data** — the per-database on-disk state under `LARK_DATA_DIR`.
+1. **lark-server data**: the per-database on-disk state under `LARK_DATA_DIR`.
    This is the actual database contents (your application data).
-2. **lark-edge metadata** — the control-plane store that holds projects, admin
+2. **lark-edge metadata**: the control-plane store that holds projects, admin
    users, database routing, and per-project settings (e.g. `firebase-project-id`,
    project secrets). This is SQLite (`lark.db`) by default, or Postgres.
 
@@ -65,28 +65,28 @@ rm "$DB_DIR/.compacting"
 While `.compacting` is present, lark-server's storage worker skips its
 incremental compaction pass entirely (`server/src/storage/worker.rs`), so
 `blob.lark`, `sidecar.lark`, `blob.generation`, and `sequence` do not change
-during the copy. Live writes continue uninterrupted — they land in the WAL,
+during the copy. Live writes continue uninterrupted: they land in the WAL,
 which is append-only and safe to copy at any time. **Remember to remove the
 marker afterward**; if it's left behind, compaction never resumes and the WAL
 grows unbounded. (This is the same mechanism `lark-compact` uses while it holds
 the blob for a full re-compaction.)
 
-To snapshot the whole deployment when there are many databases, it is recommended
-to place a `.compacting` marker in each database directory before copying, 
-then remove it after copying that database folder.
+To snapshot the whole deployment when there are many databases, place a
+`.compacting` marker in each database directory before copying, then remove it
+after copying that database's folder.
 
 ### Alternative: filesystem snapshot
 
 If `LARK_DATA_DIR` lives on snapshot-capable storage (ZFS, LVM, btrfs, EBS), an
 atomic filesystem snapshot captures a consistent point-in-time copy of every
-file at once. In that case the `.compacting` marker is optional — the snapshot is
+file at once. In that case the `.compacting` marker is optional; the snapshot is
 already internally consistent. This is the simplest option for larger
 deployments that already use snapshot-capable volumes.
 
 ### Without the marker
 
 Even a plain `cp -a` of a live database directory restores to a valid (if
-slightly stale) database — see [Data correctness guarantee](#data-correctness-guarantee) below. The
+slightly stale) database. See [Data correctness guarantee](#data-correctness-guarantee) below. The
 `.compacting` marker just removes the "slightly stale" window and the small risk
 of free-list skew, so it's the recommended default. Filesystem snapshots and the
 marker are both ways to get a *clean* point-in-time copy; the plain copy is the
@@ -107,14 +107,14 @@ fallback when neither is available.
 1. Stop lark-server (and lark-edge, if restoring its metadata too).
 2. Restore the lark-edge metadata store (`lark.db` or the Postgres database).
 3. Copy the backed-up `LARK_DATA_DIR` tree (or individual database directories)
-   into place. Ensure no `.compacting` markers were included in the backup — if
+   into place. Ensure no `.compacting` markers were included in the backup; if
    any slipped in, delete them.
 4. Start lark-server.
 
 On startup, lark-server opens each `blob.lark`, reads its `blob.generation` and
 `sequence`, and replays any WAL entries newer than `sequence` forward
 (`load_from_disk` / `load_wal_entries` in `server/src/db/database/persistence.rs`). **Restore
-uses the exact same path as a normal startup** — there is no separate recovery
+uses the exact same path as a normal startup**; there is no separate recovery
 mode. A backup is just a database that hasn't been opened yet.
 
 ## Data correctness guarantee
@@ -131,8 +131,8 @@ because of how the blob is written:
   on disk). It never sees a header pointing at data that isn't there.
 
 2. **A stale sidecar costs only space, never correctness.** `sidecar.lark` holds
-  the free list and pending dictionary keys. Reads never depend on it — key bytes
-  live inline in the blob itself; the sidecar only drives free-space reuse and
+  the free list and pending dictionary keys. Reads never depend on it: key bytes
+  live inline in the blob itself, and the sidecar only drives free-space reuse and
   dictionary deduplication during the next compaction. A sidecar that's slightly
   out of sync with the blob just means some reclaimable space goes untracked and
   some keys miss deduplication until the next full compaction.
