@@ -66,7 +66,7 @@ A SET can carry an optional compare-and-swap hash. Three shapes:
 
 The hash is computed over the current server-side value. Two formats are accepted: Lark hash (JCS + SHA-256, 64-char lowercase hex) or Firebase hash (SHA-1 + base64, ~28 chars). The server detects the format from the hash string itself.
 
-**Speculative SET semantics**: `h:""` with `hash_provided:true` is the wire shape Firebase clients use when running `transaction()` against a path they have no cached value for. The server accepts the write only if the current value at the path is null or absent — both treated as "doesn't exist," matching Firebase's semantic where null means deletion. A path that's been promoted from a blob-backed DB and is currently `Some(Value::Null)` in the in-memory tree counts as absent for this check.
+**Speculative SET semantics**: `h:""` with `hash_provided:true` is the wire shape Firebase clients use when running `transaction()` against a path they have no cached value for. The server accepts the write only if the current value at the path is null or absent, both treated as "doesn't exist," matching Firebase's semantic where null means deletion. A path that's been promoted from a blob-backed DB and is currently `Some(Value::Null)` in the in-memory tree counts as absent for this check.
 
 **Failure mode**: hash mismatch or speculative-set against an existing non-null value returns `condition_failed`. This NACK does NOT taint subsequent writes (the client is expected to retry, typically by re-reading the path and computing a new hash).
 

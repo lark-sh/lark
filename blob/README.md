@@ -10,21 +10,21 @@ This design is influenced by Oracle's OSON binary format, described in:
 
 ### Key Concepts
 
-1. **Dictionary** — Deduplicated field names, stored once per document, referenced by small integer IDs. Binary search via sorted hash codes for O(log n) field lookup.
+1. **Dictionary**: deduplicated field names, stored once per document, referenced by small integer IDs. Binary search via sorted hash codes for O(log n) field lookup.
 
-2. **Tree-structured binary with jump offsets** — Objects store a sorted field ID array and an offset array. Navigate to any child without scanning siblings. (Legacy array nodes store element offsets for O(1) indexed access; arrays are no longer written — see the note under Node Encoding.)
+2. **Tree-structured binary with jump offsets**: objects store a sorted field ID array and an offset array. Navigate to any child without scanning siblings. (Legacy array nodes store element offsets for O(1) indexed access; arrays are no longer written, as noted under Node Encoding.)
 
-3. **Variable-size field IDs** — Field ID size adapts based on distinct key count: 1 byte (<256 keys), 2 bytes (<65536), or 4 bytes. Size is recorded in the header. Most documents use 1-byte field IDs, saving significant space in child index arrays.
+3. **Variable-size field IDs**: field ID size adapts based on distinct key count, either 1 byte (<256 keys), 2 bytes (<65536), or 4 bytes. Size is recorded in the header. Most documents use 1-byte field IDs, saving significant space in child index arrays.
 
-4. **Delegate offsets for shared field structures** — Objects with identical field name sets can share their sorted field ID array via a `delegate_offset` instead of repeating it. This is significant for collections of structurally identical objects (e.g., thousands of game characters all having the same fields).
+4. **Delegate offsets for shared field structures**: objects with identical field name sets can share their sorted field ID array via a `delegate_offset` instead of repeating it. This is significant for collections of structurally identical objects (e.g., thousands of game characters all having the same fields).
 
-5. **Depth-first layout** — Children are contiguous after their parent, so reading an entire subtree is one contiguous read.
+5. **Depth-first layout**: children are contiguous after their parent, so reading an entire subtree is one contiguous read.
 
-6. **Forward-offset partial updates** — When updating a value that doesn't fit in-place: tombstone the old location (write a forward pointer), append the new value at EOF. Critically, **no forwarding chains** — subsequent updates overwrite the original tombstone's forward pointer. Re-compact when accumulated waste exceeds a threshold.
+6. **Forward-offset partial updates**: when updating a value that doesn't fit in-place, tombstone the old location (write a forward pointer) and append the new value at EOF. Critically, **no forwarding chains**: subsequent updates overwrite the original tombstone's forward pointer. Re-compact when accumulated waste exceeds a threshold.
 
-7. **Three low-level operations** — All partial updates decompose to: (a) length-preserved byte replacement, (b) append at EOF, (c) truncate at EOF. These map directly to POSIX `pwrite()`, `write()`, and `ftruncate()`.
+7. **Three low-level operations**: all partial updates decompose to (a) length-preserved byte replacement, (b) append at EOF, (c) truncate at EOF. These map directly to POSIX `pwrite()`, `write()`, and `ftruncate()`.
 
-8. **Lazy block-level reading** — For large documents stored as BLOBs, data blocks are lazily read and cached in the buffer cache based on tree navigation patterns instead of linearly reading everything.
+8. **Lazy block-level reading**: for large documents stored as BLOBs, data blocks are lazily read and cached in the buffer cache based on tree navigation patterns instead of linearly reading everything.
 
 ## Binary Format
 
@@ -89,13 +89,13 @@ Container nodes have a fixed header followed by a sorted child index and a child
 - **Array header**: 17 bytes (`ARRAY_HEADER_SIZE`). Element index entries are 17 bytes each (`ARRAY_INDEX_ENTRY_SIZE`).
 - **Collection header**: 29 bytes (`COLLECTION_HEADER_SIZE`). Child index entries are 25 bytes each (`COLLECTION_INDEX_ENTRY_SIZE`).
 
-All containers — JSON objects **and arrays** — use **TYPE_COLLECTION**. Arrays carry no native type: they are stored as integer-keyed collections (`{"0":…,"1":…}`) and rendered back as JSON arrays only at the read/wire boundary (see the array contract in `arc_value.rs`). **`TYPE_ARRAY` (0x02) is legacy and read-only** — the writer never emits it, but the reader and compactor still decode pre-existing array nodes, converting them to integer-keyed objects on read. Such nodes persist on disk (compaction preserves the tag) until the path is next written, at which point they're rewritten as `TYPE_COLLECTION`.
+All containers, JSON objects **and arrays** alike, use **TYPE_COLLECTION**. Arrays carry no native type: they are stored as integer-keyed collections (`{"0":…,"1":…}`) and rendered back as JSON arrays only at the read/wire boundary (see the array contract in `arc_value.rs`). **`TYPE_ARRAY` (0x02) is legacy and read-only**: the writer never emits it, but the reader and compactor still decode pre-existing array nodes, converting them to integer-keyed objects on read. Such nodes persist on disk (compaction preserves the tag) until the path is next written, at which point they're rewritten as `TYPE_COLLECTION`.
 
 Some collections happen to have only dictionary-resolvable keys (structural fields like `"name"`, `"score"`) and some have push-ID keys (`"-Mabc123"`); the distinction is handled at the key-encoding level (see below).
 
 **Type tag in the index entry, not at child offset.** Each entry in a parent's `child_index` / `elem_index` carries the child's `type_flags:u8`, `offset:u64`, and `size:u64`. The child's offset is found *without* reading the child first. This means type+size live in the parent index, so navigation never reads a child node just to learn its type/size.
 
-**Forwarding.** When an in-place update doesn't fit, the new value is appended at EOF and the parent's index entry has its `TYPE_FLAGS_FORWARDED` bit (`0x80`) set, with `offset` switched to an absolute file offset. There is no separate "forward" node type — the redirect lives entirely in the parent's index, so there are never multi-hop forwarding chains.
+**Forwarding.** When an in-place update doesn't fit, the new value is appended at EOF and the parent's index entry has its `TYPE_FLAGS_FORWARDED` bit (`0x80`) set, with `offset` switched to an absolute file offset. There is no separate "forward" node type: the redirect lives entirely in the parent's index, so there are never multi-hop forwarding chains.
 
 **Key encoding (Collection):** Each entry in the key_string_area is either an inline key string (`key_len:u16` with the high bit clear, followed by `key_len` UTF-8 bytes) or a dictionary reference (`key_len:u16` with `KEY_DICT_FLAG = 0x8000` set; the remaining 15 bits are the field_id, no inline bytes follow). The hot path for structural keys keeps them deduplicated via the dictionary; entity-ID keys are stored inline.
 
@@ -115,7 +115,7 @@ Some collections happen to have only dictionary-resolvable keys (structural fiel
 
 ### Dictionary
 
-All unique structural field names across the database, stored once. Collection keys (push IDs) are NOT stored in the dictionary — they're stored inline in TYPE_COLLECTION nodes.
+All unique structural field names across the database, stored once. Collection keys (push IDs) are NOT stored in the dictionary; they're stored inline in TYPE_COLLECTION nodes.
 
 ```
 +--------------------------------------------------+
@@ -138,9 +138,9 @@ All unique structural field names across the database, stored once. Collection k
 
 **Reserved space:** `max_field_count = max(500, 2×field_count)` slots. `max_name_data = max(10000, 2×name_data_used)` bytes. This allows incremental compaction to append new field names without rebuilding the dictionary or the blob. FieldIdSize (u8/u16/u32) is computed from `max_field_count` so field_ids up to reserved capacity fit in the encoding.
 
-**Lookup:** Hash the field name → binary search in sorted_hashes[0..sorted_count] → verify against actual field name string (collision resolution) → get field_id. If not found in sorted region, linear scan sorted_hashes[sorted_count..field_count] (appended entries, typically very few). If the hash is not found at all, the field does not exist anywhere in the blob — fast negative check.
+**Lookup:** Hash the field name → binary search in sorted_hashes[0..sorted_count] → verify against actual field name string (collision resolution) → get field_id. If not found in sorted region, linear scan sorted_hashes[sorted_count..field_count] (appended entries, typically very few). If the hash is not found at all, the field does not exist anywhere in the blob, which makes for a fast negative check.
 
-**Growth during incremental compaction:** New structural field names are appended unsorted after the sorted region via `append_field()`, which returns pwrite patches to update the on-disk dictionary in-place. New field_ids are assigned sequentially starting from `field_count`. All existing field_ids are preserved — no patching needed. On full re-compaction, the dictionary is rebuilt fully sorted with all field_ids reassigned.
+**Growth during incremental compaction:** New structural field names are appended unsorted after the sorted region via `append_field()`, which returns pwrite patches to update the on-disk dictionary in-place. New field_ids are assigned sequentially starting from `field_count`. All existing field_ids are preserved, so no patching is needed. On full re-compaction, the dictionary is rebuilt fully sorted with all field_ids reassigned.
 
 **Size:** Structural field names only (~200 typical for a Lark database). With reserved space: ~18KB. Negligible even for large databases.
 
@@ -148,7 +148,7 @@ Note: OSON's approach uses "partial dictionary rebuilding by tracking dictionary
 
 ### Sidecar (free list + pending keys)
 
-Every blob has a small companion file — `sidecar.lark` on disk — that
+Every blob has a small companion file (`sidecar.lark` on disk) that
 carries state the blob itself can't represent cheaply: the **free list**
 of reusable byte regions, and any **pending dictionary keys** written
 inline since the last root re-compaction.
@@ -202,9 +202,10 @@ that region's `(offset, size)` is recorded in the free list:
 - **Re-serializing a collection when its reserved space is exhausted.** The old collection's bytes are freed.
 - **Removing a child from a collection.** The child's bytes are freed.
 
-Regions smaller than `MIN_FREE_REGION = 4096` bytes are not tracked —
-the index bookkeeping overhead exceeds the space savings, so those bytes
-are charged to `bytes_wasted` and only recovered by a full re-compaction.
+Regions smaller than `MIN_FREE_REGION = 4096` bytes are not tracked,
+because the index bookkeeping overhead exceeds the space savings. Those
+bytes are charged to `bytes_wasted` and only recovered by a full
+re-compaction.
 
 #### Allocation policy: best-fit with splitting
 
@@ -214,7 +215,7 @@ smallest tracked region with size ≥ `N`:
 1. Best-fit lookup: smallest region ≥ N (O(log n) via `BTreeMap<size,
    set<offset>>` indexed by size).
 2. If the matched region is bigger than N, the remainder (`size - N`) is
-   put back as its own region — *unless* the remainder is smaller than
+   put back as its own region, *unless* the remainder is smaller than
    `MIN_FREE_REGION`, in which case it gets charged to `bytes_wasted`.
 3. If no region fits, the writer appends at EOF instead.
 
@@ -226,9 +227,9 @@ so the free list doesn't fragment indefinitely.
 The free list never reuses bytes a concurrent reader might still be
 mid-flight on. It does this with a two-generation epoch system:
 
-- **`current`** — regions freed during *this* compaction cycle. **Not reusable yet.**
-- **`previous`** — regions freed during the *previous* cycle. **Not reusable yet.**
-- **`available`** (the indexed `by_size` / `by_offset` maps) — regions freed ≥ 2 cycles ago. **Safe to reuse.**
+- **`current`**: regions freed during *this* compaction cycle. **Not reusable yet.**
+- **`previous`**: regions freed during the *previous* cycle. **Not reusable yet.**
+- **`available`** (the indexed `by_size` / `by_offset` maps): regions freed ≥ 2 cycles ago. **Safe to reuse.**
 
 At the start of each `apply_updates` batch, `advance_epoch()` rotates:
 `previous → available`, `current → previous`. The newly-promoted regions
@@ -250,7 +251,7 @@ index update) about the new location before reusing the old bytes.
 
 `bytes_wasted` is the trigger for full re-compaction. `lark-compact`
 runs root compaction when `bytes_wasted >= 500 MB AND bytes_wasted /
-blob_size >= 20%` — until then, the free list keeps the blob from
+blob_size >= 20%`. Until then, the free list keeps the blob from
 growing unboundedly even under sustained write load.
 
 #### Crash safety
@@ -258,7 +259,7 @@ growing unboundedly even under sustained write load.
 The sidecar is rewritten as a single atomic file alongside each batch
 of blob writes (`apply_updates_with_sidecar`). If a crash happens
 between the blob write and the sidecar write, the worst case is that
-some freed regions look "live" until the next root re-compaction — i.e.
+some freed regions look "live" until the next root re-compaction, i.e.
 the blob keeps a little extra dead space but is still correct. The
 blob never points at bytes the sidecar doesn't know about, because the
 blob's parent-index entries are the source of truth for what's live;
@@ -273,7 +274,7 @@ Per-node overhead:
 - **Number**: 9 bytes (type + f64).
 - **Bool**: 2 bytes, **Null**: 1 byte.
 
-The dictionary deduplicates structural field names — millions of objects sharing names like `"name"`, `"x"`, `"y"` only pay 2 bytes per key in the keystring area (a dictionary reference) plus the 25-byte child index entry. Push-ID keys are stored inline (~24 bytes per key) but don't pollute the dictionary.
+The dictionary deduplicates structural field names, so millions of objects sharing names like `"name"`, `"x"`, `"y"` only pay 2 bytes per key in the keystring area (a dictionary reference) plus the 25-byte child index entry. Push-ID keys are stored inline (~24 bytes per key) but don't pollute the dictionary.
 
 ## Operations
 
@@ -320,7 +321,7 @@ When the eviction policy decides a promoted path has been idle long enough:
 2. No I/O needed — data is recoverable from blob + in-memory WAL
 ```
 
-The data isn't lost — the next access re-promotes the subtree from the blob and replays any pending WAL entries on top. Subscriptions deliberately don't pin paths against eviction; idle paths get evicted and re-promoted on demand.
+The data is still recoverable: the next access re-promotes the subtree from the blob and replays any pending WAL entries on top. Subscriptions deliberately don't pin paths against eviction; idle paths get evicted and re-promoted on demand.
 
 ### Batch Promotion (Startup / io_uring)
 
@@ -395,7 +396,7 @@ For WAL entry (SET /chat/-msg001 = {...}) when /chat doesn't exist:
 ```
 
 **Batching optimization:** At high write rates, apply WAL entries in batches:
-- Group by path (latest value per path wins — coalesce)
+- Group by path (latest value per path wins, i.e. coalesce)
 - Sort by blob offset (sequential pwrite is faster than random)
 - Apply as batched pwrite() + append operations
 - Dictionary is read once per batch (not per update)
@@ -481,9 +482,9 @@ pub trait BlobIO {
 
 Three concrete implementations are wired up:
 
-- **`MemBlobIO`** — backed by a `Vec<u8>`. Fast, no disk, deterministic. Used in tests.
-- **`StdBlobIO`** — `std::fs::File` with `FileExt::read_at` / `write_at`. Used by `lark-compact` and by anywhere outside the Glommio runtime.
-- **`GlommioBlobIO`** — io_uring pread/pwrite. Lives in `lark-server` (`server/src/storage/glommio_blob_io.rs`), not in the blob crate itself, so the blob crate stays runtime-agnostic.
+- **`MemBlobIO`**: backed by a `Vec<u8>`. Fast, no disk, deterministic. Used in tests.
+- **`StdBlobIO`**: `std::fs::File` with `FileExt::read_at` / `write_at`. Used by `lark-compact` and by anywhere outside the Glommio runtime.
+- **`GlommioBlobIO`**: io_uring pread/pwrite. Lives in `lark-server` (`server/src/storage/glommio_blob_io.rs`), not in the blob crate itself, so the blob crate stays runtime-agnostic.
 
 `CachedIO<IO>` wraps any `BlobIO` with a byte cache so repeated reads of the same region (and write-back of pending header/index updates) don't hit the underlying I/O twice.
 
@@ -578,8 +579,8 @@ Invariants the compactor maintains so concurrent reads from lark-server
 are always safe:
 
 1. **The old blob is never deleted** until the new one is fully written and synced (for full re-compaction, this means atomic rename).
-2. **Incremental compaction only appends and does pwrite** — it never removes data from the blob. Dead space accumulates until full re-compaction.
-3. **Server reads are safe** — the blob file is always readable. Forward pointers always point to valid data. New data is appended before the forward pointer is written.
+2. **Incremental compaction only appends and does pwrite.** It never removes data from the blob. Dead space accumulates until full re-compaction.
+3. **Server reads are safe.** The blob file is always readable. Forward pointers always point to valid data. New data is appended before the forward pointer is written.
 4. **Write ordering for incremental updates:**
    - First: append new value at EOF + fsync
    - Then: pwrite forward pointer at tombstone location + fsync
@@ -619,4 +620,4 @@ On promotion of `/characters/abc123`, look up all entries with path prefix `/cha
 
 ## References
 
-- [OSON Paper](https://vldb.org/pvldb/vol13/p3059-liu.pdf) — Oracle VLDB 2020
+- [OSON Paper](https://vldb.org/pvldb/vol13/p3059-liu.pdf), Oracle VLDB 2020

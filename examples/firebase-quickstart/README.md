@@ -1,6 +1,6 @@
 # Firebase Quickstart on Lark
 
-A walkthrough showing how to run Firebase's own [`quickstart-js/database`](https://github.com/firebase/quickstart-js/tree/master/database) sample — a social-blogging app with Firebase Auth + Realtime Database — against a local Lark backend, with **only a handful of lines changed**.
+A walkthrough showing how to run Firebase's own [`quickstart-js/database`](https://github.com/firebase/quickstart-js/tree/master/database) sample (a social-blogging app with Firebase Auth + Realtime Database) against a local Lark backend, with **only a handful of lines changed**.
 
 If you're migrating an existing Firebase app to Lark, this is roughly the same changes you'll make; Firebase Auth keeps working as-is (Lark validates Firebase ID tokens server-side), and only the database endpoint changes.
 
@@ -10,7 +10,7 @@ If you're migrating an existing Firebase app to Lark, this is roughly the same c
 
 - **Node 18 or newer** and **npm ≥ 9** (e.g. `nvm install 22` and `nvm use 22`)
 - **Docker** + `make` (for the local Lark stack)
-- A **Firebase project** in the Firebase console — free tier, used only for Auth
+- A **Firebase project** in the Firebase console (free tier, used only for Auth)
 - ~5 minutes
 
 ---
@@ -21,8 +21,8 @@ In the [Firebase console](https://console.firebase.google.com/):
 
 1. **Create a project** (or use an existing one).
 2. **Authentication → Sign-in method**, enable **Google** (the upstream quickstart's default sign-in)
-3. **Project settings → General → Your apps**, register a **Web app** and copy the `firebaseConfig` snippet — you'll paste it into `config.ts` in step 5.
-4. **Note the Project ID** It's in the config snippet (for example, `projectId: "quickstart-abc123`); we'll use this to setup Lark.
+3. **Project settings → General → Your apps**, register a **Web app** and copy the `firebaseConfig` snippet; you'll paste it into `config.ts` in step 5.
+4. **Note the Project ID.** It's in the config snippet (for example, `projectId: "quickstart-abc123"`); we'll use this to set up Lark.
 
 You do **not** need to create a Realtime Database in Firebase. The DB lives in Lark; Firebase is only signing tokens.
 
@@ -56,8 +56,8 @@ http://localhost:8080/admin/
 
 In the admin UI (`http://localhost:8080/admin/`):
 
-1. **Create a new project** — call it `quickstart`. Uncheck "Ephemeral" if you want the data to be saved. Leave "Auto Create" enabled.
-2. **Click on the Settings button** in the top-right corner. Set `Firebase Auth project ID`** to your Firebase project ID from step 1 (e.g. `quickstart-abc123`). Click on `Save Settings`. This is how Lark knows which Google-signed token issuer to trust for this project.
+1. **Create a new project**: call it `quickstart`. Uncheck "Ephemeral" if you want the data to be saved. Leave "Auto Create" enabled.
+2. **Click on the Settings button** in the top-right corner. Set `Firebase Auth project ID` to your Firebase project ID from step 1 (e.g. `quickstart-abc123`). Click on `Save Settings`. This is how Lark knows which Google-signed token issuer to trust for this project.
 3. **Default rules are fine**. By default the Lark project will be created with open rules, allowing any read or write. This is fine for demo purposes. In a real app you would want rules that restrict what users can read and write.
 
 ## Step 5 — Point the quickstart at Lark
@@ -125,4 +125,6 @@ The `Firebase Auth project ID` on the Lark project doesn't match the issuer of t
 
 ## Next steps
 
-Now that you've seen how easily you can use Lark with a Firebase project, feel free to tackle your own codebase, or write something new!
+The same two edits work on your own Firebase app: point `databaseURL` at your Lark
+project and drop the emulator block. For security rules, the REST API, and the rest
+of the client surface, see [docs.larksh.com](https://docs.larksh.com).

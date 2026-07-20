@@ -4,19 +4,19 @@ This document describes the complete lifecycle of a write operation in Lark, fro
 
 ## Two Database Flavors: Ephemeral vs Blob-Backed
 
-Lark databases come in two flavors, and the write lifecycle is largely the same for both — but a handful of steps behave differently. Each section below calls out blob-backed-specific behavior where it diverges.
+Lark databases come in two flavors, and the write lifecycle is largely the same for both, though a handful of steps behave differently. Each section below calls out blob-backed-specific behavior where it diverges.
 
 | | Ephemeral | Blob-backed |
 |---|---|---|
-| Persistence | None — tree lives only in memory | `blob.lark` + WAL on disk |
+| Persistence | None; tree lives only in memory | `blob.lark` + WAL on disk |
 | Tree mutations | `tree.set` / `tree.update` (real Object intermediates) | `tree.set_lazy` / `tree.update_lazy` (Sentinel intermediates) |
-| `data.*` reads in rules | Direct tree access | `LazySnapshot` — may trigger `NeedsPromotion` if unloaded |
+| `data.*` reads in rules | Direct tree access | `LazySnapshot`; may trigger `NeedsPromotion` if unloaded |
 | `newData.*` in rules | `LazyUpdateSnapshot` (overlay over an empty tree) | `LazyUpdateSnapshot` (overlay over the real lazy tree) |
 | Eviction | None | Idle promoted paths reverted to Sentinels every ~5s |
 | WAL append | Skipped | Every write |
 | Use case | Volatile playspaces, throwaway test DBs | Long-lived game/app data |
 
-**Key concept for blob-backed DBs: Sentinels.** A `Sentinel` ArcValue represents "data exists at or below this point in the tree, but it hasn't been loaded from the blob yet." Sentinels make writes free of blob I/O — `set_lazy` walks down the path through Sentinel intermediates and just inserts the leaf — and reads opt-in to loading via `promote_path*`. See the "Storage" and "Data model" sections in the root [CONTRIBUTING](../CONTRIBUTING.md) for the lazy tree design.
+**Key concept for blob-backed DBs: Sentinels.** A `Sentinel` ArcValue represents "data exists at or below this point in the tree, but it hasn't been loaded from the blob yet." Sentinels make writes free of blob I/O (`set_lazy` walks down the path through Sentinel intermediates and just inserts the leaf), and reads opt-in to loading via `promote_path*`. See the "Storage" and "Data model" sections in the root [CONTRIBUTING](../CONTRIBUTING.md) for the lazy tree design.
 
 ## Overview
 
@@ -325,7 +325,7 @@ async fn can_write(&mut self, client_id: &str, path: &str, new_data: Option<NewD
 }
 ```
 
-`new_data` is an `Option<NewData>` — `None` for deletes (no value being written), `Some(NewData::Set { .. })` for SET, `Some(NewData::Update { .. })` for UPDATE. The same `NewData` is reused at every level of the rules cascade; the rules engine builds a level-specific snapshot via `NewData::snapshot_at(tree, ctx.path)` per level.
+`new_data` is an `Option<NewData>`: `None` for deletes (no value being written), `Some(NewData::Set { .. })` for SET, `Some(NewData::Update { .. })` for UPDATE. The same `NewData` is reused at every level of the rules cascade; the rules engine builds a level-specific snapshot via `NewData::snapshot_at(tree, ctx.path)` per level.
 
 ### Snapshot Types
 
@@ -333,9 +333,9 @@ The rules engine sees three kinds of snapshots, all of which implement the `Snap
 
 | Variable | Snapshot | What it represents | Lazy? |
 |---|---|---|---|
-| `data.*` | `LazySnapshot` | Existing tree at the rule's path | Yes — `NeedsPromotion` if unloaded |
-| `root.*` | `LazySnapshot` (at `""`) | Existing tree at root | Yes — same |
-| `newData.*` | `LazyUpdateSnapshot` | Post-write merged view | Yes — overlay of updates onto tree |
+| `data.*` | `LazySnapshot` | Existing tree at the rule's path | Yes; `NeedsPromotion` if unloaded |
+| `root.*` | `LazySnapshot` (at `""`) | Existing tree at root | Yes; same |
+| `newData.*` | `LazyUpdateSnapshot` | Post-write merged view | Yes; overlay of updates onto tree |
 
 `LazySnapshot` and `LazyUpdateSnapshot` both navigate freely (`child()`, `parent()` are O(1) path math) and only trigger `NeedsPromotion` when an accessor (`val()`, `exists()`, `has_child()`, etc.) needs data that isn't loaded.
 
@@ -356,7 +356,7 @@ view_path classification:
 
 For SET, we synthesize a one-key updates map `{set_path: value}` at root, so the same snapshot type handles both write kinds.
 
-The big win: rules like `auth.token.is_admin === true` (the production "admin only" pattern) never construct a snapshot at all — `eval_expr` checks `uses_new_data` per rule before building anything. For rules that *do* read `newData.x`, only `x`'s path is touched. Untouched siblings stay unloaded, untouched paths in a multi-path UPDATE never get walked, and the eager `merged_data = existing + updates` allocation is gone.
+Rules like `auth.token.is_admin === true` (the production "admin only" pattern) therefore never construct a snapshot at all: `eval_expr` checks `uses_new_data` per rule before building anything. For rules that *do* read `newData.x`, only `x`'s path is touched. Untouched siblings stay unloaded, untouched paths in a multi-path UPDATE never get walked, and the eager `merged_data = existing + updates` allocation is gone.
 
 ### Validate Children: Only What's Written
 
@@ -427,7 +427,7 @@ if self.is_volatile_path(path_str) {
 
 **File:** `server/src/db/tree.rs`, `blob/src/arc_value.rs`
 
-The mutation path branches on `is_blob_backed()`. Both branches end up doing the same logical thing — apply the write to the tree — but the blob-backed branch goes through Sentinel-aware lazy variants.
+The mutation path branches on `is_blob_backed()`. Both branches end up doing the same logical thing (apply the write to the tree), but the blob-backed branch goes through Sentinel-aware lazy variants.
 
 **Ephemeral DB:**
 ```rust
@@ -450,9 +450,9 @@ for key in updates.keys() {
 }
 ```
 
-`set_lazy` / `update_lazy` use `set_path_mut_sentinel` under the hood, which walks the path and creates **Sentinel** intermediates for any key that doesn't yet exist in the tree. This is what makes blob-backed writes free of blob I/O — you can write `/a/b/c/d` even if the path's ancestors have never been loaded; each missing intermediate becomes a `Sentinel` that signals "this subtree may have data in the blob, load on demand."
+`set_lazy` / `update_lazy` use `set_path_mut_sentinel` under the hood, which walks the path and creates **Sentinel** intermediates for any key that doesn't yet exist in the tree. This is what makes blob-backed writes free of blob I/O: you can write `/a/b/c/d` even if the path's ancestors have never been loaded, and each missing intermediate becomes a `Sentinel` that signals "this subtree may have data in the blob, load on demand."
 
-**No eager `promote_path`** — neither SET nor UPDATE loads existing data before the write. Earlier versions of this code did an eager `promote_path` in `handle_update` to materialize `merged_data = existing + updates` for rules eval; that's gone. The rules engine now consumes `NewData` lazily (see §5), so any blob path a rule actually reads is loaded inside the rules retry loop, not unconditionally upfront.
+**No eager `promote_path`**: neither SET nor UPDATE loads existing data before the write. Earlier versions of this code did an eager `promote_path` in `handle_update` to materialize `merged_data = existing + updates` for rules eval; that's gone. The rules engine now consumes `NewData` lazily (see §5), so any blob path a rule actually reads is loaded inside the rules retry loop, not unconditionally upfront.
 
 The tree itself uses `ArcValue` (from `lark-blob`) for copy-on-write semantics:
 
@@ -471,7 +471,7 @@ pub enum ArcValue {
 - O(1) cloning via `Arc` reference counting
 - In-place mutation when refcount == 1 via `Arc::make_mut()`
 - Structural sharing for unmodified subtrees
-- Sentinels hold children written before blob data was loaded (invisible to reads — `exists()` → false, `to_value()` → Null)
+- Sentinels hold children written before blob data was loaded (invisible to reads: `exists()` → false, `to_value()` → Null)
 
 #### Sentinel Tracking (Blob-backed only)
 
@@ -489,7 +489,7 @@ Every write site that introduces or removes Sentinels must keep `sentinel_paths`
 | `promote_path_shallow` | promoted_value can have *deep* Sentinel intermediates (lazy WAL replay through Sentinel children); recursive `collect_sentinel_paths` walk inserts every Sentinel found |
 | `handle_remove` | `remove_sentinel_paths_below(path)` clears the deleted subtree's tracking |
 
-`promote_path_deep` includes a defensive check + `warn!` if it ever finds an untracked Sentinel — promotes anyway, but flags the I3 violation in the logs so we can find the offending mutation site. See `Database::find_sentinel_tracking_violations` for a test-time audit hook.
+`promote_path_deep` includes a defensive check + `warn!` if it ever finds an untracked Sentinel. It promotes anyway, but flags the I3 violation in the logs so we can find the offending mutation site. See `Database::find_sentinel_tracking_violations` for a test-time audit hook.
 
 #### WAL Write
 
@@ -500,16 +500,16 @@ self.wal_write_set(path_str, &value);
 ```
 
 Implementation:
-1. **Canonicalize SET-to-null**: if `value.is_null()`, route to `wal_write_delete` instead. Without this, `WalEntry::set(path, Null)` serializes as `{"o":"s","v":null}`, which serde reads back as `value: None` on restart — the SET arm of WAL replay would silently skip the entry. This canonicalization gives the WAL a single encoding for "delete" (`WalOp::Delete`, no `v` field) regardless of which wire shape produced it (Lark `remove()`, Firebase `set(null)`, transaction SET-with-null, on-disconnect SET-with-null).
+1. **Canonicalize SET-to-null**: if `value.is_null()`, route to `wal_write_delete` instead. Without this, `WalEntry::set(path, Null)` serializes as `{"o":"s","v":null}`, which serde reads back as `value: None` on restart, so the SET arm of WAL replay would silently skip the entry. This canonicalization gives the WAL a single encoding for "delete" (`WalOp::Delete`, no `v` field) regardless of which wire shape produced it (Lark `remove()`, Firebase `set(null)`, transaction SET-with-null, on-disconnect SET-with-null).
 2. Create `WalEntry::Set { path, value }`
 3. Append to WAL buffer (JSONL format)
 4. Also append to in-memory `pending_wal_entries` (for replay during future promotions)
 5. Check rotation threshold (5MB)
 6. Mark `wal_dirty = true` for next sync
 
-Note that steps 1–6 touch only memory — the entry lands in an in-memory buffer,
-not the WAL file. The ACK is returned to the client at this point; the write
-becomes durable at the next sync (below).
+Steps 1–6 touch only memory: the entry lands in an in-memory buffer, not the WAL
+file. The ACK is returned to the client at this point; the write becomes durable
+at the next sync (below).
 
 WAL sync happens in the periodic task at an interval controlled by
 `LARK_WAL_SYNC_INTERVAL_MS` (default 2000ms):
@@ -527,14 +527,14 @@ is `true`, issues an `fdatasync` so the data is durable on the physical device.
 **Durability window.** With the defaults, a write is ACKed before it is flushed,
 so up to `LARK_WAL_SYNC_INTERVAL_MS` of acknowledged writes sit in memory, and
 each flush only reaches the OS page cache (no `fdatasync`). That is safe across a
-**process** crash — the kernel writes the page cache back — but a **power loss**
-or kernel panic can lose the most recent writes. Two knobs tighten this
+**process** crash, since the kernel writes the page cache back, but a **power
+loss** or kernel panic can lose the most recent writes. Two knobs tighten this
 (see [DEPLOYMENT.md](DEPLOYMENT.md#durability)):
 
-- `LARK_WAL_SYNC_INTERVAL_MS=0` — flush before every write's ACK (synchronous;
+- `LARK_WAL_SYNC_INTERVAL_MS=0`: flush before every write's ACK (synchronous;
   the database waits, so a delivered ACK means the write is at least in the page
   cache).
-- `LARK_FSYNC_ON_WAL_FLUSH=true` — `fdatasync` on every flush (power-safe).
+- `LARK_FSYNC_ON_WAL_FLUSH=true`: `fdatasync` on every flush (power-safe).
 
 Setting both gives strict per-write durability at the cost of write latency.
 
@@ -735,7 +735,7 @@ fn flush_volatile_slow(&mut self) {
 5. **Rules evaluation** `can_write("/players/alice/score", NewData::Set { .. })`
    - Rules eval consumes `newData` via `LazyUpdateSnapshot`. If a rule reads `data.*` or `root.*` and the path isn't loaded, the engine returns `NeedsPromotion` and the retry loop calls `load_from_blob` for that specific path. For a rule that only references `auth.*` / `newData.*`, no tree access happens at all.
    - Rule passes → continue
-6. **Tree mutation** `tree.set_lazy(["players", "alice", "score"], 100)` — Sentinel intermediates created for any unloaded ancestor; `track_sentinels_after_write("/players/alice/score")` records them
+6. **Tree mutation** `tree.set_lazy(["players", "alice", "score"], 100)`: Sentinel intermediates created for any unloaded ancestor; `track_sentinels_after_write("/players/alice/score")` records them
 7. **WAL append** `{"o":"s","p":"/players/alice/score","v":100}` + stored in `pending_wal_entries`
 8. **Record processed** `processed_writes["client-1"].insert("req-1")`
 9. **Broadcast** finds affected views:
@@ -782,7 +782,7 @@ fn flush_volatile_slow(&mut self) {
 | **Volatile batching** | `subscription/volatile.rs` | 5-25x reduction in event sends |
 | **Tiered flush rates** | `database/broadcast.rs` | 20Hz fast / 4Hz slow clients |
 | **Lazy blob promotion** | `database/promotion.rs` | Only loads blob data when a read accesses it |
-| **Lazy newData** | `rules/snapshot.rs` | UPDATE rules cascade builds snapshots on demand instead of materializing `merged_data` per ancestor — no eager `tree.get_value` walks for rules that don't read `newData.*` |
+| **Lazy newData** | `rules/snapshot.rs` | UPDATE rules cascade builds snapshots on demand instead of materializing `merged_data` per ancestor, with no eager `tree.get_value` walks for rules that don't read `newData.*` |
 | **writes_at validate** | `rules/snapshot.rs` | `.validate` fires only on children being written, not on tree-existing untouched siblings |
 | **Message batching** | `proxy.rs` | 256KB or 3ms → reduced syscalls |
 | **View batch processing** | `database/broadcast.rs` | 10 views per batch, yield between |

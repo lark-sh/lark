@@ -5,7 +5,7 @@ development environment, the contribution workflow, and the conventions we follo
 
 By participating, you agree to abide by our
 [Code of Conduct](CODE_OF_CONDUCT.md). To report a **security** vulnerability,
-do **not** open an issue — follow [SECURITY.md](SECURITY.md).
+do **not** open an issue; follow [SECURITY.md](SECURITY.md).
 
 ## Ways to contribute
 
@@ -21,7 +21,7 @@ under commercial terms as well. To keep that possible, **all contributors must
 sign a CLA** before their first contribution is merged:
 
 - **Individuals:** the [Individual CLA](docs/cla/individual-cla.md) is signed
-  automatically on your first pull request — a bot comments with instructions, and
+  automatically on your first pull request: a bot comments with instructions, and
   you sign by replying with the one-line statement it gives you. One signature
   covers all your future PRs.
 - **Contributing as part of your job:** your employer should also have a
@@ -32,12 +32,12 @@ sign a CLA** before their first contribution is merged:
 
 ### Prerequisites
 
-- **Rust** — the toolchain is pinned in `rust-toolchain.toml`; rustup installs
+- **Rust**: the toolchain is pinned in `rust-toolchain.toml`; rustup installs
   the right version automatically the first time you build.
-- **Docker** — required on macOS: Glommio uses `io_uring` (Linux-only), so the
+- **Docker**: required on macOS. Glommio uses `io_uring` (Linux-only), so the
   Makefile transparently runs Rust commands inside a Linux dev container.
-- **Node.js** — for building the dashboard SPA.
-- **Go** — for building `lark-edge`.
+- **Node.js**: for building the dashboard SPA.
+- **Go**: for building `lark-edge`.
 
 ### Common Makefile targets
 
@@ -121,7 +121,7 @@ while we stabilize the APIs, wire protocol, and on-disk format, minor releases m
 include breaking changes (documented in `CHANGELOG.md`). The `1.0.0` line lands at
 the public release.
 
-## Technical Underpinnings
+## Technical underpinnings
 
 Lark uses a **thread-per-core** model. Each CPU core runs its own Glommio
 event loop with no shared mutable state. When a client connects, the
@@ -130,17 +130,17 @@ That database's data structures, subscriptions, WAL writer, and blob session all
 live on that one core, which avoids the need for mutexes or locks across cores.
 
 Within a core, each database is a Glommio task with its own inbox
-(`LocalChannel<InboxMessage>`). Writes, reads, subscribes, transactions
-— all arrive as messages on that inbox and are processed one at a
-time.
+(`LocalChannel<InboxMessage>`). Writes, reads, subscribes, and
+transactions all arrive as messages on that inbox and are processed one
+at a time.
 
 ## Storage
 
 Three layers, all per-database:
 
-- **WAL** — `wal/000001.wal`, JSONL, flushed every 2 seconds, rotates at 5 MB.
-- **Blob** — `blob.lark`, single binary file in the `lark-blob` format. Compact on-disk representation. Loaded lazily.
-- **Sidecar** — `sidecar.lark`. Free list + pending dictionary keys, written alongside each compaction batch.
+- **WAL**: `wal/000001.wal`, JSONL, flushed every 2 seconds, rotates at 5 MB.
+- **Blob**: `blob.lark`, single binary file in the `lark-blob` format. Compact on-disk representation. Loaded lazily.
+- **Sidecar**: `sidecar.lark`. Free list + pending dictionary keys, written alongside each compaction batch.
 
 ```
 {data_dir}/{project}/{database}/
@@ -154,17 +154,17 @@ Three layers, all per-database:
     └── ...
 ```
 
-**Lazy tree**: blob-backed databases start with a Sentinel root — no
+**Lazy tree**: blob-backed databases start with a Sentinel root, so no
 data is in memory until first access. A read at a path triggers
 `promote_path`, which reads the subtree from the blob, replays any
 pending WAL entries on top, and inserts the result into the tree.
-Writes don't promote — `set_lazy` creates Sentinel intermediates that
+Writes don't promote: `set_lazy` creates Sentinel intermediates that
 hold new leaves without touching surrounding data. Idle promoted paths
 get evicted back to Sentinels after ~30 s; re-promotion is
 deterministic so no data is ever lost.
 
-**Compaction**: a per-core `StorageWorker` (Glommio task on the lower-
-priority queue) incrementally applies completed WAL files into the
+**Compaction**: a per-core `StorageWorker` (a Glommio task on the
+lower-priority queue) incrementally applies completed WAL files into the
 blob. The sidecar's free list lets dead bytes get reused for new writes
 so the blob stays roughly the size of its working set. Full
 re-compaction (rare) runs via the separate `lark-compact` CLI when
@@ -189,9 +189,9 @@ algorithm + claim shape:
 | Lark customer tokens | HS256 | Your service signs with the project's secret | The recommended format for new applications |
 
 Rules see the resolved auth as the `auth` object:
-- `auth.uid` — the token's `sub` (or `uid`) claim.
-- `auth.token.<claim>` — any custom claim on the token.
-- `auth == null` — unauthenticated.
+- `auth.uid`: the token's `sub` (or `uid`) claim.
+- `auth.token.<claim>`: any custom claim on the token.
+- `auth == null`: unauthenticated.
 
 Implementation: `server/src/auth/` validates tokens server-side;
 `edge/auth/` does the gateway-side JWT verification.
@@ -222,7 +222,7 @@ to reads (`exists()` → false, `to_value()` → Null), but holds children
 that were written to deeper paths before surrounding blob data was
 loaded. Reads through a Sentinel always trigger promotion.
 
-Mutations use `Arc::make_mut` — if the refcount is 1, mutate in place;
+Mutations use `Arc::make_mut`: if the refcount is 1, mutate in place;
 otherwise clone first. So a SET that touches one node only clones that
 one node, not the whole subtree.
 
@@ -236,10 +236,9 @@ operations don't reallocate.
 **`Query`** (`server/src/db/query.rs`)
 
 Captures the query parameters (`orderBy`,
-`limitToFirst`, `limitToLast`, `startAt`, `endAt`, `equalTo`). The
-interesting bit is `SortKey` (`server/src/db/value.rs`), which wraps
-`ArcValue` with mixed-type ordering (null < bool < number <
-string < object).
+`limitToFirst`, `limitToLast`, `startAt`, `endAt`, `equalTo`).
+`SortKey` (`server/src/db/value.rs`) wraps `ArcValue` with mixed-type
+ordering (null < bool < number < string < object).
 
 **`InboxMessage`** (`server/src/db/database/mod.rs`)
 
