@@ -315,6 +315,11 @@ Environment="LARK_COORDINATOR_URL=http://10.0.0.20:8080"
 # not exposed in `ps`; lark-server reads $SERVER_SECRET automatically.
 Environment="SERVER_SECRET=<same 32+ byte secret as the gateways>"
 Environment="RUST_LOG=info"
+# WAL durability — defaults shown explicitly (see the Durability section above).
+# Set LARK_WAL_SYNC_INTERVAL_MS=0 and LARK_FSYNC_ON_WAL_FLUSH=true for strict
+# per-write durability.
+Environment="LARK_WAL_SYNC_INTERVAL_MS=2000"
+Environment="LARK_FSYNC_ON_WAL_FLUSH=false"
 
 ExecStart=/usr/local/bin/lark-server \
     --id=${LARK_SERVER_ID} \
@@ -324,7 +329,9 @@ ExecStart=/usr/local/bin/lark-server \
     --proxy-port=${LARK_PROXY_PORT} \
     --capacity=${LARK_CAPACITY} \
     --data-dir=${LARK_DATA_DIR} \
-    --coordinator=${LARK_COORDINATOR_URL}
+    --coordinator=${LARK_COORDINATOR_URL} \
+    --wal-sync-interval-ms=${LARK_WAL_SYNC_INTERVAL_MS} \
+    --fsync-on-wal-flush=${LARK_FSYNC_ON_WAL_FLUSH}
 
 Restart=always
 RestartSec=5

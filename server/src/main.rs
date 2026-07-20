@@ -94,7 +94,16 @@ pub struct Args {
     /// to the OS page cache (`false`, default). Page-cache-only writes survive a
     /// process crash but not power loss; enable this for durability across power
     /// loss. Combine with `--wal-sync-interval-ms 0` for strict per-write durability.
-    #[arg(long, default_value = "false", env = "LARK_FSYNC_ON_WAL_FLUSH")]
+    ///
+    /// Takes an explicit value (`--fsync-on-wal-flush=true|false`, or
+    /// `LARK_FSYNC_ON_WAL_FLUSH=true|false`) rather than being a bare flag, so
+    /// `=false` reliably means false via either channel.
+    #[arg(
+        long,
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+        env = "LARK_FSYNC_ON_WAL_FLUSH"
+    )]
     pub fsync_on_wal_flush: bool,
 
     /// Coordinator URL for server registration (internal endpoint, e.g., http://lark-edge:8080)

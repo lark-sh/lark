@@ -9,6 +9,7 @@
 #   ./tools/chaos-monkey/run.sh                    # Run for 1 hour (default)
 #   ./tools/chaos-monkey/run.sh --duration 5h      # Run for 5 hours
 #   ./tools/chaos-monkey/run.sh --seed 42          # Reproducible run
+#   ./tools/chaos-monkey/run.sh --durability strict # interval=0 + fsync, zero-loss contract
 #   SKIP_BUILD=1 ./tools/chaos-monkey/run.sh       # Skip compilation
 #   DEBUG=1 ./tools/chaos-monkey/run.sh            # Trace-level logging
 #

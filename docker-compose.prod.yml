@@ -53,6 +53,10 @@ services:
       LARK_DATA_DIR: "/data"
       LARK_COORDINATOR_URL: "http://lark-edge:8081"
       LARK_METRICS_PUSH: "true"
+      # WAL durability — defaults shown (see docs/DEPLOYMENT.md#durability).
+      # For strict per-write durability: "0" + "true".
+      LARK_WAL_SYNC_INTERVAL_MS: "2000"
+      LARK_FSYNC_ON_WAL_FLUSH: "false"
       SERVER_SECRET: "${SERVER_SECRET:?SERVER_SECRET is required — 'make up-release' generates one into .env automatically, or set it in .env yourself}"
     volumes:
       - lark-server-data:/data
