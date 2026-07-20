@@ -83,6 +83,29 @@ pub struct Args {
     #[arg(long, default_value = "300", env = "LARK_EVICTION_IDLE_SECS")]
     pub eviction_idle_secs: u64,
 
+    /// How often (milliseconds) buffered WAL entries are flushed to disk.
+    /// Default 2000ms. `0` = synchronous: every write is flushed before its ACK,
+    /// so the client's ACK means the write is persisted (higher latency). Lower
+    /// values shrink the window of acknowledged-but-unflushed writes lost on crash.
+    #[arg(long, default_value = "2000", env = "LARK_WAL_SYNC_INTERVAL_MS")]
+    pub wal_sync_interval_ms: u64,
+
+    /// Issue a real `fdatasync` on each WAL flush (`true`) instead of only writing
+    /// to the OS page cache (`false`, default). Page-cache-only writes survive a
+    /// process crash but not power loss; enable this for durability across power
+    /// loss. Combine with `--wal-sync-interval-ms 0` for strict per-write durability.
+    ///
+    /// Takes an explicit value (`--fsync-on-wal-flush=true|false`, or
+    /// `LARK_FSYNC_ON_WAL_FLUSH=true|false`) rather than being a bare flag, so
+    /// `=false` reliably means false via either channel.
+    #[arg(
+        long,
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+        env = "LARK_FSYNC_ON_WAL_FLUSH"
+    )]
+    pub fsync_on_wal_flush: bool,
+
     /// Coordinator URL for server registration (internal endpoint, e.g., http://lark-edge:8080)
     #[arg(long, env = "LARK_COORDINATOR_URL")]
     pub coordinator: Option<String>,
@@ -195,6 +218,8 @@ fn main() {
     }
 
     lark_server::db::set_eviction_idle_secs(args.eviction_idle_secs);
+    lark_server::db::set_wal_sync_interval_ms(args.wal_sync_interval_ms);
+    lark_server::db::set_fsync_on_wal_flush(args.fsync_on_wal_flush);
 
     // Create executor pool configuration
     let pool_config = ExecutorPoolConfig {

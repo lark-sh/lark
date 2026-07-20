@@ -18,6 +18,10 @@ primary_region = "iad"          # ← must match the edge + volume region
   LARK_DATA_DIR        = "/data"
   LARK_COORDINATOR_URL = "http://lark-edge.internal:8081"
   LARK_METRICS_PUSH    = "true"   # push metrics to lark-edge → dashboard works with no log shipper
+  # WAL durability — defaults shown (see docs/DEPLOYMENT.md#durability).
+  # Strict per-write durability: LARK_WAL_SYNC_INTERVAL_MS="0" + LARK_FSYNC_ON_WAL_FLUSH="true".
+  LARK_WAL_SYNC_INTERVAL_MS = "2000"
+  LARK_FSYNC_ON_WAL_FLUSH   = "false"
   RUST_LOG             = "info"
 
 [mounts]

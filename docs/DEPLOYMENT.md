@@ -315,6 +315,11 @@ Environment="LARK_COORDINATOR_URL=http://10.0.0.20:8080"
 # not exposed in `ps`; lark-server reads $SERVER_SECRET automatically.
 Environment="SERVER_SECRET=<same 32+ byte secret as the gateways>"
 Environment="RUST_LOG=info"
+# WAL durability — defaults shown explicitly (see the Durability section above).
+# Set LARK_WAL_SYNC_INTERVAL_MS=0 and LARK_FSYNC_ON_WAL_FLUSH=true for strict
+# per-write durability.
+Environment="LARK_WAL_SYNC_INTERVAL_MS=2000"
+Environment="LARK_FSYNC_ON_WAL_FLUSH=false"
 
 ExecStart=/usr/local/bin/lark-server \
     --id=${LARK_SERVER_ID} \
@@ -324,7 +329,9 @@ ExecStart=/usr/local/bin/lark-server \
     --proxy-port=${LARK_PROXY_PORT} \
     --capacity=${LARK_CAPACITY} \
     --data-dir=${LARK_DATA_DIR} \
-    --coordinator=${LARK_COORDINATOR_URL}
+    --coordinator=${LARK_COORDINATOR_URL} \
+    --wal-sync-interval-ms=${LARK_WAL_SYNC_INTERVAL_MS} \
+    --fsync-on-wal-flush=${LARK_FSYNC_ON_WAL_FLUSH}
 
 Restart=always
 RestartSec=5
@@ -467,10 +474,31 @@ non-default values a real deployment needs.
 | `LARK_NR_CORES` | `--nr-cores` | all cores | Number of Glommio cores to run. |
 | `LARK_METRICS_PUSH` | `--metrics-push` | `false` | Push per-DB metrics to the coordinator (needs `--coordinator`). `true` in bundled deploys → dashboard works with no log shipper. See [OBSERVABILITY.md](OBSERVABILITY.md). |
 | `LARK_EVICTION_IDLE_SECS` | `--eviction-idle-secs` | `300` | Idle seconds before a promoted path is evicted back to Sentinel. |
+| `LARK_WAL_SYNC_INTERVAL_MS` | `--wal-sync-interval-ms` | `2000` | How often buffered WAL writes flush to disk. `0` = flush before every write's ACK (synchronous; higher latency). See [Durability](#durability). |
+| `LARK_FSYNC_ON_WAL_FLUSH` | `--fsync-on-wal-flush` | `false` | `fdatasync` each WAL flush (`true`) vs. OS page cache only (`false`). Enable for durability across power loss. See [Durability](#durability). |
 | `LARK_DEBUG_TIMING` | `--debug-timing` | `false` | Detailed message-latency tracking (diagnostics). |
 | `RUST_LOG` | — | `info` | Log filter (e.g. `debug`, `lark_server=debug`). |
 | `LARK_EMULATOR` | `--emulator` | `false` | **Dev/test only** — accepts the `owner` token. |
 | `LARK_TEMPLATE_PATH` | `--template` | — | **Dev/test only** — load-testing template directory. |
+
+#### Durability
+
+Writes go to a write-ahead log (WAL) that is compacted into the blob on disk.
+Two settings control how aggressively the WAL is persisted, trading write
+latency for crash safety:
+
+| Goal | `LARK_WAL_SYNC_INTERVAL_MS` | `LARK_FSYNC_ON_WAL_FLUSH` | Behavior |
+|---|---|---|---|
+| **Default** (throughput) | `2000` | `false` | Writes are ACKed immediately; the buffer flushes to the OS page cache every 2s. Survives a **process** crash, but a **power loss** can lose up to ~2s of acknowledged writes plus anything the kernel hasn't written back. |
+| **Power-safe** | `2000` | `true` | Same 2s window, but each flush is `fdatasync`'d — data in a completed flush survives power loss. |
+| **Synchronous** | `0` | `false` | Each write is flushed to the page cache before its ACK. No in-memory loss window; survives process crash but not power loss. |
+| **Strict** | `0` | `true` | Each write is flushed **and** `fdatasync`'d before its ACK — a delivered ACK means the write is durable on the device. Highest per-write latency. |
+
+Because the interval is in-memory buffering (not batching for throughput on a
+single connection), lowering it — or setting `0` — increases the fsync/flush
+rate and therefore write latency. Pick the weakest setting that meets your
+data-loss tolerance. These are process-wide (all databases on the node share
+them), set once at startup.
 
 ### `lark-edge` (the gateway / coordinator)
 

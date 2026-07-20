@@ -61,12 +61,37 @@ pub struct CliArgs {
     ///   appear after restart.
     #[arg(long, default_value = "lookup")]
     pub rules_mode: RulesMode,
+
+    /// Durability mode for the server under test.
+    ///
+    /// - `default`: the server's defaults — WAL flushed every 2s, page-cache
+    ///   only (no `fdatasync`). The run loop tolerates a loss window: writes
+    ///   ACK'd shortly before the kill may be lost (they may still be in the
+    ///   in-process WAL buffer).
+    /// - `strict`: launches the server with `--wal-sync-interval-ms=0
+    ///   --fsync-on-wal-flush=true`, so every write is flushed (and fdatasync'd)
+    ///   before its ACK. The run loop then trusts *every* ACK right up to the
+    ///   kill and requires zero loss — a single missing ACK'd write is a
+    ///   violation. This exercises the per-write flush path in `run.rs`.
+    ///
+    /// Note: the kill is `SIGKILL` (process crash), which preserves the OS page
+    /// cache, so this validates the interval=0 "flush-before-ACK" guarantee, not
+    /// power-loss survival of the `fdatasync` itself. `fsync=true` is still set so
+    /// the fdatasync path is exercised (and can't silently regress into a hang).
+    #[arg(long, default_value = "default")]
+    pub durability: Durability,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum RulesMode {
     Open,
     Lookup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Durability {
+    Default,
+    Strict,
 }
 
 pub struct ChaosConfig {
@@ -82,6 +107,7 @@ pub struct ChaosConfig {
     pub max_kill_interval: Duration,
     pub seed: Option<u64>,
     pub rules_mode: RulesMode,
+    pub durability: Durability,
 }
 
 impl From<CliArgs> for ChaosConfig {
@@ -99,6 +125,7 @@ impl From<CliArgs> for ChaosConfig {
             max_kill_interval: Duration::from_secs(args.max_kill_interval),
             seed: args.seed,
             rules_mode: args.rules_mode,
+            durability: args.durability,
         }
     }
 }

@@ -176,6 +176,12 @@ impl Database {
         const MAX_BATCH_DURATION: Duration = Duration::from_millis(10);
         const PERIODIC_INTERVAL: Duration = Duration::from_millis(50);
 
+        // WAL flush cadence, configured at startup (LARK_WAL_SYNC_INTERVAL_MS).
+        // 0 means synchronous durability, handled per-write before each ACK in
+        // handle_protocol_message; the timer-driven sync below then just mops up
+        // any residue (and is a no-op when nothing is dirty).
+        let wal_sync_interval = Duration::from_millis(wal_sync_interval_ms());
+
         loop {
             // Wait for first message or periodic timeout
             let timeout = Timer::new(PERIODIC_INTERVAL);
@@ -289,8 +295,8 @@ impl Database {
                 last_volatile_slow_flush = now;
             }
 
-            // Sync WAL to disk (2s) - async to avoid blocking other DBs
-            if now.duration_since(last_wal_sync) >= WAL_SYNC_INTERVAL {
+            // Sync WAL to disk (LARK_WAL_SYNC_INTERVAL_MS) - async to avoid blocking other DBs
+            if now.duration_since(last_wal_sync) >= wal_sync_interval {
                 self.sync_wal().await;
                 last_wal_sync = now;
             }
@@ -467,6 +473,14 @@ impl Database {
                 ))
             }
         };
+
+        // Synchronous durability mode: when the flush interval is 0, flush (and
+        // fdatasync, if FSYNC_ON_WAL_FLUSH) the WAL before acking, so a delivered
+        // ACK guarantees the write reached disk. sync_wal is a no-op when nothing
+        // is dirty (reads, volatile writes), so this only costs on real writes.
+        if self.wal_dirty && wal_sync_interval_ms() == 0 {
+            self.sync_wal().await;
+        }
 
         // Send response
         if let Some(resp) = response {

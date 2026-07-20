@@ -86,8 +86,9 @@ impl WalEntry {
 
 /// Async WAL writer that handles appending entries and file rotation.
 ///
-/// Writes are buffered in memory. Data only touches disk during `sync()`,
-/// which is called every 2 seconds.
+/// Writes are buffered in memory. Data only touches disk during `sync()`, whose
+/// cadence and durability (page-cache flush vs. `fdatasync`) are controlled by
+/// the caller — see `WAL_SYNC_INTERVAL_MS` / `FSYNC_ON_WAL_FLUSH`.
 pub struct WalWriter {
     dir: PathBuf,
     current_file: Option<AppendFile>,
@@ -184,17 +185,21 @@ impl WalWriter {
         self.last_append_bytes
     }
 
-    /// Flush the in-memory buffer to disk and sync.
+    /// Flush the in-memory buffer to the WAL file.
+    ///
+    /// When `fsync` is true, the flush is also `fdatasync`'d for durability across
+    /// power loss; when false, data only reaches the OS page cache (crash-safe
+    /// against process death, but not power loss). See `FSYNC_ON_WAL_FLUSH`.
     ///
     /// Returns true if the WAL file was rotated (size exceeded threshold).
-    pub async fn sync(&mut self) -> io::Result<bool> {
+    pub async fn sync(&mut self, fsync: bool) -> io::Result<bool> {
         if self.buffer.is_empty() {
             return Ok(false);
         }
 
         if let Some(ref mut file) = self.current_file {
             file.write(&self.buffer).await?;
-            file.sync().await?;
+            file.sync(fsync).await?;
             self.buffer.clear();
 
             // Rotate if file is too large
@@ -212,7 +217,9 @@ impl WalWriter {
         if let Some(mut file) = self.current_file.take() {
             if !self.buffer.is_empty() {
                 file.write(&self.buffer).await?;
-                file.sync().await?;
+                // Always fdatasync on close — clean shutdown must be durable
+                // regardless of the steady-state FSYNC_ON_WAL_FLUSH setting.
+                file.sync(true).await?;
                 self.buffer.clear();
             }
             file.close().await?;
@@ -634,7 +641,7 @@ mod tests {
 
                 writer.append_one(&WalEntry::set("/a", json!(1))).unwrap();
                 writer.append_one(&WalEntry::set("/b", json!(2))).unwrap();
-                writer.sync().await.unwrap();
+                writer.sync(false).await.unwrap();
             }
 
             // Read entries back
@@ -658,7 +665,7 @@ mod tests {
             {
                 let mut writer = WalWriter::new(&wal_dir).await.unwrap();
                 writer.append_one(&WalEntry::set("/a", json!(1))).unwrap();
-                writer.sync().await.unwrap();
+                writer.sync(false).await.unwrap();
             }
 
             // Create new writer (new sequence)
@@ -666,7 +673,7 @@ mod tests {
                 let mut writer = WalWriter::new(&wal_dir).await.unwrap();
                 assert_eq!(writer.sequence(), 2);
                 writer.append_one(&WalEntry::set("/b", json!(2))).unwrap();
-                writer.sync().await.unwrap();
+                writer.sync(false).await.unwrap();
             }
 
             // Read since sequence 2
@@ -689,12 +696,12 @@ mod tests {
             {
                 let mut writer = WalWriter::new(&wal_dir).await.unwrap();
                 writer.append_one(&WalEntry::set("/a", json!(1))).unwrap();
-                writer.sync().await.unwrap();
+                writer.sync(false).await.unwrap();
             }
             {
                 let mut writer = WalWriter::new(&wal_dir).await.unwrap();
                 writer.append_one(&WalEntry::set("/b", json!(2))).unwrap();
-                writer.sync().await.unwrap();
+                writer.sync(false).await.unwrap();
             }
 
             // Delete files before sequence 2
@@ -735,7 +742,7 @@ mod tests {
             ];
 
             writer.append(&entries).unwrap();
-            writer.sync().await.unwrap();
+            writer.sync(false).await.unwrap();
 
             let reader = WalReader::new(&wal_dir);
             let read_entries = reader.read_all().await.unwrap();
@@ -754,7 +761,7 @@ mod tests {
                 let mut w1 = WalWriter::new(&wal_dir).await.unwrap();
                 let seq = w1.sequence();
                 w1.append_one(&WalEntry::set("/a", json!(1))).unwrap();
-                w1.sync().await.unwrap();
+                w1.sync(false).await.unwrap();
                 seq
             };
 
@@ -832,7 +839,7 @@ mod tests {
                 writer
                     .append_one(&WalEntry::set("/complex", complex_value.clone()))
                     .unwrap();
-                writer.sync().await.unwrap();
+                writer.sync(false).await.unwrap();
             }
 
             let reader = WalReader::new(&wal_dir);
@@ -861,7 +868,7 @@ mod tests {
                 let mut w1 = WalWriter::with_min_sequence(&wal_dir, 9).await.unwrap();
                 assert_eq!(w1.sequence(), 10); // Should be min_sequence + 1
                 w1.append_one(&WalEntry::set("/a", json!(1))).unwrap();
-                w1.sync().await.unwrap();
+                w1.sync(false).await.unwrap();
             }
 
             // Now create a new writer with minSequence=5 (lower than existing file)
@@ -1193,7 +1200,7 @@ mod tests {
             writer
                 .append_one(&WalEntry::set("/test", json!("value")))
                 .unwrap();
-            writer.sync().await.unwrap();
+            writer.sync(false).await.unwrap();
             drop(writer);
 
             // Verify the file was created with sequence 6
@@ -1231,7 +1238,7 @@ mod tests {
             writer.append_one(&WalEntry::set("/b", json!(2))).unwrap();
 
             // Force rotation by syncing/closing and starting a new file
-            writer.sync().await.unwrap();
+            writer.sync(false).await.unwrap();
             writer.close().await.unwrap();
 
             // Manually create second file by bumping sequence
@@ -1240,7 +1247,7 @@ mod tests {
             assert!(seq2 > seq1, "Second writer should have higher sequence");
 
             writer2.append_one(&WalEntry::set("/c", json!(3))).unwrap();
-            writer2.sync().await.unwrap();
+            writer2.sync(false).await.unwrap();
             writer2.close().await.unwrap();
 
             // Read all entries — each should be stamped with its file's sequence
@@ -1285,7 +1292,7 @@ mod tests {
             writer
                 .append_one(&WalEntry::set("/x", json!("val")))
                 .unwrap();
-            writer.sync().await.unwrap();
+            writer.sync(false).await.unwrap();
             writer.close().await.unwrap();
 
             let mut writer2 = WalWriter::with_min_sequence(&wal_dir, seq1).await.unwrap();
@@ -1293,7 +1300,7 @@ mod tests {
             writer2
                 .append_one(&WalEntry::set("/y", json!("val2")))
                 .unwrap();
-            writer2.sync().await.unwrap();
+            writer2.sync(false).await.unwrap();
             writer2.close().await.unwrap();
 
             // Read only the second file

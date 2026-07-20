@@ -3,8 +3,12 @@
 //! A standalone chaos testing tool that continuously writes data to a real Lark server,
 //! randomly kills the server, and verifies data integrity after restart.
 //!
-//! Any write that was acknowledged (ACK) must survive. The only acceptable loss is writes
-//! that were in-flight during the crash (the known 2-second WAL fsync window).
+//! Any write that was acknowledged (ACK) must survive. In `--durability default`
+//! mode the only acceptable loss is writes in-flight during the crash (the WAL
+//! flushes every 2s, so an ACK'd write may still be in the in-process buffer);
+//! the run loop tolerates this by not trusting ACKs in a grace window before the
+//! kill. In `--durability strict` mode the server flushes before every ACK, so
+//! the run loop trusts every ACK up to the kill and requires zero loss.
 
 // Protocol structs mirror the server's wire format and include fields parsed
 // off the wire that this tool doesn't act on; helper methods are kept for
@@ -22,7 +26,7 @@ mod report;
 mod verify;
 
 use clap::Parser;
-use config::{ChaosConfig, CliArgs, RulesMode};
+use config::{ChaosConfig, CliArgs, Durability, RulesMode};
 use ground_truth::{GroundTruth, WriteOp};
 use operations::{OpType, OperationGenerator, TxOpKind};
 use process::{create_server_process, wait_for_server};
@@ -94,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
         config.min_kill_interval, config.max_kill_interval
     );
     info!("  Rules mode: {:?}", config.rules_mode);
+    info!("  Durability: {:?}", config.durability);
     // Resolve the seed up front so a randomly-chosen one is still printed —
     // lets the user copy it from the run header and re-run a failing
     // chaos session deterministically with `--seed N`.
@@ -123,8 +128,12 @@ async fn main() -> anyhow::Result<()> {
         let mut op_gen = OperationGenerator::new();
 
         // Step 1: Start server (compaction runs in-process)
-        let mut server =
-            create_server_process(&config.server_bin, &config.data_dir, config.proxy_port);
+        let mut server = create_server_process(
+            &config.server_bin,
+            &config.data_dir,
+            config.proxy_port,
+            config.durability,
+        );
 
         server.start().await?;
 
@@ -358,12 +367,23 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Step 7b: Grace period (4s). Keep writing to exercise "crash during WAL write",
-        // but do NOT mark ACKs as committed. The WAL syncs every 2s and the kernel
-        // dirty page flush takes up to 3s, so writes ACK'd in this window may not
-        // survive a SIGKILL. Leaving them as Sent means the ground truth treats them
-        // as pending (survived = fine, lost = fine).
-        info!("Grace period: writing for 4s (ACKs not trusted)...");
+        // Step 7b: Grace period (4s). Keep writing to exercise "crash during WAL write".
+        //
+        // In `default` durability, do NOT mark ACKs as committed: the WAL syncs
+        // every 2s and the kernel dirty-page flush takes up to 3s, so writes
+        // ACK'd in this window may not survive a SIGKILL. Leaving them as Sent
+        // means ground truth treats them as pending (survived = fine, lost = fine).
+        //
+        // In `strict` durability, the server flushes (and fdatasync's) before
+        // every ACK, so an observed ACK is durable even under an immediate
+        // SIGKILL. Keep trusting ACKs right up to the kill — any missing ACK'd
+        // write is then a real violation (zero-loss contract).
+        let strict = config.durability == Durability::Strict;
+        if strict {
+            info!("Grace period: writing for 4s (strict — ACKs trusted, zero loss required)...");
+        } else {
+            info!("Grace period: writing for 4s (ACKs not trusted)...");
+        }
         let grace_deadline = tokio::time::Instant::now() + Duration::from_secs(4);
         let mut grace_ops = 0;
         while tokio::time::Instant::now() < grace_deadline {
@@ -383,16 +403,39 @@ async fn main() -> anyhow::Result<()> {
                 .await;
             grace_ops += 1;
 
-            // Collect events but only handle heartbeats — ignore ACKs/NACKs
-            // (they stay as Sent, which ground truth treats as pending)
-            if let Some(ServerEvent::Heartbeat) = client.recv_event(Duration::from_millis(50)).await
-            {
-                let _ = client.send_heartbeat_ack().await;
+            if strict {
+                // Trust ACKs: mark committed so they're verified with zero tolerance.
+                if let Some(event) = client.recv_event(Duration::from_millis(50)).await {
+                    handle_event(&event, &mut ground_truth, &mut client).await;
+                }
+            } else {
+                // Collect events but only handle heartbeats — ACKs/NACKs stay as
+                // Sent, which ground truth treats as pending.
+                if let Some(ServerEvent::Heartbeat) =
+                    client.recv_event(Duration::from_millis(50)).await
+                {
+                    let _ = client.send_heartbeat_ack().await;
+                }
+            }
+        }
+        if strict {
+            // Drain any ACKs still queued from the final grace writes so they
+            // count toward the must-survive set before we stop trusting.
+            let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < drain_deadline {
+                if let Some(event) = client.recv_event(Duration::from_millis(100)).await {
+                    handle_event(&event, &mut ground_truth, &mut client).await;
+                }
             }
         }
         info!(
-            "Grace period sent {} writes (all treated as pending)",
-            grace_ops
+            "Grace period sent {} writes ({})",
+            grace_ops,
+            if strict {
+                "ACKs trusted"
+            } else {
+                "all treated as pending"
+            }
         );
 
         let pending = ground_truth.mark_all_sent_as_pending();

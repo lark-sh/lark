@@ -507,14 +507,36 @@ Implementation:
 5. Check rotation threshold (5MB)
 6. Mark `wal_dirty = true` for next sync
 
-WAL sync happens every 2 seconds in the periodic task:
+Note that steps 1–6 touch only memory — the entry lands in an in-memory buffer,
+not the WAL file. The ACK is returned to the client at this point; the write
+becomes durable at the next sync (below).
+
+WAL sync happens in the periodic task at an interval controlled by
+`LARK_WAL_SYNC_INTERVAL_MS` (default 2000ms):
 
 ```rust
-if self.wal_dirty {
-    self.wal_writer.sync()?;  // fsync to disk
-    self.wal_dirty = false;
+// run.rs — every LARK_WAL_SYNC_INTERVAL_MS
+if now.duration_since(last_wal_sync) >= wal_sync_interval {
+    self.sync_wal().await;  // flush buffer → WAL file (+ fdatasync if enabled)
 }
 ```
+
+`sync_wal` flushes the buffer to the WAL file and, when `LARK_FSYNC_ON_WAL_FLUSH`
+is `true`, issues an `fdatasync` so the data is durable on the physical device.
+
+**Durability window.** With the defaults, a write is ACKed before it is flushed,
+so up to `LARK_WAL_SYNC_INTERVAL_MS` of acknowledged writes sit in memory, and
+each flush only reaches the OS page cache (no `fdatasync`). That is safe across a
+**process** crash — the kernel writes the page cache back — but a **power loss**
+or kernel panic can lose the most recent writes. Two knobs tighten this
+(see [DEPLOYMENT.md](DEPLOYMENT.md#durability)):
+
+- `LARK_WAL_SYNC_INTERVAL_MS=0` — flush before every write's ACK (synchronous;
+  the database waits, so a delivered ACK means the write is at least in the page
+  cache).
+- `LARK_FSYNC_ON_WAL_FLUSH=true` — `fdatasync` on every flush (power-safe).
+
+Setting both gives strict per-write durability at the cost of write latency.
 
 On WAL rotation, a `CompactionRequest` is sent to the per-core StorageWorker via `LocalChannel`.
 

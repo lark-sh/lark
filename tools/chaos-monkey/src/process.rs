@@ -1,5 +1,6 @@
 //! Process management: spawn, kill, and restart the Lark server.
 
+use crate::config::Durability;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::{Child, Command};
@@ -107,8 +108,17 @@ impl ManagedProcess {
 /// during chaos runs — this exercises the lazy-tree promote/evict code paths
 /// that prod hits but the default 5-minute timeout would never fire in a short
 /// chaos session.
-pub fn create_server_process(bin_path: &Path, data_dir: &Path, proxy_port: u16) -> ManagedProcess {
-    let args = vec![
+///
+/// In `strict` durability mode, also passes `--wal-sync-interval-ms=0
+/// --fsync-on-wal-flush=true` so every write is flushed (and fdatasync'd) before
+/// its ACK — the run loop then requires zero loss of ACK'd writes.
+pub fn create_server_process(
+    bin_path: &Path,
+    data_dir: &Path,
+    proxy_port: u16,
+    durability: Durability,
+) -> ManagedProcess {
+    let mut args = vec![
         "--id=chaos-1".to_string(),
         "--hostname=localhost".to_string(),
         format!("--proxy-port={}", proxy_port),
@@ -118,6 +128,10 @@ pub fn create_server_process(bin_path: &Path, data_dir: &Path, proxy_port: u16) 
         "--nr-cores=1".to_string(),
         "--eviction-idle-secs=20".to_string(),
     ];
+    if durability == Durability::Strict {
+        args.push("--wal-sync-interval-ms=0".to_string());
+        args.push("--fsync-on-wal-flush=true".to_string());
+    }
     ManagedProcess::new("lark-server", bin_path.to_path_buf(), args)
 }
 

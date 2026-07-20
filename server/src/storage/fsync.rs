@@ -276,6 +276,12 @@ pub async fn file_size_async(path: &Path) -> i64 {
 /// Uses io_uring-based I/O via StreamWriter for efficient sequential writes.
 pub struct AppendFile {
     writer: glommio::io::StreamWriter,
+    /// A second, independent handle to the same file used solely to issue
+    /// `fdatasync`. `StreamWriter` exposes no sync of its own (and is built with
+    /// sync-on-close disabled), so durability has to come from a separate fd.
+    /// `fdatasync` flushes the inode's dirty pages regardless of which fd wrote
+    /// them, so syncing this handle durably persists the StreamWriter's writes.
+    sync_handle: glommio::io::BufferedFile,
     size: u64,
 }
 
@@ -297,7 +303,19 @@ impl AppendFile {
             .with_sync_on_close_disabled(true) // We control sync explicitly
             .build();
 
-        Ok(Self { writer, size })
+        // Independent handle on the same file, used only for fdatasync (see the
+        // field docs). Opened after the writer so the file is guaranteed to exist.
+        let sync_handle = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .buffered_open(path)
+            .await?;
+
+        Ok(Self {
+            writer,
+            sync_handle,
+            size,
+        })
     }
 
     /// Write data to the file.
@@ -308,16 +326,34 @@ impl AppendFile {
         Ok(())
     }
 
-    /// Sync the file to disk (fdatasync).
-    pub async fn sync(&mut self) -> io::Result<()> {
+    /// Flush buffered data to the file.
+    ///
+    /// When `fsync` is true, the data is also `fdatasync`'d so it is durable on
+    /// the physical device even across power loss. When false, the data only
+    /// reaches the OS page cache: it survives a process crash (the kernel writes
+    /// it back), but not a power loss or kernel panic before writeback.
+    pub async fn sync(&mut self, fsync: bool) -> io::Result<()> {
         use futures::io::AsyncWriteExt;
-        self.writer.flush().await
+        // flush() awaits completion of the buffered write, so afterwards the
+        // bytes are in the page cache; fdatasync then forces them to the device.
+        self.writer.flush().await?;
+        if fsync {
+            self.sync_handle.fdatasync().await?;
+        }
+        Ok(())
     }
 
     /// Close the file.
-    pub async fn close(mut self) -> io::Result<()> {
+    pub async fn close(self) -> io::Result<()> {
         use futures::io::AsyncWriteExt;
-        self.writer.close().await
+        let Self {
+            mut writer,
+            sync_handle,
+            ..
+        } = self;
+        writer.close().await?;
+        sync_handle.close().await?;
+        Ok(())
     }
 
     /// Get the current file size.

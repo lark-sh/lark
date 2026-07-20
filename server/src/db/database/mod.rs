@@ -406,8 +406,39 @@ const VOLATILE_FAST_FLUSH_INTERVAL: Duration = Duration::from_millis(50); // 20H
 /// Volatile batch flush interval for slow clients (WebSocket)
 const VOLATILE_SLOW_FLUSH_INTERVAL: Duration = Duration::from_millis(150); // ~7Hz
 
-/// WAL sync interval (fsync to disk)
-const WAL_SYNC_INTERVAL: Duration = Duration::from_secs(2);
+/// WAL flush interval, in milliseconds. Controls how often buffered WAL entries
+/// are flushed to the WAL file. `0` selects synchronous durability: every write
+/// is flushed (and `fdatasync`'d, if `FSYNC_ON_WAL_FLUSH`) before its ACK is
+/// sent, so the database waits on each write. Default 2000ms. Override at startup
+/// via `set_wal_sync_interval_ms` (driven by the `LARK_WAL_SYNC_INTERVAL_MS` env
+/// var). See also [`FSYNC_ON_WAL_FLUSH`].
+pub static WAL_SYNC_INTERVAL_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(2000);
+
+pub fn set_wal_sync_interval_ms(ms: u64) {
+    WAL_SYNC_INTERVAL_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn wal_sync_interval_ms() -> u64 {
+    WAL_SYNC_INTERVAL_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether each WAL flush issues a real `fdatasync` to force data onto the
+/// physical device (`true`), or only flushes to the OS page cache (`false`,
+/// the default). Page-cache-only writes survive a process crash (the kernel
+/// writes them back) but not a power loss or kernel panic before writeback.
+/// Override at startup via `set_fsync_on_wal_flush` (driven by the
+/// `LARK_FSYNC_ON_WAL_FLUSH` env var).
+pub static FSYNC_ON_WAL_FLUSH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_fsync_on_wal_flush(enabled: bool) {
+    FSYNC_ON_WAL_FLUSH.store(enabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn fsync_on_wal_flush() -> bool {
+    FSYNC_ON_WAL_FLUSH.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Metrics emission interval (only for active databases)
 const METRICS_EMIT_INTERVAL: Duration = Duration::from_secs(60);
