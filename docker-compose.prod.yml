@@ -12,7 +12,7 @@
 #
 # Pin a version with LARK_VERSION (defaults to `latest`):
 #
-#   LARK_VERSION=0.1.0 docker compose -f docker-compose.prod.yml up
+#   LARK_VERSION=0.2.0 docker compose -f docker-compose.prod.yml up
 #
 # While the repo is private the GHCR packages are private too — run
 # `docker login ghcr.io` first. They become anonymously pullable once their

@@ -10,8 +10,8 @@ name: Release
 # (native on Apple Silicon Macs and amd64 cloud hosts alike).
 #
 # Two ways to run it:
-#   * push a semver tag (`v0.1.0`) — the real release path. Always builds both
-#     arches, publishes versioned tags (0.1.0, 0.1, latest), and cuts a Release.
+#   * push a semver tag (`v0.2.0`) — the real release path. Always builds both
+#     arches, publishes versioned tags (0.2.0, 0.2, latest), and cuts a Release.
 #   * trigger manually (Actions → Release → Run workflow) — for validating the
 #     pipeline. Images publish as PRIVATE packages tagged with branch + short SHA.
 #
@@ -85,6 +85,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Resolve the version baked into the binaries. Tag pushes use the tag
+      # (v0.2.0 → 0.2.0) and must match [workspace.package] in Cargo.toml —
+      # a mismatch fails the release rather than shipping images whose
+      # --version disagrees with their image tag. Manual runs are pipeline
+      # validation, not releases, so they build as "dev".
+      - name: Resolve version
+        id: version
+        run: |
+          manifest_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            if [ "$tag_version" != "$manifest_version" ]; then
+              echo "Tag $GITHUB_REF_NAME does not match Cargo.toml workspace version $manifest_version." >&2
+              echo "Bump [workspace.package] version in Cargo.toml (and Cargo.lock) before tagging." >&2
+              exit 1
+            fi
+            echo "version=$tag_version" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
@@ -107,6 +128,8 @@ jobs:
           context: .
           file: ${{ matrix.image.dockerfile }}
           platforms: linux/${{ matrix.platform.arch }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
           labels: ${{ steps.meta.outputs.labels }}
           # Push by digest; the multi-arch tag is assembled in the merge job.
           outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=true

@@ -25,8 +25,18 @@ import (
 	"github.com/lark-sh/lark/edge/proxy"
 )
 
+// The Lark release version, injected at build time via
+// `-ldflags "-X main.version=..."` (see the Makefile and edge/Dockerfile).
+// Builds that skip the injection report "dev".
+var version = "dev"
+
 func main() {
-	logger.Info("Starting lark-edge (thick proxy mode)")
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-version") {
+		fmt.Println("lark-edge " + version)
+		return
+	}
+
+	logger.Info("Starting lark-edge (thick proxy mode)", "version", version)
 	logger.Info("Runtime config", "GOMAXPROCS", runtime.GOMAXPROCS(0), "NumCPU", runtime.NumCPU())
 
 	// Load configuration

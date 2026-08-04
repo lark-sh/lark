@@ -79,7 +79,11 @@ cargo test -p lark-server --test integration_rules -j 2
 
 `-j 2` keeps parallel linking under control so the linker isn't OOM-killed on
 memory-constrained machines. The Rust integration test harness
-(`TestServer`/`TestClient`) lives in `server/tests/common/mod.rs`. See the
+(`TestServer`/`TestClient`) lives in `server/tests/common/mod.rs`.
+
+[TESTING.md](TESTING.md) describes the full testing story: the compatibility,
+durability, and correctness claims Lark makes and which suite backs each one,
+including the Firebase SDK compatibility suite and the chaos monkey. See the
 [Data model](#data-model) and [Storage](#storage)
 sections for the internals you'll most often touch.
 
@@ -117,9 +121,19 @@ Common extension points (the relevant source files are noted inline):
 ## Versioning
 
 Lark follows [Semantic Versioning](https://semver.org). We're currently `0.x`:
-while we stabilize the APIs, wire protocol, and on-disk format, minor releases may
-include breaking changes (documented in `CHANGELOG.md`). The `1.0.0` line lands at
-the public release.
+minor releases may include breaking changes, which are documented in
+`CHANGELOG.md` and, when the on-disk format is affected, ship with a migration
+path. For how we think about `1.0.0`, see
+[Project status](README.md#project-status) in the README.
+
+There is one version for all of Lark: `version` under `[workspace.package]` in
+the root `Cargo.toml`. Every crate inherits it, the server embeds it via
+`CARGO_PKG_VERSION`, and the edge build injects it via ldflags (see the
+Makefile and `edge/Dockerfile`), so both binaries report it from `--version`
+and in their first startup log line. Cutting a release means bumping that one
+value (plus `Cargo.lock`, via `cargo update --workspace`), updating
+`CHANGELOG.md`, and pushing a matching `vX.Y.Z` tag — the release workflow
+fails if the tag and the workspace version disagree.
 
 ## Technical underpinnings
 

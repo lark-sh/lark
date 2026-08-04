@@ -16,7 +16,8 @@ If you can't use GitHub's private reporting, email **team@lark.sh** with
 Please include as much as you can:
 
 - the affected component (`lark-server`, `lark-edge`, `lark-blob`, …) and the
-  version or commit,
+  version or commit (both binaries report it via `--version` and in their first
+  startup log line),
 - a description of the issue and its impact,
 - steps to reproduce or a proof of concept,
 - any suggested mitigation.

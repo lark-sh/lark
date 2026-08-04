@@ -10,7 +10,13 @@ Lark is proudly open-source, and we believe that every developer should have the
 
 In addition, [Lark Cloud](https://lark.sh) is available for those who want us to handle the devops so you can focus on building your application, while knowing that you always have the option to move onto your own stack in the future.
 
-Full documentation for building on Lark (the client SDK, security rules, the REST API, and Firebase SDK compatibility) lives at [docs.larksh.com](https://docs.larksh.com). The [`docs/`](docs/) folder in this repo covers running Lark itself: deployment, backups, observability, and internals.
+Full documentation for building on Lark (the client SDK, security rules, the REST API, and Firebase SDK compatibility) lives at [docs.larksh.com](https://docs.larksh.com). The [`docs/`](docs/) folder in this repo covers running Lark itself: deployment, backups, observability, and internals. For how Lark is tested, including running Firebase's own SDK test suite against it and crash-testing the durability contract, see [TESTING.md](TESTING.md).
+
+## Project status
+
+Lark is a new open-source project backed by a production service: [Lark Cloud](https://lark.sh) runs this same codebase and hosts real customer data on it today. The engine is continuously tested against an explicit durability contract and verified against Firebase's own SDK test suite; [TESTING.md](TESTING.md) describes both and shows how to run everything yourself.
+
+The `0.x` version number reflects the project's age, not known instability. The on-disk format is already something we won't break without providing a migration path, and we don't expect churn in the configuration or wire surfaces beyond new features. We'd rather let Lark earn its 1.0 through public production mileage than declare it on our own confidence. Until then, breaking changes in `0.x` releases are rare, documented in the [CHANGELOG](CHANGELOG.md), and accompanied by a migration path whenever stored data is affected.
 
 ## Quick start
 

@@ -448,7 +448,9 @@ What makes this a different class of problem from Tier 2 is the
 - **Upgrades**: deploy node-by-node. The on-disk blob carries a
   `blob.generation`; a server restart re-opens its data and replays WAL forward
   (same path as restore). Roll `lark-server` nodes one at a time so the coordinator
-  reroutes around each during its brief restart.
+  reroutes around each during its brief restart. Both binaries report their
+  version via `--version` and in their first startup log line, so you can
+  confirm what each node is actually running mid-rollout.
 
 ---
 

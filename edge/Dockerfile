@@ -22,11 +22,16 @@ FROM golang:1.25-alpine AS gobuild
 RUN apk add --no-cache git
 WORKDIR /src/edge
 
+# The Lark release version reported by `lark-edge --version` and the startup
+# log. Release builds pass it from the pushed tag (see release.yml); local
+# builds without it report "dev".
+ARG VERSION=dev
+
 COPY edge/ ./
 COPY --from=spa /dashboard/dist ./dashboard/dist
 
 RUN go mod download
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/lark-edge .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/lark-edge .
 
 # --- Stage 3: runtime --------------------------------------------------------
 FROM alpine:3.20

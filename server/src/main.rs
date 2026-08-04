@@ -22,6 +22,7 @@ const METRICS_CHANNEL_CAPACITY: usize = 4096;
 /// Lark - Fast Multiplayer Database Server (Rust + Glommio)
 #[derive(Parser, Debug, Clone)]
 #[command(name = "lark")]
+#[command(version)]
 #[command(about = "Real-time database server")]
 pub struct Args {
     /// Server ID (e.g., prod-001)
@@ -191,7 +192,11 @@ fn main() {
             .unwrap_or(1)
     });
 
-    tracing::info!("Starting Lark server (ID: {})", args.id);
+    tracing::info!(
+        "Starting Lark server v{} (ID: {})",
+        env!("CARGO_PKG_VERSION"),
+        args.id
+    );
     tracing::info!("Runtime: Glommio thread-per-core with {} cores", nr_cores);
     tracing::info!("Proxy port: {} (SO_REUSEPORT)", args.proxy_port);
     tracing::info!("Public hostname: {}:{}", args.hostname, args.public_port);
