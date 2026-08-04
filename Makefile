@@ -8,6 +8,11 @@ PROJECT     := lark
 DEV_IMAGE   ?= lark-dev:latest          # Native arch — fast tests on Apple Silicon.
 BUILD_IMAGE ?= lark-builder:latest      # Forced linux/amd64 — produces deploy-ready binaries.
 
+# The Lark release version, read from [workspace.package] in Cargo.toml — the
+# single source of truth. Rust binaries embed it via CARGO_PKG_VERSION; the Go
+# edge build injects it via ldflags below.
+VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+
 # Cargo registry/git caches are arch-agnostic and shared between dev and builder.
 # Target dir is per-arch (mixed-arch artifacts would force rebuilds on every switch).
 CARGO_CACHE_FLAGS := \
@@ -137,7 +142,7 @@ build-spa:
 .PHONY: build-edge
 build-edge: build-spa
 	cd edge && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
-		go build -ldflags="-s -w" -o ../lark-edge .
+		go build -ldflags="-s -w -X main.version=$(VERSION)" -o ../lark-edge .
 
 # ---------------------------------------------------------------------------
 # OSS compose stack

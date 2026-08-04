@@ -35,6 +35,11 @@ COPY server /src/server
 # build a single `-p lark-server`, so the tools/ tree has to be present.
 COPY tools /src/tools
 
+# Accepted for parity with edge/Dockerfile (release.yml passes it to both
+# images); the Rust binary gets its version from Cargo.toml via
+# CARGO_PKG_VERSION, so the value is unused here.
+ARG VERSION=dev
+
 RUN cargo build --release -p lark-server
 
 # --- Stage 2: runtime --------------------------------------------------------
