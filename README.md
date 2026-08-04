@@ -10,7 +10,7 @@ Lark is proudly open-source, and we believe that every developer should have the
 
 In addition, [Lark Cloud](https://lark.sh) is available for those who want us to handle the devops so you can focus on building your application, while knowing that you always have the option to move onto your own stack in the future.
 
-Full documentation for building on Lark (the client SDK, security rules, the REST API, and Firebase SDK compatibility) lives at [docs.larksh.com](https://docs.larksh.com). The [`docs/`](docs/) folder in this repo covers running Lark itself: deployment, backups, observability, and internals.
+Full documentation for building on Lark (the client SDK, security rules, the REST API, and Firebase SDK compatibility) lives at [docs.larksh.com](https://docs.larksh.com). The [`docs/`](docs/) folder in this repo covers running Lark itself: deployment, backups, observability, and internals. For how Lark is tested, including running Firebase's own SDK test suite against it and crash-testing the durability contract, see [TESTING.md](TESTING.md).
 
 ## Quick start
 

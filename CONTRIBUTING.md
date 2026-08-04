@@ -79,7 +79,11 @@ cargo test -p lark-server --test integration_rules -j 2
 
 `-j 2` keeps parallel linking under control so the linker isn't OOM-killed on
 memory-constrained machines. The Rust integration test harness
-(`TestServer`/`TestClient`) lives in `server/tests/common/mod.rs`. See the
+(`TestServer`/`TestClient`) lives in `server/tests/common/mod.rs`.
+
+[TESTING.md](TESTING.md) describes the full testing story: the compatibility,
+durability, and correctness claims Lark makes and which suite backs each one,
+including the Firebase SDK compatibility suite and the chaos monkey. See the
 [Data model](#data-model) and [Storage](#storage)
 sections for the internals you'll most often touch.
 
