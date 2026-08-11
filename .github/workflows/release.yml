@@ -1,7 +1,8 @@
 name: Release
 
 # Builds and publishes multi-arch (linux/amd64 + linux/arm64) container images
-# for lark-server and lark-edge to the GitHub Container Registry (GHCR).
+# for lark-server and lark-edge to the GitHub Container Registry (GHCR). Both
+# packages are public, so `docker pull` needs no credentials.
 #
 # Each architecture is built on a NATIVE runner (amd64 on ubuntu-24.04, arm64 on
 # ubuntu-24.04-arm) — no QEMU emulation, so the Glommio Rust engine compiles at
@@ -13,20 +14,10 @@ name: Release
 #   * push a semver tag (`v0.2.0`) — the real release path. Always builds both
 #     arches, publishes versioned tags (0.2.0, 0.2, latest), and cuts a Release.
 #   * trigger manually (Actions → Release → Run workflow) — for validating the
-#     pipeline. Images publish as PRIVATE packages tagged with branch + short SHA.
-#
-# WHILE THE REPO IS PRIVATE: the free `ubuntu-24.04-arm` runners are
-# public-repos-only, so the arm64 leg can't be scheduled yet. Use the manual
-# trigger with the `platforms` input set to `amd64` to exercise the full
-# build → push → manifest flow in CI. To validate the arm64 image before going
-# public, build it natively on an Apple Silicon Mac and push to your private GHCR:
-#
-#   docker buildx build --platform linux/arm64 \
-#     -f server/Dockerfile -t ghcr.io/lark-sh/lark-server:arm64-test --push .
-#
-# GOING PUBLIC: a one-time step, no workflow change needed — flip each package's
-# visibility to public (org → Packages → settings) so anonymous `docker pull`
-# works. After that, tag pushes build both arches automatically.
+#     pipeline. Images build as version "dev" and publish under branch and short
+#     SHA tags (`main`, `sha-a0da3e7`); `latest` and the semver tags are reserved
+#     for tag pushes, so a manual run can never overwrite a release. Narrow the
+#     `platforms` input to amd64 for a faster smoke test that skips arm64.
 
 on:
   push:

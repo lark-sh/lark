@@ -4,21 +4,17 @@ How to get logs and metrics out of a self-hosted Lark deployment.
 
 Lark gives you two observability primitives:
 
-- **Logs**: both binaries write structured logs to **stdout**. Point `docker logs`, journald, or
-  your log aggregator at them.
-- **Metrics**: `lark-server` tracks per-database usage (writes, reads, bytes, CCU, latency, on-disk
-  size, etc.) and the admin dashboard charts it. In the bundled deployments this **works out of the box**;
-  larger or bare-metal setups have a couple of options, covered below.
+- **Logs**: both binaries write structured logs to **stdout**. Point `docker logs`, journald, or your log aggregator at them.
+- **Metrics**: `lark-server` tracks per-database usage (writes, reads, bytes, CCU, latency, on-disk size, etc.) and the admin dashboard charts it. In the bundled deployments this **works out of the box**; larger or bare-metal setups have a couple of options, covered below.
 
 ---
 
 ## Metrics work out of the box (containers + Fly quickstart)
 
-In the bundled `docker-compose.yml` and the Fly quickstart, `lark-server` **pushes its metrics directly
-to `lark-edge`** over the internal network.
+In the bundled compose files and the Fly quickstart, `lark-server` **pushes its metrics directly to `lark-edge`** over the internal network.
 
 ```bash
-make up
+make up-release
 # → http://localhost:8080/admin/  → Monitoring
 ```
 
@@ -42,12 +38,9 @@ This is controlled by one environment variable on **lark-server**:
 |----------|---------|--------|
 | `LARK_METRICS_PUSH` | `false` | `true` → push metrics to the coordinator (`LARK_COORDINATOR_URL`). Set to `true` in the bundled compose + Fly configs. |
 
-`lark-server` opens a single background thread that batches metrics and POSTs them to
-`<LARK_COORDINATOR_URL>/internal/metrics`. It's best-effort: if lark-edge is briefly unreachable the
-samples are dropped (logged, never blocking the database).
+`lark-server` opens a single background thread that batches metrics and POSTs them to `<LARK_COORDINATOR_URL>/internal/metrics`. It's best-effort: if lark-edge is briefly unreachable the samples are dropped (logged, never blocking the database).
 
-The first metrics can take ~5 minutes to show up in the dashboard, which is expected. Metrics are
-saved to the lark-edge backing database (SQLite or PostgreSQL), and they do add up over time.
+The first metrics can take ~5 minutes to show up in the dashboard, which is expected. Metrics are saved to the lark-edge backing database (SQLite or PostgreSQL), and they do add up over time.
 
 ---
 
@@ -64,17 +57,13 @@ Both components log to stdout:
 
 ## Larger / bare-metal setups: shipping metrics with Vector
 
-`LARK_METRICS_PUSH` is the right answer for a single lark-server talking to a lark-edge. A
-log/metrics shipper like [Vector](https://vector.dev) is a better fit when you want to:
+`LARK_METRICS_PUSH` is the right answer for a single lark-server talking to a lark-edge. A log/metrics shipper like [Vector](https://vector.dev) is a better fit when you want to:
 
-- Fan metrics out off-site, into Prometheus/Grafana, Datadog, BetterStack, and so on, not just
-  Lark's own dashboard.
-- Run on bare metal or systemd where you already operate a log pipeline and prefer one path for
-  everything.
+- Fan metrics out off-site, into Prometheus/Grafana, Datadog, BetterStack, and so on, not just Lark's own dashboard.
+- Run on bare metal or systemd where you already operate a log pipeline and prefer one path for everything.
 - Decouple metric delivery from the database process (buffering, retries, multiple sinks).
 
-Because `lark-server` also writes every metric sample to **stdout** as a JSON line, a shipper can pick
-them up there regardless of `LARK_METRICS_PUSH`. Each line looks like:
+Because `lark-server` also writes every metric sample to **stdout** as a JSON line, a shipper can pick them up there regardless of `LARK_METRICS_PUSH`. Each line looks like:
 
 ```json
 {"type":"db_metrics","ts":1706011200,"server":"lark-server-1","core":3,
@@ -99,12 +88,7 @@ Samples are emitted every ~60s per **active** database (idle databases emit noth
 
 ### Option A — Vector to Lark's dashboard (instead of `LARK_METRICS_PUSH`)
 
-If you'd rather Vector deliver metrics to the dashboard (e.g. for buffering across a flaky link), leave
-`LARK_METRICS_PUSH=false` and have Vector POST the same payload to lark-edge's internal endpoint. The
-contract: keep stdout lines where `type == "db_metrics"`, batch them into a JSON **array**, and POST to
-`http://<edge-host>:<internal-port>/internal/metrics` (the internal listener, `:8081` in the bundled
-compose; keep it off the public internet) with an `Authorization: Bearer <SERVER_SECRET>` header. The
-endpoint is authenticated and rejects unauthenticated posts with `401`. An example Vector config:
+If you'd rather Vector deliver metrics to the dashboard (e.g. for buffering across a flaky link), leave `LARK_METRICS_PUSH=false` and have Vector POST the same payload to lark-edge's internal endpoint. The contract: keep stdout lines where `type == "db_metrics"`, batch them into a JSON **array**, and POST to `http://<edge-host>:<internal-port>/internal/metrics` (the internal listener, `:8081` in the bundled compose; keep it off the public internet) with an `Authorization: Bearer <SERVER_SECRET>` header. The endpoint is authenticated and rejects unauthenticated posts with `401`. An example Vector config:
 
 ```toml
 [sources.lark]
@@ -133,8 +117,7 @@ batch.timeout_secs = 5
 
 ### Option B — Vector to Prometheus / your own stack
 
-Convert the same `db_metrics` lines into metrics tagged by `server` / `core` / `project` / `database`
-and send them wherever you like, independent of Lark's dashboard:
+Convert the same `db_metrics` lines into metrics tagged by `server` / `core` / `project` / `database` and send them wherever you like, independent of Lark's dashboard:
 
 ```toml
 [transforms.to_metrics]
@@ -153,9 +136,7 @@ address = "0.0.0.0:9598"
 
 ## How stored values reduce (dashboard rollup)
 
-lark-edge's aggregator keys incoming samples per `(project, database)` and, every
-`METRICS_FLUSH_INTERVAL` (default `3m`, env-configurable on lark-edge), writes one `database_metrics`
-row per active database. The dashboard rolls these up to project level on read. Per flush window:
+lark-edge's aggregator keys incoming samples per `(project, database)` and, every `METRICS_FLUSH_INTERVAL` (default `3m`, env-configurable on lark-edge), writes one `database_metrics` row per active database. The dashboard rolls these up to project level on read. Per flush window:
 
 | Stored field | Reduction |
 |--------------|-----------|

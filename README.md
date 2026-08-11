@@ -12,26 +12,30 @@ In addition, [Lark Cloud](https://lark.sh) is available for those who want us to
 
 Full documentation for building on Lark (the client SDK, security rules, the REST API, and Firebase SDK compatibility) lives at [docs.larksh.com](https://docs.larksh.com). The [`docs/`](docs/) folder in this repo covers running Lark itself: deployment, backups, observability, and internals. For how Lark is tested, including running Firebase's own SDK test suite against it and crash-testing the durability contract, see [TESTING.md](TESTING.md).
 
+## Quick start
+
+If you're exploring Lark for the first time, you probably have two goals: firstly, get Lark running on your local machine so you can explore the platform; and secondly, see something neat running on top of it so you can get a feel for what's possible.
+
+To do so, all you need is `Docker`. Download the compose file, give it a secret, and start it:
+
+```bash
+mkdir lark && cd lark
+curl -fsSL https://raw.githubusercontent.com/lark-sh/lark/main/docker-compose.prod.yml -o docker-compose.yml
+echo "SERVER_SECRET=$(openssl rand -hex 32)" > .env
+docker compose up
+```
+
+That pulls the published `lark-server` and `lark-edge` images and brings up the stack, so there's no Rust or Go toolchain involved. The dashboard is at http://localhost:8080/admin/, and the admin email and one-time password are printed in the log on first start. A `lark-data` folder will be created in the directory which contains your data; backup this folder to backup your data, or delete it if you want to start over fresh.
+
+The images track `latest` by default. To pin a version, add it to the same file: `echo "LARK_VERSION=0.2.0" >> .env`.
+
+**Want it on the public internet instead?** `deploy/fly/quickstart.sh` stands up a real, TLS-terminated Lark deployment on [Fly.io](https://fly.io) in a few minutes (you'll need a domain). See [`deploy/fly/README.md`](deploy/fly/README.md).
+
 ## Project status
 
 Lark is a new open-source project backed by a production service: [Lark Cloud](https://lark.sh) runs this same codebase and hosts real customer data on it today. The engine is continuously tested against an explicit durability contract and verified against Firebase's own SDK test suite; [TESTING.md](TESTING.md) describes both and shows how to run everything yourself.
 
 The `0.x` version number reflects the project's age, not known instability. The on-disk format is already something we won't break without providing a migration path, and we don't expect churn in the configuration or wire surfaces beyond new features. We'd rather let Lark earn its 1.0 through public production mileage than declare it on our own confidence. Until then, breaking changes in `0.x` releases are rare, documented in the [CHANGELOG](CHANGELOG.md), and accompanied by a migration path whenever stored data is affected.
-
-## Quick start
-
-If you're exploring Lark for the first time, you probably have two goals: firstly, get Lark running on your local machine so you can explore the platform; and secondly, see something neat running on top of it so you can get a feel for what's possible.
-
-First, you'll need to have `Docker` as well as `make` installed. Then on your local machine:
-
-```bash
-make up
-```
-
-That brings up `lark-server` and `lark-edge`. The dashboard is at http://localhost:8080/admin/, and the admin email and one-time password are
-printed in the log on first start.
-
-**Want it on the public internet instead?** `deploy/fly/quickstart.sh` stands up a real, TLS-terminated Lark deployment on [Fly.io](https://fly.io) in a few minutes (you'll need a domain). See [`deploy/fly/README.md`](deploy/fly/README.md).
 
 ### Try an example app
 
