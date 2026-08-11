@@ -25,17 +25,9 @@ echo "SERVER_SECRET=$(openssl rand -hex 32)" > .env
 docker compose up
 ```
 
-That pulls the published `lark-server` and `lark-edge` images and brings up the stack, so there's no Rust or Go toolchain involved. The dashboard is at http://localhost:8080/admin/, and the admin email and one-time password are printed in the log on first start. A `lark-data` folder will be created in the directory which contains your data; backup this folder to backup your data, or delete it if you want to start over fresh.
-
-The images track `latest` by default. To pin a version, add it to the same file: `echo "LARK_VERSION=0.2.0" >> .env`.
+The dashboard is at http://localhost:8080/admin/, and the admin email and one-time password are printed in the log on first start. A `lark-data` folder will be created in the directory which contains your data; backup this folder to backup your data, or delete it if you want to start over fresh.
 
 **Want it on the public internet instead?** `deploy/fly/quickstart.sh` stands up a real, TLS-terminated Lark deployment on [Fly.io](https://fly.io) in a few minutes (you'll need a domain). See [`deploy/fly/README.md`](deploy/fly/README.md).
-
-## Project status
-
-Lark is a new open-source project backed by a production service: [Lark Cloud](https://lark.sh) runs this same codebase and hosts real customer data on it today. The engine is continuously tested against an explicit durability contract and verified against Firebase's own SDK test suite; [TESTING.md](TESTING.md) describes both and shows how to run everything yourself.
-
-The `0.x` version number reflects the project's age, not known instability. The on-disk format is already something we won't break without providing a migration path, and we don't expect churn in the configuration or wire surfaces beyond new features. We'd rather let Lark earn its 1.0 through public production mileage than declare it on our own confidence. Until then, breaking changes in `0.x` releases are rare, documented in the [CHANGELOG](CHANGELOG.md), and accompanied by a migration path whenever stored data is affected.
 
 ### Try an example app
 
@@ -43,6 +35,22 @@ If you'd like to see something running on top of Lark, check out the [`examples/
 
 - [Sticky notes](examples/sticky-notes/README.md) is a multiplayer whiteboard built directly on [`@lark-sh/client`](https://www.npmjs.com/package/@lark-sh/client). Live cursors, draggable notes, snapshot-interpolated motion, and volatile-path presence in ~300 lines of vanilla TypeScript. Start here if you're building a new app on Lark.
 - [Firebase quickstart](examples/firebase-quickstart/README.md) runs Firebase's own `quickstart-js/database` social-blogging app against Lark with a handful of lines changed. Start here if you'd like to see how easy it is to migrate an existing Firebase SDK-based app to Lark.
+
+### Clone and compile
+
+If you'd like to pull down the repo and compile Lark to run it on your local machine instead of relying on the Docker images (`make` and `Docker` required):
+
+```bash
+git clone git@github.com:lark-sh/lark.git
+cd lark
+make up
+```
+
+## Project status
+
+Lark is a new open-source project backed by a production service: [Lark Cloud](https://lark.sh) runs this same codebase and hosts real customer data on it today. The engine is continuously tested against an explicit durability contract and verified against Firebase's own SDK test suite; [TESTING.md](TESTING.md) describes both and shows how to run everything yourself.
+
+The `0.x` version number reflects the project's age, not known instability. The on-disk format is already something we won't break without providing a migration path, and we don't expect churn in the configuration or wire surfaces beyond new features. We'd rather let Lark earn its 1.0 through public production mileage than declare it on our own confidence. Until then, breaking changes in `0.x` releases are rare, documented in the [CHANGELOG](CHANGELOG.md), and accompanied by a migration path whenever stored data is affected.
 
 ## Development
 
@@ -52,3 +60,5 @@ running an app on top of it, check out [CONTRIBUTING](CONTRIBUTING.md) for an ov
 ## License
 
 AGPL v3. See [LICENSE](LICENSE).
+
+> Firebase and Firebase Realtime Database are trademarks of Google LLC. Lark is an independent project and is not affiliated with, endorsed by, or sponsored by Google.
