@@ -148,10 +148,7 @@ Note: OSON's approach uses "partial dictionary rebuilding by tracking dictionary
 
 ### Sidecar (free list + pending keys)
 
-Every blob has a small companion file (`sidecar.lark` on disk) that
-carries state the blob itself can't represent cheaply: the **free list**
-of reusable byte regions, and any **pending dictionary keys** written
-inline since the last root re-compaction.
+Every blob has a small companion file (`sidecar.lark` on disk) that carries state the blob itself can't represent cheaply: the **free list** of reusable byte regions, and any **pending dictionary keys** written inline since the last root re-compaction.
 
 **On-disk format (v7):**
 
@@ -174,72 +171,46 @@ inline since the last root re-compaction.
 +---------------------------------------------+
 ```
 
-Magic + version verify the file matches the format the running binary
-expects; old versions are rejected outright (v1–v6 → error).
+Magic + version verify the file matches the format the running binary expects; old versions are rejected outright (v1–v6 → error).
 
-**`pending_keys`** are structural field names that were referenced in an
-incremental write but aren't in the dictionary yet. Rather than rewriting
-the dictionary on every incremental update (which would touch a fixed
-region of the blob constantly and force a write-back), the writer stores
-those keys inline in the affected collection's key-string area, marks
-them in the sidecar, and the next `root_compact()` drains the pending set
-into the dictionary as part of the rewrite.
+**`pending_keys`** are structural field names that were referenced in an incremental write but aren't in the dictionary yet. Rather than rewriting the dictionary on every incremental update (which would touch a fixed region of the blob constantly and force a write-back), the writer stores those keys inline in the affected collection's key-string area, marks them in the sidecar, and the next `root_compact()` drains the pending set into the dictionary as part of the rewrite.
 
 ### Free list and space reuse
 
-The free list is the difference between "blob grows forever on every
-write" and "blob stays roughly the same size as long as the working set
-does." It's the reason `lark-server` can run for weeks without ever
-triggering a full root compaction.
+The free list is the difference between "blob grows forever on every write" and "blob stays roughly the same size as long as the working set does." It's the reason `lark-server` can run for weeks without ever triggering a full root compaction.
 
 #### What gets freed
 
-Any time incremental compaction makes a region of the blob unreachable,
-that region's `(offset, size)` is recorded in the free list:
+Any time incremental compaction makes a region of the blob unreachable, that region's `(offset, size)` is recorded in the free list:
 
 - **Updating a value larger than the old one.** The old bytes are freed; the new value goes wherever the free list has space (or at EOF).
 - **Forwarding a child to a new location.** The pre-forwarding bytes are freed.
 - **Re-serializing a collection when its reserved space is exhausted.** The old collection's bytes are freed.
 - **Removing a child from a collection.** The child's bytes are freed.
 
-Regions smaller than `MIN_FREE_REGION = 4096` bytes are not tracked,
-because the index bookkeeping overhead exceeds the space savings. Those
-bytes are charged to `bytes_wasted` and only recovered by a full
-re-compaction.
+Regions smaller than `MIN_FREE_REGION = 4096` bytes are not tracked, because the index bookkeeping overhead exceeds the space savings. Those bytes are charged to `bytes_wasted` and only recovered by a full re-compaction.
 
 #### Allocation policy: best-fit with splitting
 
-When the writer wants `N` bytes of space, the free list finds the
-smallest tracked region with size ≥ `N`:
+When the writer wants `N` bytes of space, the free list finds the smallest tracked region with size ≥ `N`:
 
-1. Best-fit lookup: smallest region ≥ N (O(log n) via `BTreeMap<size,
-   set<offset>>` indexed by size).
-2. If the matched region is bigger than N, the remainder (`size - N`) is
-   put back as its own region, *unless* the remainder is smaller than
-   `MIN_FREE_REGION`, in which case it gets charged to `bytes_wasted`.
+1. Best-fit lookup: smallest region ≥ N (O(log n) via `BTreeMap<size, set<offset>>` indexed by size).
+2. If the matched region is bigger than N, the remainder (`size - N`) is put back as its own region, *unless* the remainder is smaller than `MIN_FREE_REGION`, in which case it gets charged to `bytes_wasted`.
 3. If no region fits, the writer appends at EOF instead.
 
-Adjacent and overlapping regions are merged on insert via `insert_and_merge`,
-so the free list doesn't fragment indefinitely.
+Adjacent and overlapping regions are merged on insert via `insert_and_merge`, so the free list doesn't fragment indefinitely.
 
 #### Concurrent-reader safety: two-generation epoch
 
-The free list never reuses bytes a concurrent reader might still be
-mid-flight on. It does this with a two-generation epoch system:
+The free list never reuses bytes a concurrent reader might still be mid-flight on. It does this with a two-generation epoch system:
 
 - **`current`**: regions freed during *this* compaction cycle. **Not reusable yet.**
 - **`previous`**: regions freed during the *previous* cycle. **Not reusable yet.**
 - **`available`** (the indexed `by_size` / `by_offset` maps): regions freed ≥ 2 cycles ago. **Safe to reuse.**
 
-At the start of each `apply_updates` batch, `advance_epoch()` rotates:
-`previous → available`, `current → previous`. The newly-promoted regions
-are returned to the caller, which clears them from the CachedIO byte
-cache so the cache won't serve stale bytes after the regions are reused.
+At the start of each `apply_updates` batch, `advance_epoch()` rotates: `previous → available`, `current → previous`. The newly-promoted regions are returned to the caller, which clears them from the CachedIO byte cache so the cache won't serve stale bytes after the regions are reused.
 
-The two-cycle delay matches the worst case for an in-flight reader:
-they may have already started a read using the pre-write offset/size,
-and we need to wait for them to either finish or be told (via the parent
-index update) about the new location before reusing the old bytes.
+The two-cycle delay matches the worst case for an in-flight reader: they may have already started a read using the pre-write offset/size, and we need to wait for them to either finish or be told (via the parent index update) about the new location before reusing the old bytes.
 
 #### Accounting fields
 
@@ -249,21 +220,11 @@ index update) about the new location before reusing the old bytes.
 | `bytes_reused` | Total bytes ever allocated from the free list | Every successful `allocate()` | Full re-compaction |
 | `bytes_wasted` | Dead-space bytes not recoverable by the free list (too small to track, or interior to a parent's reserved area) | `free()` of < MIN_FREE_REGION, leftover splits, `waste()` calls | Full re-compaction |
 
-`bytes_wasted` is the trigger for full re-compaction. `lark-compact`
-runs root compaction when `bytes_wasted >= 500 MB AND bytes_wasted /
-blob_size >= 20%`. Until then, the free list keeps the blob from
-growing unboundedly even under sustained write load.
+`bytes_wasted` is the trigger for full re-compaction. `lark-compact` runs root compaction when `bytes_wasted >= 500 MB AND bytes_wasted / blob_size >= 20%`. Until then, the free list keeps the blob from growing unboundedly even under sustained write load.
 
 #### Crash safety
 
-The sidecar is rewritten as a single atomic file alongside each batch
-of blob writes (`apply_updates_with_sidecar`). If a crash happens
-between the blob write and the sidecar write, the worst case is that
-some freed regions look "live" until the next root re-compaction, i.e.
-the blob keeps a little extra dead space but is still correct. The
-blob never points at bytes the sidecar doesn't know about, because the
-blob's parent-index entries are the source of truth for what's live;
-the sidecar is just an accounting hint for "what's safe to overwrite."
+The sidecar is rewritten as a single atomic file alongside each batch of blob writes (`apply_updates_with_sidecar`). If a crash happens between the blob write and the sidecar write, the worst case is that some freed regions look "live" until the next root re-compaction, i.e. the blob keeps a little extra dead space but is still correct. The blob never points at bytes the sidecar doesn't know about, because the blob's parent-index entries are the source of truth for what's live; the sidecar is just an accounting hint for "what's safe to overwrite."
 
 ### Size Overhead
 
@@ -463,10 +424,7 @@ Tests are inline `#[cfg(test)]` modules within each source file rather than in a
 
 ### I/O Abstraction
 
-LarkBlob doesn't depend on Glommio or Tokio directly. It defines an
-async `BlobIO` trait so the same engine works behind both the io_uring
-runtime in `lark-server` and a plain `std::fs::File` for tests and the
-standalone `lark-compact` binary.
+LarkBlob doesn't depend on Glommio or Tokio directly. It defines an async `BlobIO` trait so the same engine works behind both the io_uring runtime in `lark-server` and a plain `std::fs::File` for tests and the standalone `lark-compact` binary.
 
 ```rust
 pub trait BlobIO {
@@ -490,9 +448,7 @@ Three concrete implementations are wired up:
 
 ### Public API
 
-The main entry point is `BlobSession`, which owns the blob's header,
-dictionary, and (optionally) sidecar across navigation + read + write
-calls so the per-operation cost is just I/O.
+The main entry point is `BlobSession`, which owns the blob's header, dictionary, and (optionally) sidecar across navigation + read + write calls so the per-operation cost is just I/O.
 
 ```rust
 // --- One-shot initial write ---
@@ -575,8 +531,7 @@ pub struct BlobLocation {
 
 ### Server-Compactor Safety
 
-Invariants the compactor maintains so concurrent reads from lark-server
-are always safe:
+Invariants the compactor maintains so concurrent reads from lark-server are always safe:
 
 1. **The old blob is never deleted** until the new one is fully written and synced (for full re-compaction, this means atomic rename).
 2. **Incremental compaction only appends and does pwrite.** It never removes data from the blob. Dead space accumulates until full re-compaction.
