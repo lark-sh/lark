@@ -46,10 +46,15 @@ make build         # both
 make build-spa     # dashboard SPA only
 
 make up            # whole stack via docker compose (dashboard at :8080/admin/)
+make up-release    # same stack from published GHCR images (no compile)
 make shell         # shell inside the Linux dev container
 # from inside the dev container, run the server directly in emulator mode:
 cargo run -p lark-server -- --id=local-1 --hostname=localhost --proxy-port=7779 --emulator
 ```
+
+`make up` keeps its state in `./lark-data-dev` (git-ignored) — `server/` for the WAL and blob files, `edge/` for the SQLite control plane. Because that's a real host directory, you can point `lark-compact` or a hex dump straight at a blob instead of reaching into a container, and `rm -rf lark-data-dev` gives you a clean slate. `make up-release` uses `./lark-data` instead, so a source build and a published image never open the same data directory.
+
+One caveat on macOS: a bind mount goes through the Docker VM's virtiofs layer, which measures roughly 35% slower on 4K random reads than a named volume on the same machine. Irrelevant for iterating, but don't read performance numbers off `make up` on a Mac — the storage path isn't representative. The chaos-monkey durability harness doesn't use compose at all, so it's unaffected.
 
 ### Testing
 

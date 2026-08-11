@@ -1,10 +1,17 @@
 # Single-host Lark stack.
 #
 # Brings up lark-edge (Go: admin dashboard + wire-protocol proxy) and
-# lark-server (Rust: DB engine). SQLite persists per-deployment state in
-# a named volume; lark-server's per-database WAL + blob files persist in
-# another. Plain HTTP throughout — browsers exempt *.localhost from
-# mixed-content rules, so this works for local dev without TLS gymnastics.
+# lark-server (Rust: DB engine), both COMPILED FROM THE WORKING TREE. Plain
+# HTTP throughout — browsers exempt *.localhost from mixed-content rules, so
+# this works for local dev without TLS gymnastics.
+#
+# State lands in `./lark-data-dev` (git-ignored): `server/` for the WAL + blob
+# files, `edge/` for the SQLite control plane. Being on the host filesystem
+# means host tooling — lark-compact, a hex dump, checking the WAL is valid
+# JSONL — can read it without reaching into a container. `rm -rf lark-data-dev`
+# resets the stack. The path deliberately differs from the `./lark-data` that
+# docker-compose.prod.yml uses, so a source build and a published release image
+# never share a data directory.
 #
 # Usage (from the repo root):
 #
@@ -46,7 +53,7 @@ services:
       # any non-throwaway deploy.
       SERVER_SECRET: "${SERVER_SECRET:-dev-secret-change-me}"
     volumes:
-      - lark-edge-data:/data
+      - ./lark-data-dev/edge:/data
     networks:
       - lark
 
@@ -75,17 +82,13 @@ services:
       # lark-edge's SERVER_SECRET — the server rejects gateways that can't prove it.
       SERVER_SECRET: "${SERVER_SECRET:-dev-secret-change-me}"
     volumes:
-      - lark-server-data:/data
+      - ./lark-data-dev/server:/data
     # Glommio's io_uring needs the seccomp profile relaxed; this also
     # lets the kernel set CPU affinity on the worker threads.
     security_opt:
       - seccomp:unconfined
     networks:
       - lark
-
-volumes:
-  lark-edge-data:
-  lark-server-data:
 
 networks:
   lark:

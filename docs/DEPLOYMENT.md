@@ -120,7 +120,7 @@ Wildcard issuance uses the **DNS-01** challenge, and this build wires **Cloudfla
 Start from the bundled [`docker-compose.prod.yml`](../docker-compose.prod.yml) — the same file the [README quick start](../README.md#quick-start) uses. It already runs published images and refuses to start without a real `SERVER_SECRET`, so what separates it from a production stack:
 
 1. **Real TLS and a real domain.** The quickstart sets `DISABLE_TLS: "true"` with `LARKDB_DOMAIN: "lark.localhost"`. For production, either let `lark-edge` obtain certificates automatically via CertMagic/Let's Encrypt (below), or terminate TLS at a reverse proxy / load balancer in front of it.
-2. **Durable volumes + backups.** The named `lark-server-data` / `lark-edge-data` volumes already survive restarts, but confirm they're backed by local NVMe on the host (see [Storage](#storage-local-disk-only)) and wire up backups per [BACKUP.md](BACKUP.md). You need both: the data dir *and* the metadata store.
+2. **Durable storage + backups.** State lands in `./lark-data` beside the compose file — `server/` for the databases, `edge/` for the control plane. Put that directory on local NVMe (see [Storage](#storage-local-disk-only)) and wire up backups per [BACKUP.md](BACKUP.md). Backing up `lark-data` as a whole covers both halves, which is what a restore needs. The containers run as root, so on a Linux host those files are root-owned and your backup job needs privileges to read them.
 3. **Raise `memlock` on a Linux host.** Glommio registers `io_uring` buffers against `RLIMIT_MEMLOCK`, and Linux hosts commonly default to around 8MB. Add to the `lark-server` service:
 
    ```yaml

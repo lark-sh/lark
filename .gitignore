@@ -28,6 +28,8 @@ edge/lark-edge
 # Local data directories used by docker-compose
 /data/
 /tmp-data/
+/lark-data-dev/
+/lark-data/
 
 # On-demand test fixtures (firebase-js-sdk clone, etc.)
 /.cache/
