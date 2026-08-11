@@ -4,23 +4,32 @@
 # pulls published `lark-server` / `lark-edge` images — so you get a running
 # stack in seconds without a Rust/Go toolchain. This is the fast "try it" path.
 #
-# Usage (from the repo root):
+# You do NOT need a clone of the Lark repo to use this file. Download it on its
+# own, give it a secret, and start:
 #
-#   make up-release          # generates .env with a strong secret, then pulls + runs
-#   # or, directly:
-#   docker compose -f docker-compose.prod.yml up
+#   mkdir lark && cd lark
+#   curl -fsSL https://raw.githubusercontent.com/lark-sh/lark/main/docker-compose.prod.yml -o docker-compose.yml
+#   echo "SERVER_SECRET=$(openssl rand -hex 32)" > .env
+#   docker compose up
 #
-# Pin a version with LARK_VERSION (defaults to `latest`):
+# Compose reads `.env` from the working directory, so that is the whole setup.
+# Saving the file as `docker-compose.yml` keeps every later command bare
+# (`docker compose down`, `docker compose pull`, and so on).
 #
-#   LARK_VERSION=0.2.0 docker compose -f docker-compose.prod.yml up
+# The images track `latest` by default; pin a version in the same .env:
 #
-# While the repo is private the GHCR packages are private too — run
-# `docker login ghcr.io` first. They become anonymously pullable once their
-# visibility is flipped to public at launch.
+#   echo "LARK_VERSION=0.2.0" >> .env
+#
+# From a repo clone, `make up-release` generates the .env for you and runs this
+# file directly.
 #
 # Note: this serves plain HTTP on localhost (browsers exempt *.localhost from
 # mixed-content rules), which is right for trying Lark on your machine. For a
 # real internet-facing deployment with TLS, see deploy/fly/.
+
+# Pinned so volume and container names stay stable wherever the file is saved;
+# without it Compose derives the project name from the parent directory.
+name: lark
 
 services:
   lark-edge:
@@ -35,7 +44,7 @@ services:
       LARKDB_DOMAIN: "lark.localhost"
       DATABASE_URL: "sqlite:///data/lark.db"
       ADMIN_API_ENABLED: "true"
-      SERVER_SECRET: "${SERVER_SECRET:?SERVER_SECRET is required — 'make up-release' generates one into .env automatically, or set it in .env yourself}"
+      SERVER_SECRET: "${SERVER_SECRET:?required — add SERVER_SECRET=<32+ byte random value> to a .env file beside this compose file; 'openssl rand -hex 32' generates one}"
     volumes:
       - lark-edge-data:/data
     networks:
@@ -57,7 +66,7 @@ services:
       # For strict per-write durability: "0" + "true".
       LARK_WAL_SYNC_INTERVAL_MS: "2000"
       LARK_FSYNC_ON_WAL_FLUSH: "false"
-      SERVER_SECRET: "${SERVER_SECRET:?SERVER_SECRET is required — 'make up-release' generates one into .env automatically, or set it in .env yourself}"
+      SERVER_SECRET: "${SERVER_SECRET:?required — add SERVER_SECRET=<32+ byte random value> to a .env file beside this compose file; 'openssl rand -hex 32' generates one}"
     volumes:
       - lark-server-data:/data
     # Glommio's io_uring needs the seccomp profile relaxed; this also

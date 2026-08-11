@@ -21,7 +21,7 @@ Notes persist (closing all tabs and reopening shows them again). Cursors don't; 
 From the root of the `lark` repo:
 
 ```sh
-make up
+make up-release
 ```
 
 Wait ~30 seconds, then open the admin UI:
@@ -30,7 +30,7 @@ Wait ~30 seconds, then open the admin UI:
 http://localhost:8080/admin/
 ```
 
-If this is your first time, the admin temporary password is printed in the `make up` output. Sign in with that.
+If this is your first time, the admin temporary password is printed in the `make up-release` output. Sign in with that.
 
 ## Step 2 — Create the project
 

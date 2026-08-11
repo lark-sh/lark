@@ -1,36 +1,18 @@
 # Production Deployment
 
-> **Public-facing quickstart:** if you just want a hosted basic deployment up quickly,
-> [`deploy/fly/`](../deploy/fly/README.md) does all of this on Fly.io with one
-> script.
+> **Public-facing quickstart:** if you just want a hosted basic deployment up quickly, [`deploy/fly/`](../deploy/fly/README.md) does all of this on Fly.io with one script.
 
-The [README quick start](../README.md#quick-start) (`make up`) is a good starting point for local
-development and testing. However, if you want to run Lark in a production environment, you'll
-need to do a little more work. There are three tiers of deployment, in increasing order of
-complexity:
+The [README quick start](../README.md#quick-start) is a good starting point for local development and testing. However, if you want to run Lark in a production environment, you'll need to do a little more work. There are three tiers of deployment, in increasing order of complexity:
 
-1. **[Tier 1 — Single host, hardened](#tier-1--single-host-hardened):** one machine,
-  one `lark-edge` + one `lark-server`, real TLS, secrets, persistent storage,
-  backups. Suitable for small-to-medium production loads.
-2. **[Tier 2 — Scale the gateway](#tier-2--scale-the-gateway):** *multiple
-  `lark-edge` gateways, a single `lark-server`*, with a shared Postgres control
-  plane. This scales client connections and gives you gateway-level redundancy
-  while keeping the data tier simple: **one data directory**. This is the "larger
-  deployment" most people actually need, and it's the ceiling this guide covers
-  concretely. In practice with a large enough bare metal server you can handle up to 
-  50k CCU with this tier.
-3. **[Tier 3 — Scale the data tier](#tier-3--scale-the-data-tier):** *multiple
-  `lark-server` nodes.* This is a step-change in operational complexity, because
-  each `lark-server` owns its **own local data directory** and there is no shared
-  storage. Covered conceptually only, beyond the scope of this document.
+1. **[Tier 1 — Single host, hardened](#tier-1--single-host-hardened):** one machine, one `lark-edge` + one `lark-server`, real TLS, secrets, persistent storage, backups. Suitable for small-to-medium production loads.
+2. **[Tier 2 — Scale the gateway](#tier-2--scale-the-gateway):** *multiple `lark-edge` gateways, a single `lark-server`*, with a shared Postgres control plane. This scales client connections and gives you gateway-level redundancy while keeping the data tier simple: **one data directory**. This is the "larger deployment" most people actually need, and it's the ceiling this guide covers concretely. In practice with a large enough bare metal server you can handle up to 50k CCU with this tier.
+3. **[Tier 3 — Scale the data tier](#tier-3--scale-the-data-tier):** *multiple `lark-server` nodes.* This is a step-change in operational complexity, because each `lark-server` owns its **own local data directory** and there is no shared storage. Covered conceptually only, beyond the scope of this document.
 
 ---
 
 ## Architecture
 
-Lark is two main pieces plus a control plane. The diagram below shows a **Tier 2**
-deployment (multiple `lark-edge` gateways in front of a single `lark-server`),
-which is the shape most production deployments take:
+Lark is two main pieces plus a control plane. The diagram below shows a **Tier 2** deployment (multiple `lark-edge` gateways in front of a single `lark-server`), which is the shape most production deployments take:
 
 ```
                        Clients (browsers, SDKs)
@@ -59,40 +41,27 @@ which is the shape most production deployments take:
      (Postgres once >1 gateway)            [ NVMe ]
 ```
 
-Every `lark-edge` talks to both the shared control-plane store (for routing and
-project config) and, over the private network, to the `lark-server` that owns each
-database.
+Every `lark-edge` talks to both the shared control-plane store (for routing and project config) and, over the private network, to the `lark-server` that owns each database.
 
-**`lark-edge` (the gateway / coordinator)** terminates TLS, upgrades client
-connections (WebSocket / WebTransport), validates auth tokens, and routes each
-database to the `lark-server` that owns it via consistent hashing. It also serves
-the admin dashboard (`/admin/`) and holds all control-plane state (projects,
-admin users, server routing, per-project settings) in its metadata store.
+**`lark-edge` (the gateway / coordinator)** terminates TLS, upgrades client connections (WebSocket / WebTransport), validates auth tokens, and routes each database to the `lark-server` that owns it via consistent hashing. It also serves the admin dashboard (`/admin/`) and holds all control-plane state (projects, admin users, server routing, per-project settings) in its metadata store.
 
-**`lark-server` (the engine)** holds the actual database contents (in-memory tree
-+ WAL + blob on disk) and speaks Lark's wire protocol over TCP on its
-`--proxy-port` (default 2727). On startup it **registers** itself with the
-coordinator's internal endpoint; the coordinator then routes databases to it via
-consistent hashing. Booting another `lark-server` does get it into the hash ring
-automatically, but the *data does not move with it*, which is why care is needed
-when moving to a Tier 3 setup.
+**`lark-server` (the engine)** holds the actual database contents (in-memory tree + WAL + blob on disk) and speaks Lark's wire protocol over TCP on its `--proxy-port` (default 2727). On startup it **registers** itself with the coordinator's internal endpoint; the coordinator then routes databases to it via consistent hashing. Booting another `lark-server` does get it into the hash ring automatically, but the *data does not move with it*, which is why care is needed when moving to a Tier 3 setup.
 
 ### Storage: local disk only
 
 This is the important operational fact about `lark-server`:
 
-**Each `lark-server` reads and writes its `LARK_DATA_DIR` as exclusively-owned,
-local storage, ideally local NVMe.** The blob format does many small random
-reads and the engine assumes low-latency, exclusively-owned files.
+**Each `lark-server` reads and writes its `LARK_DATA_DIR` as exclusively-owned, local storage, ideally local NVMe.** The blob format does many small random reads and the engine assumes low-latency, exclusively-owned files.
 
 - **Use local NVMe (or equivalent low-latency local block storage).**
-- **Do _not_ put `LARK_DATA_DIR` on a shared/network filesystem** (CephFS, NFS,
-  EBS multi-attach, GlusterFS). You will have a bad time: the small-random-read
-  access pattern is pathological over network storage, and Lark assumes a single
-  process exclusively owns each data directory.
-- A consequence: a database's data lives on exactly one node's local disk. There
-  is no shared pool that any `lark-server` can serve any database from. That's
-  why adding or removing servers requires data migration.
+- **Do _not_ put `LARK_DATA_DIR` on a shared/network filesystem** (CephFS, NFS, EBS multi-attach, GlusterFS). You will have a bad time: the small-random-read access pattern is pathological over network storage, and Lark assumes a single process exclusively owns each data directory.
+- A consequence: a database's data lives on exactly one node's local disk. There is no shared pool that any `lark-server` can serve any database from. That's why adding or removing servers requires data migration.
+
+### Containers vs. native binaries
+
+Lark ships both major components as container images which you can run without compiling manually yourself. This is the recommended approach when you are just getting started with Lark and testing locally or for small-to-medium production loads.
+
+However, if you are running Lark under heavy load, we recommend compiling native binaries on your target server and running directly without the overhead of containerization. See the Makefile and the `make build` command for more information on building `lark-server` and `lark-edge` binaries for your deployment.
 
 ### Components and ports
 
@@ -104,115 +73,64 @@ reads and the engine assumes low-latency, exclusively-owned files.
 | `lark-edge` admin dashboard | path `/admin/` on the client listener | — | TCP | protected by admin auth; restrict at network layer too |
 | `lark-server` wire protocol | `--proxy-port` / `LARK_PROXY_PORT` | `2727` | TCP | **Private**: only `lark-edge` should reach it |
 
-The two **private** rows are the critical firewall boundary: `lark-server`'s
-`2727` and `lark-edge`'s internal listener must be reachable only from within your
-trusted network, never from the internet. Clients only ever talk to the public
-`lark-edge` listeners.
+The two **private** rows are the critical firewall boundary: `lark-server`'s `2727` and `lark-edge`'s internal listener must be reachable only from within your trusted network, never from the internet. Clients only ever talk to the public `lark-edge` listeners.
 
-Both server-to-server channels are also **authenticated** with the shared
-`SERVER_SECRET`, so network isolation isn't the only line of defense:
+Both server-to-server channels are also **authenticated** with the shared `SERVER_SECRET`, so network isolation isn't the only line of defense:
 
-- The `lark-server` proxy port (`2727`) requires a gateway to prove knowledge of
-  the secret via an HMAC over a per-connection nonce during the HELLO handshake;
-  a stray connection is rejected rather than trusted.
-- `lark-edge`'s internal HTTP endpoints (`/internal/register`, `/internal/metrics`)
-  require an `Authorization: Bearer <SERVER_SECRET>` header; without it they return
-  `401`, so a caller that reaches the internal port still can't register a rogue
-  backend or poison metrics.
+- The `lark-server` proxy port (`2727`) requires a gateway to prove knowledge of the secret via an HMAC over a per-connection nonce during the HELLO handshake; a stray connection is rejected rather than trusted.
+- `lark-edge`'s internal HTTP endpoints (`/internal/register`, `/internal/metrics`) require an `Authorization: Bearer <SERVER_SECRET>` header; without it they return `401`, so a caller that reaches the internal port still can't register a rogue backend or poison metrics.
 
 ### DNS: clients connect to a per-database hostname
 
-Lark clients connect **directly to a per-database hostname**, not to a single shared 
-API endpoint. `lark-edge` figures out which project/database a connection is for by parsing the `Host` header
-against `LARKDB_DOMAIN`:
+Lark clients connect **directly to a per-database hostname**, not to a single shared API endpoint. `lark-edge` figures out which project/database a connection is for by parsing the `Host` header against `LARKDB_DOMAIN`:
 
 - `<project>.<LARKDB_DOMAIN>` → that project's default database.
-- `<database>--<project>.<LARKDB_DOMAIN>` → a specific database within a project
-  (note the **double-hyphen** separator).
+- `<database>--<project>.<LARKDB_DOMAIN>` → a specific database within a project (note the **double-hyphen** separator).
 
-So with `LARKDB_DOMAIN=db.example.com`, a client that opens
-`my-app.db.example.com` reaches project `my-app`. The consequence is a hard
-requirement, from Tier 1 onward:
+So with `LARKDB_DOMAIN=db.example.com`, a client that opens `my-app.db.example.com` reaches project `my-app`. The consequence is a hard requirement, from Tier 1 onward:
 
-**Point a wildcard DNS record `*.<LARKDB_DOMAIN>` at your `lark-edge` gateway(s).**
-The client resolves `<project>.<domain>` on its own and connects there, so that
-name *must* land on a gateway. With a single gateway (Tier 1) that's one wildcard
-A/AAAA record. With multiple gateways (Tier 2), use **round-robin DNS**: one
-A/AAAA record per gateway public IP on the same `*.<LARKDB_DOMAIN>` name.
+**Point a wildcard DNS record `*.<LARKDB_DOMAIN>` at your `lark-edge` gateway(s).** The client resolves `<project>.<domain>` on its own and connects there, so that name *must* land on a gateway. With a single gateway (Tier 1) that's one wildcard A/AAAA record. With multiple gateways (Tier 2), use **round-robin DNS**: one A/AAAA record per gateway public IP on the same `*.<LARKDB_DOMAIN>` name.
 
-Your TLS certificate has to cover that wildcard too, but you normally don't
-configure that separately. When CertMagic is enabled and you leave
-`CERTMAGIC_DOMAINS` **unset**, it automatically manages certs for both
-`*.<LARKDB_DOMAIN>` (the per-database client hostnames) **and** the apex
-`<LARKDB_DOMAIN>` (where the admin dashboard is served, `<LARKDB_DOMAIN>/admin/`).
-So in the common case you only set `LARKDB_DOMAIN`.
+Your TLS certificate has to cover that wildcard too, but you normally don't configure that separately. When CertMagic is enabled and you leave `CERTMAGIC_DOMAINS` **unset**, it automatically manages certs for both `*.<LARKDB_DOMAIN>` (the per-database client hostnames) **and** the apex `<LARKDB_DOMAIN>` (where the admin dashboard is served, `<LARKDB_DOMAIN>/admin/`). So in the common case you only set `LARKDB_DOMAIN`.
 
-Set `CERTMAGIC_DOMAINS` explicitly only to manage *additional* names, such as a
-separate API hostname. Note that doing so **replaces** the auto-derived list
-rather than adding to it, so you must include `*.<LARKDB_DOMAIN>` and the apex
-yourself. (Lark's own cloud does this: `LARKDB_DOMAIN=larkdb.net` with
-`CERTMAGIC_DOMAINS="db.lark.sh,*.larkdb.net"` to add the `db.lark.sh` API host.)
+Set `CERTMAGIC_DOMAINS` explicitly only to manage *additional* names, such as a separate API hostname. Note that doing so **replaces** the auto-derived list rather than adding to it, so you must include `*.<LARKDB_DOMAIN>` and the apex yourself. (Lark's own cloud does this: `LARKDB_DOMAIN=larkdb.net` with `CERTMAGIC_DOMAINS="db.lark.sh,*.larkdb.net"` to add the `db.lark.sh` API host.)
 
-Wildcard issuance uses the **DNS-01** challenge, and this build wires
-**Cloudflare** specifically: `CLOUDFLARE_API_TOKEN` is **required** whenever
-CertMagic is enabled. If your DNS isn't on Cloudflare, supply a wildcard cert via
-`TLS_CERT_FILE` / `TLS_KEY_FILE` or terminate TLS at a load balancer instead.
+Wildcard issuance uses the **DNS-01** challenge, and this build wires **Cloudflare** specifically: `CLOUDFLARE_API_TOKEN` is **required** whenever CertMagic is enabled. If your DNS isn't on Cloudflare, supply a wildcard cert via `TLS_CERT_FILE` / `TLS_KEY_FILE` or terminate TLS at a load balancer instead.
 
 ### The admin dashboard
 
-`lark-edge` serves an admin dashboard and API under `/admin/`, gated by
-`ADMIN_API_ENABLED` (when off, the routes and SPA aren't mounted at all). Two
-operational points:
+`lark-edge` serves an admin dashboard and API under `/admin/`, gated by `ADMIN_API_ENABLED` (when off, the routes and SPA aren't mounted at all). Two operational points:
 
-- Treat it as internal tooling. The OSS admin panel is meant for operators, not
-  as a self-service end-user control surface. Even though it has its own
-  authentication, it's best to keep it off the public internet: put it behind
-  your VPN, management network, or an IP allowlist.
-- With multiple gateways, enable it on exactly one. Run `ADMIN_API_ENABLED=true`
-  on a single designated gateway (ideally one kept out of the public
-  client-traffic rotation) and `false` on the rest. You don't lose anything by
-  doing so: admin writes land in the shared metadata store and propagate to every
-  gateway via Postgres `NOTIFY` (`project_config_changed` / `database_evicted`),
-  so the other gateways pick up config and routing changes automatically.
+- Treat it as internal tooling. The OSS admin panel is meant for operators, not as a self-service end-user control surface. Even though it has its own authentication, it's best to keep it off the public internet: put it behind your VPN, management network, or an IP allowlist.
+- With multiple gateways, enable it on exactly one. Run `ADMIN_API_ENABLED=true` on a single designated gateway (ideally one kept out of the public client-traffic rotation) and `false` on the rest. You don't lose anything by doing so: admin writes land in the shared metadata store and propagate to every gateway via Postgres `NOTIFY` (`project_config_changed` / `database_evicted`), so the other gateways pick up config and routing changes automatically.
 
 ### The metadata store: SQLite vs. Postgres
 
 `lark-edge`'s control-plane state lives in `DATABASE_URL`:
 
-- **SQLite** (`sqlite:///data/lark.db`): the default. Fine for **a single
-  `lark-edge` instance**. Simplest to operate; state is one file.
-- **Postgres** (`postgres://…`): **required once you run more than one
-  `lark-edge`**, because the coordinators share project/routing/user state. The
-  moment you want a second gateway (for HA or to spread client load), switch to
-  Postgres. This is the config change that matters most when moving from Tier 1
-  to Tier 2.
+- **SQLite** (`sqlite:///data/lark.db`): the default. Fine for **a single `lark-edge` instance**. Simplest to operate; state is one file.
+- **Postgres** (`postgres://…`): **required once you run more than one `lark-edge`**, because the coordinators share project/routing/user state. The moment you want a second gateway (for HA or to spread client load), switch to Postgres. This is the config change that matters most when moving from Tier 1 to Tier 2.
 
 ---
 
 ## Tier 1 — Single host, hardened
 
-> **Fastest path:** if you just want a hosted Tier 1 deployment up quickly,
-> [`deploy/fly/`](../deploy/fly/README.md) does all of this on Fly.io with one
-> script. The rest of this section is the general single-host recipe for any host.
+> **Fastest path:** if you just want a hosted Tier 1 deployment up quickly, [`deploy/fly/`](../deploy/fly/README.md) does all of this on Fly.io with one script. The rest of this section is the general single-host recipe for any host.
 
-Start from the bundled `docker-compose.yml`, but change the three things that make
-it a dev stack:
+Start from the bundled [`docker-compose.prod.yml`](../docker-compose.prod.yml) — the same file the [README quick start](../README.md#quick-start) uses. It already runs published images and refuses to start without a real `SERVER_SECRET`, so what separates it from a production stack:
 
-1. **Real `SERVER_SECRET`.** The shared secret authenticating `lark-edge` ↔
-   `lark-server`. The default is `dev-secret-change-me`. Generate one
-   (`openssl rand -hex 32`) and set it on **both** services.
-2. **Real TLS.** The dev compose runs `DISABLE_TLS: "true"` (HTTP only). For
-   production, either let `lark-edge` obtain certificates automatically via
-   CertMagic/Let's Encrypt, or terminate TLS at a reverse proxy / load balancer in
-   front of it.
-3. **Durable volumes + backups.** Make sure both the `lark-server` data dir and
-   the `lark-edge` metadata store are on persistent volumes, and wire up backups
-   per [BACKUP.md](BACKUP.md).
+1. **Real TLS and a real domain.** The quickstart sets `DISABLE_TLS: "true"` with `LARKDB_DOMAIN: "lark.localhost"`. For production, either let `lark-edge` obtain certificates automatically via CertMagic/Let's Encrypt (below), or terminate TLS at a reverse proxy / load balancer in front of it.
+2. **Durable volumes + backups.** The named `lark-server-data` / `lark-edge-data` volumes already survive restarts, but confirm they're backed by local NVMe on the host (see [Storage](#storage-local-disk-only)) and wire up backups per [BACKUP.md](BACKUP.md). You need both: the data dir *and* the metadata store.
+3. **Raise `memlock` on a Linux host.** Glommio registers `io_uring` buffers against `RLIMIT_MEMLOCK`, and Linux hosts commonly default to around 8MB. Add to the `lark-server` service:
+
+   ```yaml
+   ulimits:
+     memlock: -1
+   ```
 
 ### TLS via CertMagic (automatic Let's Encrypt)
 
-This is the example setup for running a single host in production. Note that it assumes
-you will run your DNS via Cloudflare, and provides a subdomain-wildcard via CertMagic.
+This is the example setup for running a single host in production. Note that it assumes you will run your DNS via Cloudflare, and provides a subdomain-wildcard via CertMagic.
 
 Set on the `lark-edge` service instead of `DISABLE_TLS`:
 
@@ -229,66 +147,59 @@ environment:
   DATABASE_URL: "sqlite:///data/lark.db"
 ```
 
-CertMagic stores certificates under `CERTMAGIC_STORAGE` (default `./certs`). Put
-that on a persistent volume so you don't re-issue on every restart. (Use
-`CERTMAGIC_STAGING: "true"` while testing to avoid Let's Encrypt rate limits.) The
-wildcard cert is obtained via the DNS-01 challenge, which is why
-`CLOUDFLARE_API_TOKEN` is required; if your DNS isn't on Cloudflare, use
-`TLS_CERT_FILE` / `TLS_KEY_FILE` with a wildcard cert instead. And remember the
-matching DNS: a wildcard `*.db.example.com` record pointing at this host.
+CertMagic stores certificates under `CERTMAGIC_STORAGE` (default `./certs`). Put that on a persistent volume so you don't re-issue on every restart. (Use `CERTMAGIC_STAGING: "true"` while testing to avoid Let's Encrypt rate limits.) The wildcard cert is obtained via the DNS-01 challenge, which is why `CLOUDFLARE_API_TOKEN` is required; if your DNS isn't on Cloudflare, use `TLS_CERT_FILE` / `TLS_KEY_FILE` with a wildcard cert instead. And remember the matching DNS: a wildcard `*.db.example.com` record pointing at this host.
 
 ---
 
 ## Tier 2 — Scale the gateway
 
-Tier 2 keeps **one `lark-server`** and scales out the **`lark-edge` gateway tier** for connection
-capacity and redundancy. The shape:
+Tier 2 keeps **one `lark-server`** and scales out the **`lark-edge` gateway tier** for connection capacity and redundancy. The shape:
 
-- **Multiple `lark-edge` gateways**, all backed by the **same Postgres**, all
-  sharing the **same `SERVER_SECRET`**, fronted by DNS round-robin.
+- **Multiple `lark-edge` gateways**, all backed by the **same Postgres**, all sharing the **same `SERVER_SECRET`**, fronted by DNS round-robin.
 - **One `lark-server`** on a **private network**, registering with the coordinator.
 - A firewall that exposes only the public `lark-edge` listeners.
 
-At this tier, `lark-server` and `lark-edge` are best run **directly on the host via systemd, not in
-a container**. `lark-server` uses Linux `io_uring` (Glommio thread-per-core) and benefits
-from raw `memlock` limits and CPU affinity that are awkward to grant inside a
-container.
+At this tier, `lark-server` and `lark-edge` are best run **directly on the host via systemd, not in a container**. `lark-server` uses Linux `io_uring` (Glommio thread-per-core) and benefits from raw `memlock` limits and CPU affinity that are awkward to grant inside a container.
 
 ### Host requirements (`lark-server`)
 
-- **Linux kernel ≥ 5.8**: `io_uring` support is mandatory; the process will not
-  run otherwise.
-- **`memlock` unlimited**: `io_uring` registers locked memory. The systemd unit
-  below sets `LimitMEMLOCK=infinity`.
+- **Linux kernel ≥ 5.8**: `io_uring` support is mandatory; the process will not run otherwise.
+- **`memlock` unlimited**: `io_uring` registers locked memory. The systemd unit below sets `LimitMEMLOCK=infinity`.
 - **High file-descriptor limits**: many concurrent connections (`LimitNOFILE`).
-- Persistent, fast storage for `LARK_DATA_DIR` (local NVMe is ideal; the blob
-  format does small random reads).
+- Persistent, fast storage for `LARK_DATA_DIR` (local NVMe is ideal; the blob format does small random reads).
 
 ### Networking and discovery
 
-1. Put all nodes on a private network: VLAN, VPC, WireGuard, Tailscale, whatever
-   you already run.
-2. Give the `lark-server` a `--private-ip` on that network. It registers with the
-   coordinator as `private_ip:proxy_port`, so the coordinator (and only the
-   coordinator) can reach it on `2727`.
-3. Point the `lark-server` at a coordinator's **internal** endpoint via
-   `--coordinator` / `LARK_COORDINATOR_URL` (e.g. `http://10.0.0.20:8080`).
-   Registration and heartbeats are persisted to the shared Postgres, so **every**
-   `lark-edge` learns about the server from the database. You only need to point
-   it at one gateway's internal endpoint (or an internal load balancer across
-   them).
+1. Put all nodes on a private network: VLAN, VPC, WireGuard, Tailscale, whatever you already run.
+2. Give the `lark-server` a `--private-ip` on that network. It registers with the coordinator as `private_ip:proxy_port`, so the coordinator (and only the coordinator) can reach it on `2727`.
+3. Point the `lark-server` at a coordinator's **internal** endpoint via `--coordinator` / `LARK_COORDINATOR_URL` (e.g. `http://10.0.0.20:8080`). Registration and heartbeats are persisted to the shared Postgres, so **every** `lark-edge` learns about the server from the database. You only need to point it at one gateway's internal endpoint (or an internal load balancer across them).
 4. Firewall rules:
-   - **Public, on `lark-edge` only:** `HTTPS_LISTEN_ADDR` (TCP) and
-     `WT_LISTEN_ADDR` (+ `WT_PORTS`, UDP).
-   - **Private only:** `lark-server` `2727`, and every `lark-edge`'s
-     `INTERNAL_LISTEN_ADDR`.
-   - Consider restricting `/admin/` to your VPN/management network even though it
-     has its own authentication.
+   - **Public, on `lark-edge` only:** `HTTPS_LISTEN_ADDR` (TCP) and `WT_LISTEN_ADDR` (+ `WT_PORTS`, UDP).
+   - **Private only:** `lark-server` `2727`, and every `lark-edge`'s `INTERNAL_LISTEN_ADDR`.
+   - Consider restricting `/admin/` to your VPN/management network even though it has its own authentication.
+
+### Installing the binaries
+
+The configurations below run `/usr/local/bin/lark-server` and `/usr/local/bin/lark-edge` as a dedicated `lark` user against `/var/lib/lark/data`. None of those four exist on a fresh host, so create them first.
+
+Build the binaries per `make build`, copy them over, then:
+
+```bash
+# One-time host setup
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin lark
+sudo mkdir -p /var/lib/lark/data
+sudo chown -R lark:lark /var/lib/lark
+
+# Install (or upgrade) the binaries
+sudo install -o root -g root -m 0755 lark-server /usr/local/bin/lark-server
+sudo install -o root -g root -m 0755 lark-edge /usr/local/bin/lark-edge
+/usr/local/bin/lark-server --version    # confirm what you just installed
+/usr/local/bin/lark-edge --version
+```
 
 ### Reference systemd unit — `lark-server`
 
-`/etc/systemd/system/lark-server.service` (genericized; fill in the `Environment`
-values for your host):
+`/etc/systemd/system/lark-server.service` (genericized; fill in the `Environment` values for your host):
 
 ```ini
 [Unit]
@@ -364,102 +275,128 @@ sudo journalctl -u lark-server -f
 
 ### Reference deployment — `lark-edge` (with Postgres)
 
-Run `lark-edge` as a container or binary. The essential environment for a
-production coordinator:
+`lark-edge`'s configuration goes in an environment file rather than inline in the unit. Unit files under `/etc/systemd/system` are world-readable, and the gateway's environment holds the Postgres URL, the shared secret, and a Cloudflare token.
+
+`/etc/lark/lark-edge.env`, root-owned and mode `0600`:
 
 ```bash
 HTTPS_LISTEN_ADDR=":443"
 WT_LISTEN_ADDR=":8444"
-INTERNAL_LISTEN_ADDR=":8080"        # private; lark-server registers here
+INTERNAL_LISTEN_ADDR="10.0.0.20:8080"     # bind the private IP, not 0.0.0.0
 DATABASE_URL="postgres://lark:…@db.internal:5432/lark"
 SERVER_SECRET="<shared secret, identical on every node>"
 ADMIN_API_ENABLED="true"            # ONE designated gateway only; "false" on the rest
 LARKDB_DOMAIN="db.example.com"      # CertMagic auto-manages *.db.example.com + the apex
 CERTMAGIC_ENABLED="true"
 CERTMAGIC_EMAIL="you@example.com"
+CERTMAGIC_STORAGE="/var/lib/lark/certs"   # persist certs; re-issuing on every restart hits LE rate limits
 CLOUDFLARE_API_TOKEN="<token>"      # required when CERTMAGIC_ENABLED (DNS-01)
 ```
 
-Every `lark-edge` and `lark-server` in the deployment must share the **same**
-`SERVER_SECRET`. Running a second `lark-edge` is just another instance with the
-same env pointed at the same Postgres; they coordinate through it. The one
-exception is **`ADMIN_API_ENABLED`, which should be `true` on only one gateway** (see
-[The admin dashboard](#the-admin-dashboard)). Front the gateways with round-robin
-DNS or a load balancer on the wildcard hostname (see
-[DNS](#dns-clients-connect-to-a-per-database-hostname)).
+```bash
+sudo install -d -m 0755 /etc/lark
+sudo install -o root -g root -m 0600 lark-edge.env /etc/lark/lark-edge.env
+sudo install -d -o lark -g lark -m 0700 /var/lib/lark/certs
+```
 
-> **Postgres schema:** `lark-edge` manages its own schema (see
-> `edge/db/postgres_schema.sql`). Point `DATABASE_URL` at an empty database and it
-> initializes on first boot.
+### Reference systemd unit — `lark-edge`
+
+`/etc/systemd/system/lark-edge.service`:
+
+```ini
+[Unit]
+Description=Lark Edge Gateway (TLS termination, routing, coordinator)
+Documentation=https://github.com/lark-sh/lark
+After=network-online.target
+Wants=network-online.target
+# Back off rather than hammering a crash loop
+StartLimitIntervalSec=30
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=lark
+Group=lark
+
+# Config and secrets (root-owned, 0600 — see above)
+EnvironmentFile=/etc/lark/lark-edge.env
+
+# Go runtime. Size GOMEMLIMIT to roughly 75% of the host's RAM so the collector
+# works harder before the kernel OOM-killer gets involved.
+Environment="GOGC=200"
+Environment="GOMEMLIMIT=6GiB"
+
+ExecStart=/usr/local/bin/lark-edge
+
+Restart=always
+RestartSec=5
+
+# Bind :443 and :8444 without running as root
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# The gateway holds the client connections, so this is the fd ceiling that matters
+LimitNOFILE=1000000
+LimitNPROC=65535
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+# CertMagic's cert cache; ProtectSystem=strict makes everything else read-only
+ReadWritePaths=/var/lib/lark/certs
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lark-edge
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now lark-edge
+sudo journalctl -u lark-edge -f
+```
+
+Every `lark-edge` and `lark-server` in the deployment must share the **same** `SERVER_SECRET`. Running a second `lark-edge` is just another instance with the same env pointed at the same Postgres; they coordinate through it. The one exception is **`ADMIN_API_ENABLED`, which should be `true` on only one gateway** (see [The admin dashboard](#the-admin-dashboard)). Front the gateways with round-robin DNS or a load balancer on the wildcard hostname (see [DNS](#dns-clients-connect-to-a-per-database-hostname)).
+
+> **Postgres schema:** `lark-edge` manages its own schema (see `edge/db/postgres_schema.sql`). Point `DATABASE_URL` at an empty database and it initializes on first boot.
 
 ---
 
 ## Tier 3 — Scale the data tier
 
-> **Covered conceptually.** This section explains the model and the problems you
-> must solve, not a turnkey recipe; the right answer is deployment-specific.
-> Exhaust vertical scaling (a bigger `lark-server` box: more cores, more RAM, more
-> NVMe) before going here.
+> **Covered conceptually.** This section explains the model and the problems you must solve, not a turnkey recipe; the right answer is deployment-specific. Exhaust vertical scaling (a bigger `lark-server` box: more cores, more RAM, more NVMe) before going here.
 
-Tier 3 is running **more than one `lark-server`**. The coordinator consistent-hashes
-each `(project, database)` to one server, so adding nodes spreads databases across
-them, giving you in principle linear scale-out of total data size and write
-throughput.
+Tier 3 is running **more than one `lark-server`**. The coordinator consistent-hashes each `(project, database)` to one server, so adding nodes spreads databases across them, giving you in principle linear scale-out of total data size and write throughput.
 
-What makes this a different class of problem from Tier 2 is the
-[local-disk-only](#storage-local-disk-only) reality:
+What makes this a different class of problem from Tier 2 is the [local-disk-only](#storage-local-disk-only) reality:
 
-- Each database lives on exactly one node's local disk. There is no shared pool.
-  A server can only serve databases whose data directory is physically present
-  on its own NVMe.
-- Changing the node count reshuffles the hash ring. Consistent hashing minimizes
-  how many databases move when you add or remove a node, but the ones that move
-  get *reassigned to a node that doesn't have their files*. Until you migrate
-  those data directories, the new owner has no data for them.
-- Scaling the server count is therefore a data-migration operation, not just a
-  config change. Roughly: identify which `{project}/{database}` directories are
-  reassigned by the new topology, back them up or quiesce them, copy them to the
-  newly-assigned node, then bring that node into the ring. Done wrong, a
-  reassigned database appears empty on its new owner while its data sits
-  stranded on the old one.
-- Backups now span N hosts. The [BACKUP.md](BACKUP.md) procedure is per-data-
-  directory; at Tier 3 you run it across every node and need a strategy that
-  captures all of them (and ideally tracks which databases live where).
+- Each database lives on exactly one node's local disk. There is no shared pool. A server can only serve databases whose data directory is physically present on its own NVMe.
+- Changing the node count reshuffles the hash ring. Consistent hashing minimizes how many databases move when you add or remove a node, but the ones that move get *reassigned to a node that doesn't have their files*. Until you migrate those data directories, the new owner has no data for them.
+- Scaling the server count is therefore a data-migration operation, not just a config change. Roughly: identify which `{project}/{database}` directories are reassigned by the new topology, back them up or quiesce them, copy them to the newly-assigned node, then bring that node into the ring. Done wrong, a reassigned database appears empty on its new owner while its data sits stranded on the old one.
+- Backups now span N hosts. The [BACKUP.md](BACKUP.md) procedure is per-data- directory; at Tier 3 you run it across every node and need a strategy that captures all of them (and ideally tracks which databases live where).
 
 ---
 
 ## Operational concerns
 
-- **Backups**: see [BACKUP.md](BACKUP.md). You need both the `lark-server`
-  `LARK_DATA_DIR` (database contents) and the `lark-edge` metadata store
-  (projects, routing, users). Backing up only one leaves an incomplete restore.
-- **Compaction**: `lark-server`'s in-process storage worker keeps the blob
-  reasonably current automatically. Full re-compaction (space reclamation) is the
-  separate `lark-compact` tool, run when a blob has accumulated significant wasted
-  space; it coordinates with the server via the `.compacting` marker (see
-  [BACKUP.md](BACKUP.md) and CONTRIBUTING's [Storage section](../CONTRIBUTING.md#storage)).
-- **Observability**: with `LARK_METRICS_PUSH=true`, `lark-server` pushes
-  per-database metrics straight to `lark-edge`'s internal endpoint and the admin
-  dashboard's Monitoring tab works with no extra setup (this is set in the bundled
-  compose + Fly configs). Leave it off to rely on an external log shipper scraping
-  stdout instead. Either way, enable `--debug-timing` / `LARK_DEBUG_TIMING` for
-  latency breakdowns when diagnosing. Full details, including the Vector path for
-  bare-metal and off-site metrics, are in [OBSERVABILITY.md](OBSERVABILITY.md).
-- **Upgrades**: deploy node-by-node. The on-disk blob carries a
-  `blob.generation`; a server restart re-opens its data and replays WAL forward
-  (same path as restore). Roll `lark-server` nodes one at a time so the coordinator
-  reroutes around each during its brief restart. Both binaries report their
-  version via `--version` and in their first startup log line, so you can
-  confirm what each node is actually running mid-rollout.
+- **Backups**: see [BACKUP.md](BACKUP.md). You need both the `lark-server` `LARK_DATA_DIR` (database contents) and the `lark-edge` metadata store (projects, routing, users). Backing up only one leaves an incomplete restore.
+- **Compaction**: `lark-server`'s in-process storage worker keeps the blob reasonably current automatically. Full re-compaction (space reclamation) is the separate `lark-compact` tool, run when a blob has accumulated significant wasted space; it coordinates with the server via the `.compacting` marker (see [BACKUP.md](BACKUP.md) and CONTRIBUTING's [Storage section](../CONTRIBUTING.md#storage)).
+- **Observability**: with `LARK_METRICS_PUSH=true`, `lark-server` pushes per-database metrics straight to `lark-edge`'s internal endpoint and the admin dashboard's Monitoring tab works with no extra setup (this is set in the bundled compose + Fly configs). Leave it off to rely on an external log shipper scraping stdout instead. Either way, enable `--debug-timing` / `LARK_DEBUG_TIMING` for latency breakdowns when diagnosing. Full details, including the Vector path for bare-metal and off-site metrics, are in [OBSERVABILITY.md](OBSERVABILITY.md).
+- **Upgrades**: deploy node-by-node. The on-disk blob carries a `blob.generation`; a server restart re-opens its data and replays WAL forward (same path as restore). Roll `lark-server` nodes one at a time so the coordinator reroutes around each during its brief restart.
 
 ---
 
 ## Configuration reference
 
-Every setting is an environment variable; `lark-server` additionally accepts each
-as a CLI flag (shown below). Unless noted, defaults are production-safe. The
-bundled `docker-compose.yml` and [`deploy/fly/`](../deploy/fly/README.md) set the
-non-default values a real deployment needs.
+Every setting is an environment variable; `lark-server` additionally accepts each as a CLI flag (shown below). Unless noted, defaults are production-safe. The bundled `docker-compose.prod.yml` and [`deploy/fly/`](../deploy/fly/README.md) set the non-default values a real deployment needs. (`LARK_VERSION` in the compose files isn't a Lark setting — it selects which published image tag to run.)
 
 ### `lark-server` (the engine)
 
@@ -488,9 +425,7 @@ non-default values a real deployment needs.
 
 #### Durability
 
-Writes go to a write-ahead log (WAL) that is compacted into the blob on disk.
-Two settings control how aggressively the WAL is persisted, trading write
-latency for crash safety:
+Writes go to a write-ahead log (WAL) that is compacted into the blob on disk. Two settings control how aggressively the WAL is persisted, trading write latency for crash safety:
 
 | Goal | `LARK_WAL_SYNC_INTERVAL_MS` | `LARK_FSYNC_ON_WAL_FLUSH` | Behavior |
 |---|---|---|---|
@@ -499,11 +434,7 @@ latency for crash safety:
 | **Synchronous** | `0` | `false` | Each write is flushed to the page cache before its ACK. No in-memory loss window; survives process crash but not power loss. |
 | **Strict** | `0` | `true` | Each write is flushed **and** `fdatasync`'d before its ACK, so a delivered ACK means the write is durable on the device. Highest per-write latency. |
 
-Because the interval is in-memory buffering (not batching for throughput on a
-single connection), lowering it or setting it to `0` increases the fsync/flush
-rate and therefore write latency. Pick the weakest setting that meets your
-data-loss tolerance. These are process-wide (all databases on the node share
-them), set once at startup.
+Because the interval is in-memory buffering (not batching for throughput on a single connection), lowering it or setting it to `0` increases the fsync/flush rate and therefore write latency. Pick the weakest setting that meets your data-loss tolerance. These are process-wide (all databases on the node share them), set once at startup.
 
 ### `lark-edge` (the gateway / coordinator)
 
@@ -540,6 +471,4 @@ them), set once at startup.
 | `LOCAL_BACKEND_ADDR` | `localhost:7779` | **Dev only**: backend address in `LOCAL_MODE`. |
 | `LOCAL_PROJECT_ID` | `test-project` | **Dev only**: project ID used in `LOCAL_MODE`. |
 
-> `BACKEND_ADDRS`, `COORDINATOR_ADDR`, and `IS_COORDINATOR` exist for advanced or
-> non-self-coordinator topologies and are left at their defaults in the standard
-> Tier 1–2 deployments described above.
+> `BACKEND_ADDRS`, `COORDINATOR_ADDR`, and `IS_COORDINATOR` exist for advanced or non-self-coordinator topologies and are left at their defaults in the standard Tier 1–2 deployments described above.

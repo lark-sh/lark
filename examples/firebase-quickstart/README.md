@@ -41,7 +41,7 @@ npm install
 In your root `lark` directory:
 
 ```sh
-make up
+make up-release
 ```
 
 This brings up the Lark service. Wait around 30 seconds for the service to come up fully, then open the admin UI:
@@ -115,16 +115,12 @@ If you'd like, you can go back to your admin dashboard in Lark at `http://localh
 
 ## Troubleshooting
 
-**The browser can't resolve `quickstart.lark.localhost`.**
-You're on an older browser or a system that doesn't honor RFC 6761. Add `127.0.0.1 quickstart.lark.localhost` to `/etc/hosts`.
+**The browser can't resolve `quickstart.lark.localhost`.** You're on an older browser or a system that doesn't honor RFC 6761. Add `127.0.0.1 quickstart.lark.localhost` to `/etc/hosts`.
 
-**Sign-in works but Lark rejects the token.**
-The `Firebase Auth project ID` on the Lark project doesn't match the issuer of the ID token. Re-check step 4 against the Firebase console.
+**Sign-in works but Lark rejects the token.** The `Firebase Auth project ID` on the Lark project doesn't match the issuer of the ID token. Re-check step 4 against the Firebase console.
 
 ---
 
 ## Next steps
 
-The same two edits work on your own Firebase app: point `databaseURL` at your Lark
-project and drop the emulator block. For security rules, the REST API, and the rest
-of the client surface, see [docs.larksh.com](https://docs.larksh.com).
+The same two edits work on your own Firebase app: point `databaseURL` at your Lark project and drop the emulator block. For security rules, the REST API, and the rest of the client surface, see [docs.larksh.com](https://docs.larksh.com).
