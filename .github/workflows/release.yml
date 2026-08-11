@@ -212,9 +212,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # This job only runs on tag pushes, so the version is the tag minus its
+      # leading `v` — the same tag the images carry.
+      - name: Resolve version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          # The CHANGELOG carries the narrative; GitHub appends its generated
+          # commit and contributor list below this body.
+          body: |
+            ## Container images
+
+            Multi-arch (`linux/amd64` + `linux/arm64`) — `docker pull` resolves the right one:
+
+            ```
+            ghcr.io/${{ github.repository_owner }}/lark-server:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/lark-edge:${{ steps.version.outputs.version }}
+            ```
+
+            ## What changed
+
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md).
+
+            New here? Start with the [README](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/README.md). To run Lark, see [DEPLOYMENT.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/DEPLOYMENT.md) — and if you're upgrading, [back up first](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/BACKUP.md), since downgrades aren't supported.
           generate_release_notes: true
           # Pre-1.0: tag a prerelease if the version carries a suffix (e.g. -rc1).
           prerelease: ${{ contains(github.ref_name, '-') }}
