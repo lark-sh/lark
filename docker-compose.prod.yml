@@ -1,20 +1,21 @@
 # Single-host Lark stack running PREBUILT images from GHCR.
 #
 # Same topology as docker-compose.yml, but instead of compiling from source it
-# pulls published `lark-server` / `lark-edge` images — so you get a running
+# pulls published `lark-server` / `lark-edge` images so you get a running
 # stack in seconds without a Rust/Go toolchain. This is the fast "try it" path.
 #
-# You do NOT need a clone of the Lark repo to use this file. Download it on its
-# own, give it a secret, and start:
+# From a repo clone, `make up-release` generates the .env for you and runs this
+# file directly.
+#
+# You can also use this file without a clone (say, on a deployment host that
+# has no reason to carry the source tree). Download it on its own, give it a
+# secret, and start:
 #
 #   mkdir lark && cd lark
 #   curl -fsSL https://raw.githubusercontent.com/lark-sh/lark/main/docker-compose.prod.yml -o docker-compose.yml
 #   echo "SERVER_SECRET=$(openssl rand -hex 32)" > .env
 #   docker compose up
 #
-# Compose reads `.env` from the working directory, so that is the whole setup.
-# Saving the file as `docker-compose.yml` keeps every later command bare
-# (`docker compose down`, `docker compose pull`, and so on).
 #
 # All state lands in `./lark-data` next to this file — `server/` holds the
 # databases (blob + WAL) and `edge/` holds the control plane (projects, admin
@@ -25,9 +26,6 @@
 # The images track `latest` by default; pin a version in the same .env:
 #
 #   echo "LARK_VERSION=0.2.0" >> .env
-#
-# From a repo clone, `make up-release` generates the .env for you and runs this
-# file directly.
 #
 # Note: this serves plain HTTP on localhost (browsers exempt *.localhost from
 # mixed-content rules), which is right for trying Lark on your machine. For a
