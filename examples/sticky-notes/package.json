@@ -9,7 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@lark-sh/client": "^0.1.28"
+    "@lark-sh/client": "^0.1.30"
   },
   "devDependencies": {
     "typescript": "^5.4.0",

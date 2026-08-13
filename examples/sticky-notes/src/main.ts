@@ -109,9 +109,7 @@ function setStatus(state: "connecting" | "connected" | "disconnected", text: str
 const db = new LarkDatabase(`${PROJECT}/${DATABASE}`, {
   anonymous: true,
   domain: DOMAIN,
-  // Try WebTransport first so volatile cursor writes can use UDP datagrams.
-  // Falls back to WebSocket automatically if unavailable.
-  transport: "auto",
+  transport: "websocket", //Use 'auto' if this is deployed publicly to take advantage of WebTransport
 });
 
 // Cursor write rate. 50ms (~20Hz) for both transports — the server batches
