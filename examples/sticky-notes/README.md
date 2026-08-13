@@ -36,7 +36,7 @@ If this is your first time, the admin temporary password is printed in the `make
 
 In the admin UI:
 
-1. Click **Create Project**. Name it **`Sticky Notes`** (which should create the slug `stick-notes`).
+1. Click **Create Project**. Name it **`Sticky Notes`** (which should create the slug `sticky-notes`).
 2. Leave **Auto Create** enabled. Uncheck **Ephemeral** if you'd like notes to survive a restart of the stack.
 3. Open the project, then click the **Project Settings** button in the top-right corner, and replace the default rules with:
 
