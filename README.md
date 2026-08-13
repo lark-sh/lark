@@ -1,5 +1,7 @@
 # Lark
 
+<img width="1291" height="873" alt="Screenshot 2026-08-13 at 9 13 18 AM" src="https://github.com/user-attachments/assets/8c11aa58-f1b6-4840-ba2b-86c8ca60f6ee" />
+
 Lark is a real-time database server that syncs a JSON tree between multiple clients with optional data persistence. It's written primarily in Rust on top of Glommio, with an edge component written in Go for terminating WebSocket, WebTransport, and REST HTTP connections.
 
 You can use it alongside [`@lark-sh/client`](https://www.npmjs.com/package/@lark-sh/client) to easily create web applications which are realtime.
