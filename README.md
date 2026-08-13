@@ -16,16 +16,15 @@ Full documentation for building on Lark (the client SDK, security rules, the RES
 
 If you're exploring Lark for the first time, you probably have two goals: firstly, get Lark running on your local machine so you can explore the platform; and secondly, see something neat running on top of it so you can get a feel for what's possible.
 
-To do so, all you need is `Docker`. Download the compose file, give it a secret, and start it:
+To do so, you'll need `make` and `Docker`. Clone the repo and start Lark from the prebuilt images:
 
 ```bash
-mkdir lark && cd lark
-curl -fsSL https://raw.githubusercontent.com/lark-sh/lark/main/docker-compose.prod.yml -o docker-compose.yml
-echo "SERVER_SECRET=$(openssl rand -hex 32)" > .env
-docker compose up
+git clone https://github.com/lark-sh/lark.git
+cd lark
+make up-release
 ```
 
-The dashboard is at http://localhost:8080/admin/, and the admin email and one-time password are printed in the log on first start. A `lark-data` folder will be created in the directory which contains your data; backup this folder to backup your data, or delete it if you want to start over fresh.
+The dashboard is at http://localhost:8080/admin/, and the admin email and one-time password are printed in the log on first start. A `lark-data` folder will be created in the repo directory which contains your data; backup this folder to backup your data, or delete it if you want to start over fresh.
 
 **Want it on the public internet instead?** `deploy/fly/quickstart.sh` stands up a real, TLS-terminated Lark deployment on [Fly.io](https://fly.io) in a few minutes (you'll need a domain). See [`deploy/fly/README.md`](deploy/fly/README.md).
 
@@ -36,15 +35,9 @@ If you'd like to see something running on top of Lark, check out the [`examples/
 - [Sticky notes](examples/sticky-notes/README.md) is a multiplayer whiteboard built directly on [`@lark-sh/client`](https://www.npmjs.com/package/@lark-sh/client). Live cursors, draggable notes, snapshot-interpolated motion, and volatile-path presence in ~300 lines of vanilla TypeScript. Start here if you're building a new app on Lark.
 - [Firebase quickstart](examples/firebase-quickstart/README.md) runs Firebase's own `quickstart-js/database` social-blogging app against Lark with a handful of lines changed. Start here if you'd like to see how easy it is to migrate an existing Firebase SDK-based app to Lark.
 
-### Clone and compile
+### Compile it yourself
 
-If you'd like to pull down the repo and compile Lark to run it on your local machine instead of relying on the Docker images (`make` and `Docker` required):
-
-```bash
-git clone git@github.com:lark-sh/lark.git
-cd lark
-make up
-```
+If you'd rather compile Lark from source instead of relying on the prebuilt Docker images, run `make up` instead of `make up-release` — it's the same stack, built from the code in your checkout.
 
 ## Project status
 
