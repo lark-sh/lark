@@ -190,10 +190,11 @@ impl Database {
         //
         // Rate limiting is done at the VIEW level inside send_events.
         //
-        // FAIRNESS: Process views in batches of 10, yielding between batches.
-        // This prevents a database with many unique views (e.g., 200k CCU with different
-        // query params) from starving other databases on the same core.
-        const VIEWS_PER_BATCH: usize = 10;
+        // FAIRNESS: Process views in batches (default 10, LARK_BROADCAST_VIEWS_PER_BATCH),
+        // yielding between batches. This prevents a database with many unique views
+        // (e.g., 200k CCU with different query params) from starving other databases
+        // on the same core.
+        let views_per_batch = broadcast_views_per_batch();
 
         // 1. Collect affected views (quick, needs tree briefly)
         let view_infos = self.view_manager.collect_affected_view_infos(&event);
@@ -209,7 +210,7 @@ impl Database {
 
         // 3. Process in batches, yielding between
         let mut event_count = 0;
-        for (batch_idx, chunk) in view_infos.chunks(VIEWS_PER_BATCH).enumerate() {
+        for (batch_idx, chunk) in view_infos.chunks(views_per_batch).enumerate() {
             // Acquire lock only for this batch
             let batch_sent = {
                 let tree = self.tree.read().unwrap();

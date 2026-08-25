@@ -206,7 +206,7 @@ pub async fn run(&mut self) {
 ```
 
 **Key design points:**
-- **Batching**: Up to 128 messages or 10ms of work per iteration
+- **Batching**: Up to 128 messages or 10ms of work per iteration (tunable via `LARK_DB_BATCH_MAX_MESSAGES` / `LARK_DB_BATCH_MAX_MS`)
 - **Non-blocking poll**: `poll_immediate()` checks for ready messages without waiting
 - **Cooperative yielding**: Prevents starvation of other databases on same core
 
@@ -565,11 +565,11 @@ async fn broadcast_mutation(
     // Collect affected views
     let view_infos = self.view_manager.collect_affected_view_infos(&event);
 
-    // Process in batches of 10 for fairness
-    const VIEWS_PER_BATCH: usize = 10;
+    // Process in batches for fairness (default 10, LARK_BROADCAST_VIEWS_PER_BATCH)
+    let views_per_batch = broadcast_views_per_batch();
     let mut event_count = 0;
 
-    for (batch_idx, chunk) in view_infos.chunks(VIEWS_PER_BATCH).enumerate() {
+    for (batch_idx, chunk) in view_infos.chunks(views_per_batch).enumerate() {
         let batch_sent = {
             let tree = self.tree.read().unwrap();
             self.view_manager.send_events_for_views(chunk, &event, &tree)
@@ -774,7 +774,7 @@ fn flush_volatile_slow(&mut self) {
 | **Lazy newData** | `rules/snapshot.rs` | UPDATE rules cascade builds snapshots on demand instead of materializing `merged_data` per ancestor, with no eager `tree.get_value` walks for rules that don't read `newData.*` |
 | **writes_at validate** | `rules/snapshot.rs` | `.validate` fires only on children being written, not on tree-existing untouched siblings |
 | **Message batching** | `proxy.rs` | 256KB or 3ms → reduced syscalls |
-| **View batch processing** | `database/broadcast.rs` | 10 views per batch, yield between |
+| **View batch processing** | `database/broadcast.rs` | 10 views per batch (`LARK_BROADCAST_VIEWS_PER_BATCH`), yield between |
 | **Deduplication** | `database/run.rs` | IndexSet with O(1) eviction |
 
 ## Latency Tracking

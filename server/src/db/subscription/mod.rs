@@ -646,9 +646,20 @@ impl View {
 /// Maximum number of distinct subscriptions (views) a single client connection
 /// may hold on one database. A subscription amplifies every matching write's
 /// fan-out, so an unbounded count lets one cheap connection inflate per-write
-/// work for the whole database. This is a generous DoS rail (audit M-3). Re-subscribing to a view the
-/// client already holds is idempotent and does not count against this.
-const MAX_SUBSCRIPTIONS_PER_CLIENT: usize = 1_000;
+/// work for the whole database. This is a generous DoS rail; Re-subscribing to a
+/// view the client already holds is idempotent and does not count against this.
+/// Default 10,000; override at startup via `set_max_subscriptions_per_client`
+/// (driven by the `LARK_MAX_SUBSCRIPTIONS_PER_CLIENT` env var). Clamped to >= 1.
+pub static MAX_SUBSCRIPTIONS_PER_CLIENT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(10_000);
+
+pub fn set_max_subscriptions_per_client(n: usize) {
+    MAX_SUBSCRIPTIONS_PER_CLIENT.store(n.max(1), std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn max_subscriptions_per_client() -> usize {
+    MAX_SUBSCRIPTIONS_PER_CLIENT.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Why a `subscribe` call was rejected. Distinct from [`QueryError`] (a
 /// query-*parsing* failure) so unrelated query-parsing call sites don't have to
@@ -657,7 +668,7 @@ const MAX_SUBSCRIPTIONS_PER_CLIENT: usize = 1_000;
 pub enum SubscribeError {
     /// The query parameters themselves were invalid.
     Query(QueryError),
-    /// The client already holds [`MAX_SUBSCRIPTIONS_PER_CLIENT`] subscriptions.
+    /// The client already holds `max_subscriptions_per_client()` subscriptions.
     TooManySubscriptions { limit: usize },
 }
 

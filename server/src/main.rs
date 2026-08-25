@@ -107,6 +107,32 @@ pub struct Args {
     )]
     pub fsync_on_wal_flush: bool,
 
+    /// Maximum distinct subscriptions (listeners/views) one client connection may
+    /// hold on a database. Exceeding it NACKs the SUBSCRIBE with
+    /// `too_many_subscriptions`.
+    #[arg(
+        long,
+        default_value = "10000",
+        env = "LARK_MAX_SUBSCRIPTIONS_PER_CLIENT"
+    )]
+    pub max_subscriptions_per_client: usize,
+
+    /// Maximum inbox messages a database processes per scheduling slice before
+    /// yielding to other databases on the same core. Larger = more throughput
+    /// for a hot database, less fairness for its neighbours.
+    #[arg(long, default_value = "128", env = "LARK_DB_BATCH_MAX_MESSAGES")]
+    pub db_batch_max_messages: usize,
+
+    /// Maximum milliseconds a database spends processing its inbox per
+    /// scheduling slice before yielding. Checked between messages.
+    #[arg(long, default_value = "10", env = "LARK_DB_BATCH_MAX_MS")]
+    pub db_batch_max_ms: u64,
+
+    /// Number of affected views a write's broadcast fans out to before
+    /// yielding to other databases on the same core.
+    #[arg(long, default_value = "10", env = "LARK_BROADCAST_VIEWS_PER_BATCH")]
+    pub broadcast_views_per_batch: usize,
+
     /// Coordinator URL for server registration (internal endpoint, e.g., http://lark-edge:8080)
     #[arg(long, env = "LARK_COORDINATOR_URL")]
     pub coordinator: Option<String>,
@@ -225,6 +251,10 @@ fn main() {
     lark_server::db::set_eviction_idle_secs(args.eviction_idle_secs);
     lark_server::db::set_wal_sync_interval_ms(args.wal_sync_interval_ms);
     lark_server::db::set_fsync_on_wal_flush(args.fsync_on_wal_flush);
+    lark_server::db::set_max_subscriptions_per_client(args.max_subscriptions_per_client);
+    lark_server::db::set_db_batch_max_messages(args.db_batch_max_messages);
+    lark_server::db::set_db_batch_max_ms(args.db_batch_max_ms);
+    lark_server::db::set_broadcast_views_per_batch(args.broadcast_views_per_batch);
 
     // Create executor pool configuration
     let pool_config = ExecutorPoolConfig {

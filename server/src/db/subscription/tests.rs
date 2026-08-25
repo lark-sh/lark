@@ -130,8 +130,11 @@ fn test_unsubscribe_all() {
 fn test_subscription_cap_per_client() {
     let mut vm = ViewManager::new();
 
-    // Fill client1 to the cap with distinct paths.
-    for i in 0..MAX_SUBSCRIPTIONS_PER_CLIENT {
+    // Fill client1 to the cap with distinct paths. Read the live (default)
+    // value rather than overriding the global: other tests subscribe
+    // concurrently and must not see a lowered cap.
+    let cap = max_subscriptions_per_client();
+    for i in 0..cap {
         let path = format!("/p{}", i);
         assert!(vm.subscribe("client1", &path, None, mock_conn()).is_ok());
     }
@@ -140,12 +143,7 @@ fn test_subscription_cap_per_client() {
     let err = vm
         .subscribe("client1", "/overflow", None, mock_conn())
         .unwrap_err();
-    assert_eq!(
-        err,
-        SubscribeError::TooManySubscriptions {
-            limit: MAX_SUBSCRIPTIONS_PER_CLIENT
-        }
-    );
+    assert_eq!(err, SubscribeError::TooManySubscriptions { limit: cap });
 
     // Re-subscribing to a view the client already holds is idempotent and
     // must still succeed even at the cap.
