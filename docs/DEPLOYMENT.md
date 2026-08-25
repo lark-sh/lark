@@ -418,6 +418,10 @@ Every setting is an environment variable; `lark-server` additionally accepts eac
 | `LARK_EVICTION_IDLE_SECS` | `--eviction-idle-secs` | `300` | Idle seconds before a promoted path is evicted back to Sentinel. |
 | `LARK_WAL_SYNC_INTERVAL_MS` | `--wal-sync-interval-ms` | `2000` | How often buffered WAL writes flush to disk. `0` = flush before every write's ACK (synchronous; higher latency). See [Durability](#durability). |
 | `LARK_FSYNC_ON_WAL_FLUSH` | `--fsync-on-wal-flush` | `false` | `fdatasync` each WAL flush (`true`) vs. OS page cache only (`false`). Enable for durability across power loss. See [Durability](#durability). |
+| `LARK_MAX_SUBSCRIPTIONS_PER_CLIENT` | `--max-subscriptions-per-client` | `10000` | Max distinct listeners one client connection may hold on a database; further `SUBSCRIBE`s are NACKed with `too_many_subscriptions`. |
+| `LARK_DB_BATCH_MAX_MESSAGES` | `--db-batch-max-messages` | `128` | Max inbox messages a database processes per scheduling slice before yielding to other databases on its core. |
+| `LARK_DB_BATCH_MAX_MS` | `--db-batch-max-ms` | `10` | Max milliseconds a database processes its inbox per slice before yielding (checked between messages). |
+| `LARK_BROADCAST_VIEWS_PER_BATCH` | `--broadcast-views-per-batch` | `10` | Affected views a write's broadcast fans out to before yielding. |
 | `LARK_DEBUG_TIMING` | `--debug-timing` | `false` | Detailed message-latency tracking (diagnostics). |
 | `RUST_LOG` | — | `info` | Log filter (e.g. `debug`, `lark_server=debug`). |
 | `LARK_EMULATOR` | `--emulator` | `false` | **Dev/test only**: accepts the `owner` token. |

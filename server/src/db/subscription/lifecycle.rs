@@ -96,10 +96,9 @@ impl ViewManager {
             // view. Idempotent re-subscribes (already_subscribed) are exempt so
             // a client at the cap can still refresh an existing listener.
             let current = self.by_client.get(client_id).map_or(0, |keys| keys.len());
-            if current >= MAX_SUBSCRIPTIONS_PER_CLIENT {
-                return Err(SubscribeError::TooManySubscriptions {
-                    limit: MAX_SUBSCRIPTIONS_PER_CLIENT,
-                });
+            let limit = max_subscriptions_per_client();
+            if current >= limit {
+                return Err(SubscribeError::TooManySubscriptions { limit });
             }
 
             // Get or create the shared view

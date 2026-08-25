@@ -440,6 +440,52 @@ pub fn fsync_on_wal_flush() -> bool {
     FSYNC_ON_WAL_FLUSH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Maximum number of inbox messages a database drains in one scheduling slice
+/// before yielding to the other databases on its core. Together with
+/// [`DB_BATCH_MAX_MS`] this bounds how long a busy database can monopolise a
+/// core. Default 128; override at startup via `set_db_batch_max_messages`
+/// (driven by the `LARK_DB_BATCH_MAX_MESSAGES` env var). Clamped to >= 1.
+pub static DB_BATCH_MAX_MESSAGES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(128);
+
+pub fn set_db_batch_max_messages(n: usize) {
+    DB_BATCH_MAX_MESSAGES.store(n.max(1), std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn db_batch_max_messages() -> usize {
+    DB_BATCH_MAX_MESSAGES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Maximum wall-clock time, in milliseconds, a database spends draining its
+/// inbox in one scheduling slice before yielding. Checked between messages, so
+/// a single slow message can overshoot it. Default 10ms; override at startup
+/// via `set_db_batch_max_ms` (driven by the `LARK_DB_BATCH_MAX_MS` env var).
+pub static DB_BATCH_MAX_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(10);
+
+pub fn set_db_batch_max_ms(ms: u64) {
+    DB_BATCH_MAX_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn db_batch_max_ms() -> u64 {
+    DB_BATCH_MAX_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Number of affected views a write's broadcast fans out to before yielding.
+/// Keeps a database with very many distinct views (e.g. every client on its
+/// own query) from starving other databases on the same core. Default 10;
+/// override at startup via `set_broadcast_views_per_batch` (driven by the
+/// `LARK_BROADCAST_VIEWS_PER_BATCH` env var). Clamped to >= 1.
+pub static BROADCAST_VIEWS_PER_BATCH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(10);
+
+pub fn set_broadcast_views_per_batch(n: usize) {
+    BROADCAST_VIEWS_PER_BATCH.store(n.max(1), std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn broadcast_views_per_batch() -> usize {
+    BROADCAST_VIEWS_PER_BATCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Metrics emission interval (only for active databases)
 const METRICS_EMIT_INTERVAL: Duration = Duration::from_secs(60);
 

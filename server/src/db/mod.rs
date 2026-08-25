@@ -10,6 +10,7 @@ mod value;
 pub use database::{
     AuthInfo, ClientInfo, CompactionComplete, ConnectionSender, Database, DatabaseHandle,
     DatabaseState, DisconnectAction, InboxMessage, SendError, blob_path, read_blob_generation,
+    set_broadcast_views_per_batch, set_db_batch_max_messages, set_db_batch_max_ms,
     set_eviction_idle_secs, set_fsync_on_wal_flush, set_wal_sync_interval_ms, sidecar_path,
 };
 pub use firebase_hash::{compute_firebase_hash, is_firebase_hash};
@@ -20,6 +21,6 @@ pub use path::{
 };
 pub use pushid::{generate_push_id, generate_push_id_at};
 pub use query::{Limit, OrderBy, Query, QueryError, QueryParams, Range, RangeBound};
-pub use subscription::{ClientEvent, View, ViewManager};
+pub use subscription::{ClientEvent, View, ViewManager, set_max_subscriptions_per_client};
 pub use tree::Tree;
 pub use value::{ArcValueSortExt, compare_keys, compare_values, type_rank};

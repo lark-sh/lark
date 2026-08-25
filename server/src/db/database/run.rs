@@ -114,7 +114,8 @@ impl Database {
 
     /// Run the database message loop.
     /// Event-driven using Glommio's local_channel with message batching.
-    /// Processes up to 128 messages or 10ms worth of work before yielding.
+    /// Drains up to `LARK_DB_BATCH_MAX_MESSAGES` messages (default 128) or
+    /// `LARK_DB_BATCH_MAX_MS` (default 10ms) worth of work before yielding.
     pub async fn run(mut self) {
         debug!("Database {} starting", self.id);
 
@@ -171,9 +172,10 @@ impl Database {
         let mut last_promotion_stats_emit = Instant::now();
         let mut last_backup_marker = Instant::now();
 
-        // Batch processing constants
-        const MAX_BATCH_SIZE: usize = 128;
-        const MAX_BATCH_DURATION: Duration = Duration::from_millis(10);
+        // Batch processing limits, configured at startup
+        // (LARK_DB_BATCH_MAX_MESSAGES / LARK_DB_BATCH_MAX_MS).
+        let max_batch_size: usize = db_batch_max_messages();
+        let max_batch_duration = Duration::from_millis(db_batch_max_ms());
         const PERIODIC_INTERVAL: Duration = Duration::from_millis(50);
 
         // WAL flush cadence, configured at startup (LARK_WAL_SYNC_INTERVAL_MS).
@@ -233,7 +235,7 @@ impl Database {
                 let batch_start = Instant::now();
                 let mut batch_count = 1;
 
-                while batch_count < MAX_BATCH_SIZE && batch_start.elapsed() < MAX_BATCH_DURATION {
+                while batch_count < max_batch_size && batch_start.elapsed() < max_batch_duration {
                     // poll_immediate polls once without blocking
                     match poll_immediate(self.inbox.recv()).await {
                         Some(Some(mut msg)) => {
