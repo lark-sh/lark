@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/bytedance/sonic"
 
@@ -701,5 +703,73 @@ func TestSendFirebaseAuthError(t *testing.T) {
 	}
 	if b["d"] != "token expired" {
 		t.Errorf("Error message: got %v, want 'token expired'", b["d"])
+	}
+}
+
+// Regression test for "panic: close of closed channel" in handleAuthMessage.
+// Two AUTH messages arriving while the first handler is still waiting for the
+// project config used to spawn two handlers that both closed the same authDone
+// channel. Run with -race to also catch unsynchronized access to auth state.
+func TestClientDuplicateAuthBeforeProjectReady(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		protocol Protocol
+		authMsg  func() []byte
+	}{
+		{
+			name:     "lark",
+			protocol: ProtocolLark,
+			authMsg:  func() []byte { return []byte(`{"o":"au","r":"1","t":"tok"}`) },
+		},
+		{
+			name:     "firebase",
+			protocol: ProtocolFirebase,
+			authMsg:  func() []byte { return testutil.FirebaseAuthMessage(1, "tok") },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			transport := NewMockTransport(backend.ProtocolWebSocket)
+			client := newTestClient(1, transport, tc.protocol)
+			client.projectReady = make(chan struct{})
+
+			// Both AUTH messages arrive before the project config resolves,
+			// so the first handler is still blocked when the second arrives.
+			client.OnMessage(tc.authMsg(), true)
+			client.OnMessage(tc.authMsg(), true)
+
+			// waitForAuth must block while the handler is in flight.
+			waited := make(chan struct{})
+			go func() {
+				client.waitForAuth()
+				close(waited)
+			}()
+			select {
+			case <-waited:
+				t.Fatal("waitForAuth returned before project config was ready")
+			case <-time.After(20 * time.Millisecond):
+			}
+
+			// Resolve the project lookup (as an error - no server in tests).
+			client.projectErr = errors.New("project not found")
+			close(client.projectReady)
+
+			select {
+			case <-waited:
+			case <-time.After(2 * time.Second):
+				t.Fatal("waitForAuth did not return after project config resolved")
+			}
+
+			client.authMu.Lock()
+			processing := client.authProcessing
+			client.authMu.Unlock()
+			if processing {
+				t.Error("authProcessing should be false after handler completes")
+			}
+
+			// A later AUTH (after the first handler finished) must be accepted
+			// and complete without panicking on the old channel.
+			client.OnMessage(tc.authMsg(), true)
+			client.waitForAuth()
+		})
 	}
 }

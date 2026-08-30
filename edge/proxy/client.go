@@ -152,12 +152,16 @@ type ClientConn struct {
 	backend    *backend.Backend
 
 	// Auth state
-	authToken        string        // Pending token (extracted before routing complete)
-	authInfo         *auth.Info    // Validated auth info (after routing complete)
-	authRequestID    string        // Request ID for pending auth (to send response)
+	authToken     string     // Pending token (extracted before routing complete)
+	authInfo      *auth.Info // Validated auth info (after routing complete)
+	authRequestID string     // Request ID for pending auth (to send response)
+
+	// Async auth handler state. The read loop spawns handleAuthMessage, and
+	// startRouting waits on it, so these are touched from several goroutines.
+	authMu           sync.Mutex
 	authResponseSent bool          // True if we've already sent auth response (avoid double-send)
-	authProcessing   bool          // True if auth is being processed async
-	authDone         chan struct{} // Closed when auth processing completes
+	authProcessing   bool          // True while a handleAuthMessage goroutine is running
+	authDone         chan struct{} // Closed when the most recent auth handler completes
 
 	// Lark protocol state
 	joinRequestID string // Request ID from join message (to send JoinAck)
@@ -474,12 +478,51 @@ func (c *ClientConn) handleLarkAuthMessage(msg map[string]interface{}, data []by
 		c.authRequestID = reqID
 	}
 
-	// Mark auth as processing - routing will wait for this
-	c.authProcessing = true
-	c.authDone = make(chan struct{})
-
 	// Validate and send response (async - waits for project config)
-	go c.handleAuthMessage(data)
+	c.startAuth(data)
+}
+
+// startAuth spawns the async auth handler for an AUTH message; routing waits
+// for it to finish. If a handler is already in flight the message is dropped:
+// the in-flight handler reads c.authToken after the project config arrives, so
+// it picks up the newer token anyway, and only one auth response is sent per
+// connection before routing completes. Spawning a second handler would race
+// on authDone (both would close the same channel and panic the process).
+func (c *ClientConn) startAuth(data []byte) {
+	c.authMu.Lock()
+	if c.authProcessing {
+		c.authMu.Unlock()
+		logger.Debug("Auth already in progress, ignoring duplicate auth message", "client_id", c.id)
+		return
+	}
+	done := make(chan struct{})
+	c.authProcessing = true
+	c.authDone = done
+	c.authMu.Unlock()
+
+	go c.handleAuthMessage(data, done)
+}
+
+// waitForAuth blocks until any in-flight auth handler has completed.
+func (c *ClientConn) waitForAuth() {
+	c.authMu.Lock()
+	done := c.authDone
+	c.authMu.Unlock()
+	if done != nil {
+		<-done
+	}
+}
+
+// markAuthResponseSent records that the pre-routing auth response has been
+// sent. Returns false if it had already been sent (caller should not send again).
+func (c *ClientConn) markAuthResponseSent() bool {
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
+	if c.authResponseSent {
+		return false
+	}
+	c.authResponseSent = true
+	return true
 }
 
 // handleFirebaseMessage handles Firebase protocol messages
@@ -567,11 +610,8 @@ func (c *ClientConn) handleFirebaseMessage(data []byte) {
 					c.authToken = cred
 				}
 			}
-			// Mark auth as processing - routing will wait for this
-			c.authProcessing = true
-			c.authDone = make(chan struct{})
 			// Validate and send response (async - waits for project config)
-			go c.handleAuthMessage(data)
+			c.startAuth(data)
 
 		case "s":
 			// Stats message - acknowledge locally
@@ -635,9 +675,7 @@ func (c *ClientConn) startRouting() {
 
 	go func() {
 		// Wait for any pending auth to complete first
-		if c.authProcessing {
-			<-c.authDone
-		}
+		c.waitForAuth()
 
 		// Wait for project config (should already be ready or nearly ready)
 		project, err := c.waitForProjectConfig()
@@ -878,13 +916,14 @@ func (c *ClientConn) sendLarkJoinAck(project *db.Project) {
 
 // handleAuthMessage is the unified auth handler for both Lark and Firebase.
 // Waits for project config, validates token, sends response, signals completion.
-func (c *ClientConn) handleAuthMessage(data []byte) {
+// done is the channel this handler owns; it is closed exactly once on exit.
+func (c *ClientConn) handleAuthMessage(data []byte, done chan struct{}) {
 	// Ensure we signal completion when done
 	defer func() {
-		if c.authDone != nil {
-			close(c.authDone)
-		}
+		c.authMu.Lock()
 		c.authProcessing = false
+		c.authMu.Unlock()
+		close(done)
 	}()
 
 	// Wait for project config
@@ -926,10 +965,9 @@ func (c *ClientConn) handleAuthMessage(data []byte) {
 	authPayload, err := c.validateAuth(project)
 	if err != nil {
 		// Check if already sent (avoid double-send)
-		if c.authResponseSent {
+		if !c.markAuthResponseSent() {
 			return
 		}
-		c.authResponseSent = true
 
 		// Send error response
 		if c.protocol == ProtocolLark {
@@ -941,10 +979,9 @@ func (c *ClientConn) handleAuthMessage(data []byte) {
 	}
 
 	// Check if already sent (avoid double-send)
-	if c.authResponseSent {
+	if !c.markAuthResponseSent() {
 		return
 	}
-	c.authResponseSent = true
 
 	// Send success response based on protocol
 	if c.protocol == ProtocolLark {

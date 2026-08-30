@@ -86,6 +86,8 @@ jobs:
         working-directory: edge
         run: go vet ./...
 
+      # -race catches unsynchronized access across goroutines (the proxy spawns
+      # per-connection auth/routing goroutines that share ClientConn state).
       - name: Test
         working-directory: edge
-        run: go test ./...
+        run: go test -race ./...
