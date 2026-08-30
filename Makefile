@@ -58,7 +58,7 @@ help:
 	@echo ""
 	@echo "  make check       cargo check --workspace (in Linux container)."
 	@echo "  make test        cargo test --lib (the common case)."
-	@echo "  make test-all    Full integration suite (./test-everything.sh) + go test ./... (edge)."
+	@echo "  make test-all    Full integration suite (./test-everything.sh) + go test -race ./... (edge)."
 	@echo "  make fmt         cargo fmt --all + go fmt ./... (edge)."
 	@echo "  make lint        cargo clippy with -D warnings."
 	@echo ""
@@ -109,7 +109,7 @@ test: dev-image
 .PHONY: test-all
 test-all: dev-image
 	$(DOCKER_RUN) ./test-everything.sh
-	cd edge && go test ./...
+	cd edge && go test -race ./...
 
 .PHONY: fmt
 fmt: dev-image
