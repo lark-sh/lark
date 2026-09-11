@@ -70,8 +70,10 @@
 //   - One write goroutine (writeLoop, drains outbox)
 //   - Potentially async routing/auth goroutines
 //
-// The outbox channel (1000 messages) provides backpressure. If full, messages
-// are dropped and the client should reconnect.
+// The outbox is bounded by bytes (CLIENT_OUTBOX_MAX_BYTES). It exists because
+// the backend read loop serves every client on that backend connection and must
+// never block on one slow socket. A client whose queue exceeds the cap is
+// dropped with a WARN log naming the reason; it is expected to reconnect.
 //
 // # Authentication
 //
@@ -85,6 +87,8 @@ package proxy
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -122,7 +126,20 @@ type outboxMessage struct {
 	reliable bool
 }
 
-const clientOutboxSize = 1000 // Max queued messages per client (~50s at 20hz, handles backend bursts)
+// outboxMsgOverhead is charged against the byte cap on top of each payload so
+// a flood of tiny messages is still accounted for (struct, slice header, and
+// queue slot are roughly this much on the heap).
+const outboxMsgOverhead = 64
+
+// Defaults used when a ClientConn has no server (tests). Production values
+// come from config: CLIENT_OUTBOX_MAX_BYTES, CLIENT_OUTBOX_WARN_BYTES,
+// CLIENT_WRITE_DEADLINE, CLIENT_WRITE_MIN_BYTES_PER_SEC.
+const (
+	defaultClientOutboxMaxBytes      int64 = 256 * 1024 * 1024
+	defaultClientOutboxWarnBytes     int64 = 64 * 1024 * 1024
+	defaultClientWriteDeadline             = 10 * time.Second
+	defaultClientWriteMinBytesPerSec int64 = 64 * 1024
+)
 
 // ClientConn represents a client connection being proxied
 type ClientConn struct {
@@ -134,9 +151,20 @@ type ClientConn struct {
 	// Transport-specific connection
 	transport ClientTransport
 
-	// Outbox for messages to send to client (lock-free)
-	outbox chan *outboxMessage
-	done   chan struct{}
+	// Outbox for messages to send to client. A byte-bounded queue rather
+	// than a fixed channel: memory scales with what is actually queued, and
+	// the cap measures what matters for a slow client (bytes held for it),
+	// not a message count. Bytes are released when a message is dequeued
+	// for writing, so at most one in-flight message is uncounted.
+	outboxMu     sync.Mutex
+	outboxQ      []*outboxMessage
+	outboxHead   int           // index of the next message to send in outboxQ
+	outboxBytes  int64         // bytes currently queued (payload + overhead)
+	outboxPeak   int64         // high-water mark of outboxBytes for this connection
+	outboxWarned bool          // WARN logged for approaching the cap; reset once drained below half the warn line
+	outboxClosed bool          // set by Close under outboxMu; Deliver refuses afterwards so the edge-wide total stays exact
+	outboxSignal chan struct{} // capacity 1; wakes writeLoop when a message is queued
+	done         chan struct{}
 
 	// Project config (fetched at connection time, needed for auth and JoinAck)
 	projectID     string
@@ -247,7 +275,7 @@ func newClientConn(server *Server, id uint32, transport ClientTransport, protoco
 		server:       server,
 		transport:    transport,
 		protocol:     protocol,
-		outbox:       make(chan *outboxMessage, clientOutboxSize),
+		outboxSignal: make(chan struct{}, 1),
 		done:         make(chan struct{}),
 		projectReady: make(chan struct{}),
 	}
@@ -312,31 +340,212 @@ func (c *ClientConn) SetState(state ClientState) {
 	c.state.Store(int32(state))
 }
 
+// outboxLimits returns the byte cap and the WARN threshold for this client.
+func (c *ClientConn) outboxLimits() (maxBytes, warnBytes int64) {
+	if c.server != nil && c.server.config != nil {
+		return c.server.config.ClientOutboxMaxBytes, c.server.config.ClientOutboxWarnBytes
+	}
+	return defaultClientOutboxMaxBytes, defaultClientOutboxWarnBytes
+}
+
+// WriteDeadline returns how long a single write of payloadLen bytes to this
+// client may take before the client is considered dead: a base deadline plus
+// the time the payload would take at the minimum acceptable drain rate. A
+// 16KB Firebase frame gets the base; a 16MB native frame at the default
+// 64KB/s floor gets over four minutes. The rule this encodes is "the client
+// has stopped taking bytes", never "the client is slow".
+func (c *ClientConn) WriteDeadline(payloadLen int) time.Duration {
+	base, minRate := defaultClientWriteDeadline, defaultClientWriteMinBytesPerSec
+	if c.server != nil && c.server.config != nil {
+		base, minRate = c.server.config.ClientWriteDeadline, c.server.config.ClientWriteMinBytesPerSec
+	}
+	if minRate <= 0 || payloadLen <= 0 {
+		return base
+	}
+	return base + time.Duration(int64(payloadLen)*int64(time.Second)/minRate)
+}
+
+// OutboxBytes returns the bytes currently queued for this client and the
+// connection's high-water mark.
+func (c *ClientConn) OutboxBytes() (queued, peak int64) {
+	c.outboxMu.Lock()
+	defer c.outboxMu.Unlock()
+	return c.outboxBytes, c.outboxPeak
+}
+
+// popOutbox dequeues the next message and releases its bytes from the cap.
+// Returns nil when the queue is empty.
+func (c *ClientConn) popOutbox() *outboxMessage {
+	c.outboxMu.Lock()
+	defer c.outboxMu.Unlock()
+
+	if c.outboxHead >= len(c.outboxQ) {
+		return nil
+	}
+	msg := c.outboxQ[c.outboxHead]
+	c.outboxQ[c.outboxHead] = nil
+	c.outboxHead++
+
+	size := int64(len(msg.data)) + outboxMsgOverhead
+	c.outboxBytes -= size
+	if c.server != nil {
+		c.server.outboxBytesTotal.Add(-size)
+	}
+	if _, warnBytes := c.outboxLimits(); c.outboxWarned && c.outboxBytes < warnBytes/2 {
+		c.outboxWarned = false // re-arm so a second climb warns again
+	}
+
+	// Compact: reset when fully drained, or slide down once the dead prefix
+	// dominates so a long-lived slow client doesn't pin a huge backing array.
+	if c.outboxHead == len(c.outboxQ) {
+		c.outboxQ = c.outboxQ[:0]
+		c.outboxHead = 0
+	} else if c.outboxHead >= 1024 && c.outboxHead*2 >= len(c.outboxQ) {
+		n := copy(c.outboxQ, c.outboxQ[c.outboxHead:])
+		for i := n; i < len(c.outboxQ); i++ {
+			c.outboxQ[i] = nil
+		}
+		c.outboxQ = c.outboxQ[:n]
+		c.outboxHead = 0
+	}
+	return msg
+}
+
 // writeLoop drains the outbox and sends to transport
 func (c *ClientConn) writeLoop() {
 	for {
 		select {
-		case msg := <-c.outbox:
-			if err := c.transport.Send(msg.data, msg.reliable); err != nil {
-				// Write failed (client disconnected or timeout) - close silently
-				c.Close()
+		case <-c.done:
+			return
+		default:
+		}
+
+		msg := c.popOutbox()
+		if msg == nil {
+			select {
+			case <-c.outboxSignal:
+				continue
+			case <-c.done:
 				return
 			}
-		case <-c.done:
+		}
+
+		if err := c.transport.Send(msg.data, msg.reliable); err != nil {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				// The write deadline already allows for a slow drain, so a
+				// timeout means the client stopped taking bytes entirely.
+				c.Kick("write deadline exceeded", "error", err, "message_bytes", len(msg.data))
+			} else {
+				// Client went away (broken pipe, reset). Ordinary churn.
+				logger.Debug("Client write failed", "client_id", c.id, "error", err)
+				c.Close()
+			}
 			return
 		}
 	}
 }
 
-// Deliver delivers a message to the client's outbox (non-blocking)
-// Returns false if the outbox is full
+// Deliver delivers a message to the client's outbox (non-blocking).
+// Returns false if queuing it would exceed the client's byte cap; the caller
+// is expected to Kick the client, since nothing can be dropped silently
+// without breaking the client's view of the data.
 func (c *ClientConn) Deliver(data []byte, reliable bool) bool {
-	select {
-	case c.outbox <- &outboxMessage{data: data, reliable: reliable}:
-		return true
-	default:
+	size := int64(len(data)) + outboxMsgOverhead
+	maxBytes, warnBytes := c.outboxLimits()
+
+	c.outboxMu.Lock()
+	if c.outboxClosed || c.outboxBytes+size > maxBytes {
+		c.outboxMu.Unlock()
 		return false
 	}
+	c.outboxQ = append(c.outboxQ, &outboxMessage{data: data, reliable: reliable})
+	c.outboxBytes += size
+	if c.outboxBytes > c.outboxPeak {
+		c.outboxPeak = c.outboxBytes
+	}
+	queued := c.outboxBytes
+	queuedMsgs := len(c.outboxQ) - c.outboxHead
+	warn := false
+	if !c.outboxWarned && queued >= warnBytes {
+		c.outboxWarned = true
+		warn = true
+	}
+	c.outboxMu.Unlock()
+
+	if c.server != nil {
+		c.server.outboxBytesTotal.Add(size)
+	}
+
+	if warn {
+		logger.Warn("Client outbox approaching limit",
+			"client_id", c.id,
+			"protocol", c.protocolName(),
+			"project", c.projectID,
+			"database", c.databaseID,
+			"outbox_bytes", queued,
+			"outbox_messages", queuedMsgs,
+			"warn_bytes", warnBytes,
+			"max_bytes", maxBytes,
+		)
+	}
+
+	select {
+	case c.outboxSignal <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+// Kick closes the connection because the edge decided to drop it, as opposed
+// to the client going away on its own, and says why at WARN. Every artificial
+// limit that ends a connection should come through here so it shows up in
+// the logs with enough context to tune the limit.
+func (c *ClientConn) Kick(reason string, kvs ...interface{}) {
+	c.closeMu.Lock()
+	alreadyClosed := c.closed
+	c.closeMu.Unlock()
+	if alreadyClosed {
+		return
+	}
+
+	queued, peak := c.OutboxBytes()
+	maxBytes, _ := c.outboxLimits()
+	serverID := ""
+	if c.backend != nil {
+		serverID = c.backend.ServerID
+	}
+	args := []interface{}{
+		"reason", reason,
+		"client_id", c.id,
+		"protocol", c.protocolName(),
+		"project", c.projectID,
+		"database", c.databaseID,
+		"server", serverID,
+		"outbox_bytes", queued,
+		"outbox_peak_bytes", peak,
+		"outbox_max_bytes", maxBytes,
+	}
+	args = append(args, kvs...)
+	logger.Warn("Client dropped", args...)
+
+	c.Close()
+}
+
+// Describe returns a short "id/protocol/project/database" label for logs.
+// Safe on a nil receiver.
+func (c *ClientConn) Describe() string {
+	if c == nil {
+		return ""
+	}
+	return fmt.Sprintf("%d/%s/%s/%s", c.id, c.protocolName(), c.projectID, c.databaseID)
+}
+
+func (c *ClientConn) protocolName() string {
+	if c.protocol == ProtocolFirebase {
+		return "Firebase"
+	}
+	return "Lark"
 }
 
 // sendDirect sends a message directly (bypassing outbox, for protocol messages)
@@ -1275,6 +1484,17 @@ func (c *ClientConn) Close() {
 
 	// Signal write goroutine to exit
 	close(c.done)
+
+	// Abandon whatever is still queued and release it from the edge-wide total.
+	c.outboxMu.Lock()
+	if c.server != nil && c.outboxBytes != 0 {
+		c.server.outboxBytesTotal.Add(-c.outboxBytes)
+	}
+	c.outboxBytes = 0
+	c.outboxQ = nil
+	c.outboxHead = 0
+	c.outboxClosed = true
+	c.outboxMu.Unlock()
 
 	// Notify backend and unregister client from core mapping
 	if c.backend != nil {

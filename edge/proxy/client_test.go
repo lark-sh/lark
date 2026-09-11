@@ -14,11 +14,11 @@ import (
 // newTestClient creates a ClientConn for testing with required channels initialized
 func newTestClient(id uint32, transport ClientTransport, protocol Protocol) *ClientConn {
 	c := &ClientConn{
-		id:        id,
-		transport: transport,
-		protocol:  protocol,
-		outbox:    make(chan *outboxMessage, 100),
-		done:      make(chan struct{}),
+		id:           id,
+		transport:    transport,
+		protocol:     protocol,
+		outboxSignal: make(chan struct{}, 1),
+		done:         make(chan struct{}),
 	}
 	c.state.Store(int32(StateConnected))
 	if protocol == ProtocolFirebase {

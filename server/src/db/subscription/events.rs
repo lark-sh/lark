@@ -327,12 +327,17 @@ impl ViewManager {
                     // Check if chunking is needed (Firebase + >16KB)
                     if fb_bytes.len() > FIREBASE_MAX_FRAME_SIZE {
                         // Fall back to direct send (handles chunking)
-                        if subscriber
+                        match subscriber
                             .conn
                             .try_send(fb_bytes.clone().into(), is_volatile, true)
-                            .is_ok()
                         {
-                            direct_sent += 1;
+                            Ok(()) => direct_sent += 1,
+                            Err(e) => crate::db::log_dropped_send(
+                                &subscriber.client_id,
+                                "event",
+                                is_volatile,
+                                &e,
+                            ),
                         }
                         continue;
                     }
@@ -483,8 +488,14 @@ impl ViewManager {
                             } else {
                                 fb_base.clone().into()
                             };
-                            if subscriber.conn.try_send(encoded, is_volatile, true).is_ok() {
-                                direct_sent += 1;
+                            match subscriber.conn.try_send(encoded, is_volatile, true) {
+                                Ok(()) => direct_sent += 1,
+                                Err(e) => crate::db::log_dropped_send(
+                                    &subscriber.client_id,
+                                    "event",
+                                    is_volatile,
+                                    &e,
+                                ),
                             }
                             continue;
                         }

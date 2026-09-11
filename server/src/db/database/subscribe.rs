@@ -53,6 +53,10 @@ impl Database {
         if self.has_sentinel_at_or_below(path_str)
             && self.blob_subtree_exceeds_limit(path_str).await
         {
+            warn!(
+                "NACK {}: read of {} rejected for client {} — blob subtree exceeds size limit",
+                self.id, path_str, client_id
+            );
             self.metrics.record_size_rejection();
             return Some(ServerMessage::nack(
                 request_id,
@@ -99,7 +103,7 @@ impl Database {
                     ));
                 }
                 Err(SubscribeError::TooManySubscriptions { limit }) => {
-                    debug!(
+                    warn!(
                         "NACK {}: SUBSCRIBE rejected for client {} — at subscription cap ({})",
                         self.id, client_id, limit
                     );
@@ -157,7 +161,12 @@ impl Database {
 
         // Check response size limit (256MB for all clients)
         let estimated_size = arc_value.estimate_size() as usize;
-        if estimated_size > crate::protocol::MAX_RESPONSE_SIZE {
+        let max_response = crate::protocol::max_response_size();
+        if estimated_size > max_response {
+            warn!(
+                "NACK {}: subscribe to {} rejected for client {} — initial snapshot {} bytes exceeds {}",
+                self.id, path_str, client_id, estimated_size, max_response
+            );
             // Remove the subscription we just added
             self.view_manager
                 .unsubscribe_with_query(client_id, path_str, &query_id);
@@ -167,8 +176,7 @@ impl Database {
                 error::RESPONSE_TOO_LARGE,
                 &format!(
                     "Initial snapshot size {} exceeds maximum allowed ({} bytes)",
-                    estimated_size,
-                    crate::protocol::MAX_RESPONSE_SIZE
+                    estimated_size, max_response
                 ),
             ));
         }
@@ -275,6 +283,10 @@ impl Database {
         if self.has_sentinel_at_or_below(path_str)
             && self.blob_subtree_exceeds_limit(path_str).await
         {
+            warn!(
+                "NACK {}: read of {} rejected for client {} — blob subtree exceeds size limit",
+                self.id, path_str, client_id
+            );
             self.metrics.record_size_rejection();
             return Some(ServerMessage::nack(
                 request_id,
@@ -324,15 +336,19 @@ impl Database {
 
         // Check response size limit (256MB for all clients)
         let estimated_size = arc_value.estimate_size() as usize;
-        if estimated_size > crate::protocol::MAX_RESPONSE_SIZE {
+        let max_response = crate::protocol::max_response_size();
+        if estimated_size > max_response {
+            warn!(
+                "NACK {}: read of {} rejected for client {} — response {} bytes exceeds {}",
+                self.id, path_str, client_id, estimated_size, max_response
+            );
             self.metrics.record_size_rejection();
             return Some(ServerMessage::nack(
                 request_id,
                 error::RESPONSE_TOO_LARGE,
                 &format!(
                     "Response size {} exceeds maximum allowed ({} bytes)",
-                    estimated_size,
-                    crate::protocol::MAX_RESPONSE_SIZE
+                    estimated_size, max_response
                 ),
             ));
         }

@@ -177,11 +177,19 @@ impl BroadcastBuffer {
             .extend_from_slice(&(message.len() as u32).to_be_bytes());
         self.data.extend_from_slice(message);
 
-        // Send and return count
-        if conn.send_broadcast_raw(&self.data, flags).is_ok() {
-            count
-        } else {
-            0
+        // Send and return count. One BROADCAST carries this event for every
+        // client in the buffer, so a failed send loses it for all of them.
+        match conn.send_broadcast_raw(&self.data, flags) {
+            Ok(()) => count,
+            Err(e) => {
+                crate::db::log_dropped_send(
+                    &format!("{} clients", count),
+                    "broadcast",
+                    flags & broadcast_flag::RELIABLE == 0,
+                    &e,
+                );
+                0
+            }
         }
     }
 }

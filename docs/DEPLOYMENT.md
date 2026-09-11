@@ -419,6 +419,10 @@ Every setting is an environment variable; `lark-server` additionally accepts eac
 | `LARK_WAL_SYNC_INTERVAL_MS` | `--wal-sync-interval-ms` | `2000` | How often buffered WAL writes flush to disk. `0` = flush before every write's ACK (synchronous; higher latency). See [Durability](#durability). |
 | `LARK_FSYNC_ON_WAL_FLUSH` | `--fsync-on-wal-flush` | `false` | `fdatasync` each WAL flush (`true`) vs. OS page cache only (`false`). Enable for durability across power loss. See [Durability](#durability). |
 | `LARK_MAX_SUBSCRIPTIONS_PER_CLIENT` | `--max-subscriptions-per-client` | `10000` | Max distinct listeners one client connection may hold on a database; further `SUBSCRIBE`s are NACKed with `too_many_subscriptions`. |
+| `LARK_MAX_TRANSACTION_OPS` | `--max-transaction-ops` | `1000` | Max operations in one transaction; larger transactions are NACKed with `payload_too_large`. |
+| `LARK_MAX_ON_DISCONNECT_ACTIONS_PER_CLIENT` | `--max-on-disconnect-actions-per-client` | `100` | Max onDisconnect actions one client connection may have registered at once; further registrations are NACKed with `payload_too_large`. |
+| `LARK_MAX_ON_DISCONNECT_BYTES_PER_CLIENT` | `--max-on-disconnect-bytes-per-client` | `1048576` | Max aggregate payload bytes across one client connection's onDisconnect actions. |
+| `LARK_MAX_RESPONSE_SIZE` | `--max-response-size` | `268435456` | Max bytes in one read response or initial subscription snapshot; larger reads are NACKed with `response_too_large`. The blob-subtree pre-check rejects at 1.5x this. |
 | `LARK_DB_BATCH_MAX_MESSAGES` | `--db-batch-max-messages` | `128` | Max inbox messages a database processes per scheduling slice before yielding to other databases on its core. |
 | `LARK_DB_BATCH_MAX_MS` | `--db-batch-max-ms` | `10` | Max milliseconds a database processes its inbox per slice before yielding (checked between messages). |
 | `LARK_BROADCAST_VIEWS_PER_BATCH` | `--broadcast-views-per-batch` | `10` | Affected views a write's broadcast fans out to before yielding. |
@@ -468,6 +472,10 @@ Because the interval is in-memory buffering (not batching for throughput on a si
 | `BATCH_FLUSH_INTERVAL` | `1` | Milliseconds between outbound batch flushes. |
 | `BATCH_MAX_SIZE` | `65536` | Bytes buffered before a forced flush. |
 | `BATCH_MAX_MESSAGES` | `100` | Messages buffered before a forced flush. |
+| `CLIENT_OUTBOX_MAX_BYTES` | `268435456` (256 MB) | Bytes the edge will queue for one client connection before dropping it. This is the buffer between the backend (which answers at memory speed) and a client draining at its own link speed, so it has to hold a full initial sync. A ceiling, not an allocation: memory is used only by what is actually queued. Kicks are logged at WARN with the reason `outbox full`. |
+| `CLIENT_OUTBOX_WARN_BYTES` | `67108864` (64 MB) | Queued bytes for one client at which a WARN (`Client outbox approaching limit`) is logged. If you see this in normal use, raise the cap before players hit it. |
+| `CLIENT_WRITE_DEADLINE` | `10s` | Base time one write to a client may take (Go duration). Fires only when the client has stopped taking bytes; a slow but draining client is never dropped by this. |
+| `CLIENT_WRITE_MIN_BYTES_PER_SEC` | `65536` | Added to the deadline per payload byte, so a large native-protocol frame gets proportionally longer (a 16 MB frame gets 10 s + 256 s at the default). Set to `0` to use the base deadline alone. |
 | `DEBUG` | `false` | Debug-level logging. |
 | `PPROF_ENABLED` | `false` | Start the `net/http/pprof` debug profiler. **Loopback only** (`127.0.0.1:6060`) and off by default, because it exposes heap dumps (which can hold secrets/tenant data) and an on-demand CPU profiler. To profile a remote node, enable it and SSH-tunnel or `fly proxy` to `6060`; never expose the port. |
 | `LOCAL_MODE` | `false` | **Dev only**: bypass the control-plane DB, use an in-memory backend (implies `DISABLE_TLS`). Enables open rules, hardcoded dev secrets, and the `owner` admin token. Refuses to start bound to a non-loopback address unless `LOCAL_MODE_ALLOW_PUBLIC_BIND=true`. |

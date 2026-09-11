@@ -453,11 +453,11 @@ func (c *Conn) dispatchClientMessage(msgType byte, clientID uint32, payload []by
 
 		reliable := dataPayload.Flags&FlagReliable != 0
 
-		// Non-blocking deliver to client outbox
-		// If false, client is too slow - disconnect them
+		// Non-blocking deliver to client outbox. If false the client's byte
+		// cap is exhausted: nothing can be dropped silently, so drop the
+		// client instead. Kick logs the reason and the queue depth.
 		if !client.Deliver(data, reliable) {
-			logger.Debug("Client outbox full, disconnecting", "server_id", c.backend.ServerID, "client_id", clientID)
-			client.Close()
+			client.Kick("outbox full", "message_bytes", len(data))
 		}
 
 	case MsgTypeClose:
@@ -478,8 +478,7 @@ func (c *Conn) deliverToClient(clientID uint32, data []byte, reliable bool) {
 	}
 
 	if !client.Deliver(data, reliable) {
-		logger.Debug("Client outbox full, disconnecting", "server_id", c.backend.ServerID, "client_id", clientID)
-		client.Close()
+		client.Kick("outbox full", "message_bytes", len(data))
 	}
 }
 

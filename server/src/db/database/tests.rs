@@ -481,7 +481,7 @@ fn test_on_disconnect_caps_per_client() {
         );
 
         // Register up to the per-client action-count cap — all accepted.
-        for i in 0..MAX_ON_DISCONNECT_ACTIONS_PER_CLIENT {
+        for i in 0..max_on_disconnect_actions_per_client() {
             let msg = ClientMessage {
                 path: Some(format!("/p{}", i)),
                 action: Some("s".to_string()),
@@ -513,7 +513,7 @@ fn test_on_disconnect_caps_per_client() {
         // A fresh client with a single oversized value trips the byte cap.
         let (conn2, _m2) = MockConnection::new();
         db.add_client_internal("client2", None, "conn2", conn2);
-        let big = "x".repeat(MAX_ON_DISCONNECT_BYTES_PER_CLIENT + 1);
+        let big = "x".repeat(max_on_disconnect_bytes_per_client() + 1);
         let msg = ClientMessage {
             path: Some("/big".to_string()),
             action: Some("s".to_string()),
@@ -1015,7 +1015,7 @@ fn test_transaction_op_count_cap() {
         db.add_client_internal("client1", None, "conn1", conn);
 
         // A transaction at the cap is accepted (open rules by default).
-        let ops_at_cap: Vec<_> = (0..MAX_TRANSACTION_OPS)
+        let ops_at_cap: Vec<_> = (0..max_transaction_ops())
             .map(|i| crate::protocol::TransactionOp {
                 op: "s".to_string(),
                 path: format!("/k{}", i),
@@ -1037,7 +1037,7 @@ fn test_transaction_op_count_cap() {
         );
 
         // One more op exceeds the cap → NACK PAYLOAD_TOO_LARGE.
-        let too_many: Vec<_> = (0..=MAX_TRANSACTION_OPS)
+        let too_many: Vec<_> = (0..=max_transaction_ops())
             .map(|i| crate::protocol::TransactionOp {
                 op: "s".to_string(),
                 path: format!("/k{}", i),

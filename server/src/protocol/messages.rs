@@ -207,8 +207,20 @@ pub const MAX_VOLATILE_WRITE_SIZE: usize = 2 * 1024;
 /// Maximum size for a single string value (10 MB)
 pub const MAX_STRING_SIZE: usize = 10 * 1024 * 1024;
 
-/// Maximum size for read responses (256 MB)
-pub const MAX_RESPONSE_SIZE: usize = 256 * 1024 * 1024;
+/// Maximum size for read responses and initial subscription snapshots.
+/// Default 256 MiB; override at startup via `set_max_response_size`
+/// (`LARK_MAX_RESPONSE_SIZE`). Clamped to >= 1. The blob-subtree pre-check in
+/// promotion derives its limit from this (1.5x), so the two move together.
+pub static MAX_RESPONSE_SIZE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(256 * 1024 * 1024);
+
+pub fn set_max_response_size(n: usize) {
+    MAX_RESPONSE_SIZE.store(n.max(1), std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn max_response_size() -> usize {
+    MAX_RESPONSE_SIZE.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Maximum nesting depth for JSON values (matches Firebase's 32-level limit).
 ///

@@ -107,7 +107,11 @@ func (t *WebTransportConn) sendReliable(data []byte) error {
 	lenBuf := make([]byte, 4)
 	binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
 
-	t.stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	deadline := defaultClientWriteDeadline
+	if t.client != nil {
+		deadline = t.client.WriteDeadline(len(data))
+	}
+	t.stream.SetWriteDeadline(time.Now().Add(deadline))
 
 	if _, err := t.stream.Write(lenBuf); err != nil {
 		return err

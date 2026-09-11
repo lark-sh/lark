@@ -36,6 +36,12 @@
 //   - BATCH_FLUSH_INTERVAL: Milliseconds between batch flushes (default: 1)
 //   - BATCH_MAX_SIZE: Bytes before forced flush (default: 65536)
 //
+// Client outbox (per-connection buffer between the backend and a slow client):
+//   - CLIENT_OUTBOX_MAX_BYTES: Bytes queued for one client before it is dropped (default: 256MB)
+//   - CLIENT_OUTBOX_WARN_BYTES: Bytes queued for one client before a WARN is logged (default: 64MB)
+//   - CLIENT_WRITE_DEADLINE: Base time allowed for one write to a client (default: 10s)
+//   - CLIENT_WRITE_MIN_BYTES_PER_SEC: Drain rate below which a client is considered dead (default: 65536)
+//
 // # Local Mode
 //
 // When LOCAL_MODE=true, the proxy runs without TLS (plain HTTP) and uses an
@@ -96,6 +102,23 @@ type Config struct {
 	BatchMaxSize       int // Max bytes before forced flush (default: 65536)
 	BatchMaxMessages   int // Max messages before forced flush (default: 100)
 
+	// Client outbox. Each client connection has a queue between the backend
+	// read loop (which serves every client on that backend connection and must
+	// never block) and the client's own socket. The queue is bounded by bytes,
+	// not messages: a message count says nothing about memory, and the Firebase
+	// transport splits large responses into 16KB frames that would exhaust a
+	// message cap during an ordinary initial sync.
+	ClientOutboxMaxBytes  int64 // Bytes queued for one client before it is dropped (default: 256MB)
+	ClientOutboxWarnBytes int64 // Bytes queued for one client before a WARN is logged (default: 64MB)
+
+	// Client write deadline. A single write to a client is allowed
+	// ClientWriteDeadline plus len(payload)/ClientWriteMinBytesPerSec, so a
+	// client that is still draining (however slowly) is never dropped for
+	// being slow, while a client that has stopped taking bytes is reaped
+	// after the base deadline.
+	ClientWriteDeadline       time.Duration // Base time allowed for one write (default: 10s)
+	ClientWriteMinBytesPerSec int64         // Drain rate below which a client is considered dead (default: 65536)
+
 	// Metrics aggregation
 	MetricsFlushInterval time.Duration // How often the aggregator flushes database_metrics (default: 3m)
 
@@ -153,6 +176,11 @@ func Load() (*Config, error) {
 		BatchMaxMessages:   getEnvInt("BATCH_MAX_MESSAGES", 100),
 
 		MetricsFlushInterval: getEnvDuration("METRICS_FLUSH_INTERVAL", 3*time.Minute),
+
+		ClientOutboxMaxBytes:      getEnvInt64("CLIENT_OUTBOX_MAX_BYTES", 256*1024*1024),
+		ClientOutboxWarnBytes:     getEnvInt64("CLIENT_OUTBOX_WARN_BYTES", 64*1024*1024),
+		ClientWriteDeadline:       getEnvDuration("CLIENT_WRITE_DEADLINE", 10*time.Second),
+		ClientWriteMinBytesPerSec: getEnvInt64("CLIENT_WRITE_MIN_BYTES_PER_SEC", 64*1024),
 
 		ConnectionsPerCore: getEnvInt("CONNECTIONS_PER_CORE", 2),
 
@@ -281,6 +309,15 @@ func getEnv(key, defaultVal string) string {
 func getEnvInt(key string, defaultVal int) int {
 	if val := os.Getenv(key); val != "" {
 		if i, err := strconv.Atoi(val); err == nil {
+			return i
+		}
+	}
+	return defaultVal
+}
+
+func getEnvInt64(key string, defaultVal int64) int64 {
+	if val := os.Getenv(key); val != "" {
+		if i, err := strconv.ParseInt(val, 10, 64); err == nil {
 			return i
 		}
 	}

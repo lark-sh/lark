@@ -106,10 +106,10 @@ impl Database {
                             .sum();
                         (actions.len(), bytes)
                     });
-                if existing_count >= MAX_ON_DISCONNECT_ACTIONS_PER_CLIENT
-                    || existing_bytes + new_bytes > MAX_ON_DISCONNECT_BYTES_PER_CLIENT
-                {
-                    debug!(
+                let max_actions = max_on_disconnect_actions_per_client();
+                let max_bytes = max_on_disconnect_bytes_per_client();
+                if existing_count >= max_actions || existing_bytes + new_bytes > max_bytes {
+                    warn!(
                         "NACK {}: onDisconnect rejected for client {} — at cap ({} actions / {} bytes)",
                         self.id, client_id, existing_count, existing_bytes
                     );
@@ -118,8 +118,7 @@ impl Database {
                         error::PAYLOAD_TOO_LARGE,
                         &format!(
                             "onDisconnect limit reached ({} actions or {} bytes per connection)",
-                            MAX_ON_DISCONNECT_ACTIONS_PER_CLIENT,
-                            MAX_ON_DISCONNECT_BYTES_PER_CLIENT
+                            max_actions, max_bytes
                         ),
                     ));
                 }
@@ -249,10 +248,7 @@ impl Database {
 
                 // Use try_send to avoid blocking the database task if client is slow
                 if let Err(e) = client.conn.try_send(data.into(), volatile, false) {
-                    trace!(
-                        "Failed to send to client {} (dropping message): {:?}",
-                        client_id, e
-                    );
+                    log_dropped_send(client_id, "response", volatile, &e);
                 }
             }
             Err(e) => {

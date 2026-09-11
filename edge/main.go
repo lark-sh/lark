@@ -299,6 +299,8 @@ func statsReporter(proxyServer *proxy.Server, pool *backend.Pool) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
+	const pressureEvery = 12 // 60s at a 5s tick
+	tick := 0
 	for range ticker.C {
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
@@ -310,12 +312,28 @@ func statsReporter(proxyServer *proxy.Server, pool *backend.Pool) {
 			queueInfo += fmt.Sprintf(" %s[inbox=%d/%d]", id, qs.InboxLen, qs.InboxCap)
 		}
 
+		outboxTotal, outboxMax, outboxMaxClient := proxyServer.OutboxStats()
+
 		logger.Debug("STATS",
 			"connections", proxyServer.ConnectionCount(),
 			"mem_mb", m.Alloc/1024/1024,
 			"goroutines", runtime.NumGoroutine(),
 			"queues", queueInfo,
+			"outbox_bytes_total", outboxTotal,
+			"outbox_bytes_max_client", outboxMax,
 		)
+
+		// The outbox gauges are the evidence for whether the per-client cap is
+		// ever approached in practice, so surface them at INFO once a minute
+		// whenever anything is queued at all (idle edges stay quiet).
+		tick++
+		if tick%pressureEvery == 0 && outboxTotal > 0 {
+			logger.Info("Client outbox usage",
+				"outbox_bytes_total", outboxTotal,
+				"outbox_bytes_max_client", outboxMax,
+				"max_client", outboxMaxClient.Describe(),
+			)
+		}
 	}
 }
 

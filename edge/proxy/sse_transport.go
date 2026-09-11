@@ -81,6 +81,7 @@ type SSETransport struct {
 	client     *ClientConn
 
 	eventCh   chan []byte   // All events streamed here
+	dropped   atomic.Int64  // Events dropped because eventCh was full
 	doneCh    chan struct{} // Closed when connection should end
 	closeOnce sync.Once
 
@@ -117,7 +118,13 @@ func (t *SSETransport) Send(data []byte, reliable bool) error {
 	select {
 	case t.eventCh <- data:
 	default:
-		// Buffer full, drop oldest and add new
+		// Buffer full, drop oldest and add new. The dropped event is gone
+		// for good, so say so: first drop at WARN, then every 1000th so a
+		// stuck stream doesn't flood the log.
+		if n := t.dropped.Add(1); n == 1 || n%1000 == 0 {
+			logger.Warn("SSE client too slow, dropping oldest event",
+				"dropped_total", n, "buffer", cap(t.eventCh))
+		}
 		select {
 		case <-t.eventCh:
 		default:

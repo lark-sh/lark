@@ -117,6 +117,35 @@ pub struct Args {
     )]
     pub max_subscriptions_per_client: usize,
 
+    /// Maximum operations in a single transaction. Exceeding it NACKs the
+    /// transaction with `payload_too_large`.
+    #[arg(long, default_value = "1000", env = "LARK_MAX_TRANSACTION_OPS")]
+    pub max_transaction_ops: usize,
+
+    /// Maximum onDisconnect actions one client connection may have registered
+    /// at once. Exceeding it NACKs the onDisconnect with `payload_too_large`.
+    #[arg(
+        long,
+        default_value = "100",
+        env = "LARK_MAX_ON_DISCONNECT_ACTIONS_PER_CLIENT"
+    )]
+    pub max_on_disconnect_actions_per_client: usize,
+
+    /// Maximum aggregate payload bytes across one client connection's
+    /// registered onDisconnect actions.
+    #[arg(
+        long,
+        default_value = "1048576",
+        env = "LARK_MAX_ON_DISCONNECT_BYTES_PER_CLIENT"
+    )]
+    pub max_on_disconnect_bytes_per_client: usize,
+
+    /// Maximum bytes in a single read response or initial subscription
+    /// snapshot. Exceeding it NACKs with `response_too_large`. The blob-subtree
+    /// pre-check uses 1.5x this value.
+    #[arg(long, default_value = "268435456", env = "LARK_MAX_RESPONSE_SIZE")]
+    pub max_response_size: usize,
+
     /// Maximum inbox messages a database processes per scheduling slice before
     /// yielding to other databases on the same core. Larger = more throughput
     /// for a hot database, less fairness for its neighbours.
@@ -252,6 +281,14 @@ fn main() {
     lark_server::db::set_wal_sync_interval_ms(args.wal_sync_interval_ms);
     lark_server::db::set_fsync_on_wal_flush(args.fsync_on_wal_flush);
     lark_server::db::set_max_subscriptions_per_client(args.max_subscriptions_per_client);
+    lark_server::db::set_max_transaction_ops(args.max_transaction_ops);
+    lark_server::db::set_max_on_disconnect_actions_per_client(
+        args.max_on_disconnect_actions_per_client,
+    );
+    lark_server::db::set_max_on_disconnect_bytes_per_client(
+        args.max_on_disconnect_bytes_per_client,
+    );
+    lark_server::protocol::set_max_response_size(args.max_response_size);
     lark_server::db::set_db_batch_max_messages(args.db_batch_max_messages);
     lark_server::db::set_db_batch_max_ms(args.db_batch_max_ms);
     lark_server::db::set_broadcast_views_per_batch(args.broadcast_views_per_batch);
