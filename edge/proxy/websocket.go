@@ -140,7 +140,19 @@ func (t *WebSocketTransport) ReadLoop() {
 	for {
 		_, message, err := t.conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+			// A browser that closes with one of these codes is reporting that
+			// *we* sent something it could not accept (a text frame that was
+			// not valid UTF-8, a frame too large, a protocol violation). That
+			// is a server bug and must be visible, unlike ordinary churn.
+			if websocket.IsCloseError(err,
+				websocket.CloseProtocolError,
+				websocket.CloseUnsupportedData,
+				websocket.CloseInvalidFramePayloadData,
+				websocket.CloseMessageTooBig,
+			) {
+				logger.Warn("Client closed connection reporting a protocol fault",
+					"client_id", t.client.id, "client", t.client.Describe(), "error", err)
+			} else if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				logger.Debug("WS read error", "client_id", t.client.id, "error", err)
 			}
 			return
