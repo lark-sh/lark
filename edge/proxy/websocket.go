@@ -19,6 +19,13 @@
 //   - Client has 60 seconds to respond with pong
 //   - Read deadline is reset on any message or pong
 //
+// # Write Deadline
+//
+// Each write gets CLIENT_WRITE_DEADLINE plus the payload's transfer time at
+// CLIENT_WRITE_MIN_BYTES_PER_SEC. The deadline fires only when the client has
+// stopped taking bytes, not when it is merely slow; the client's outbox (see
+// client.go) is what absorbs the gap between backend and client speed.
+//
 // # Long Polling → WebSocket Upgrade
 //
 // Firebase clients may start with Long Polling (if WebSocket previously failed)
@@ -85,8 +92,17 @@ func (t *WebSocketTransport) Send(data []byte, reliable bool) error {
 		return nil
 	}
 
-	t.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	t.conn.SetWriteDeadline(time.Now().Add(t.writeDeadline(len(data))))
 	return t.conn.WriteMessage(websocket.TextMessage, data)
+}
+
+// writeDeadline sizes the deadline to the payload so a slow-but-draining
+// client is never dropped mid-frame; see ClientConn.WriteDeadline.
+func (t *WebSocketTransport) writeDeadline(payloadLen int) time.Duration {
+	if t.client != nil {
+		return t.client.WriteDeadline(payloadLen)
+	}
+	return defaultClientWriteDeadline
 }
 
 // Close closes the connection
@@ -148,7 +164,7 @@ func (t *WebSocketTransport) pingLoop() {
 				t.writeMu.Unlock()
 				return
 			}
-			t.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			t.conn.SetWriteDeadline(time.Now().Add(t.writeDeadline(0)))
 			err := t.conn.WriteMessage(websocket.PingMessage, nil)
 			t.writeMu.Unlock()
 			if err != nil {

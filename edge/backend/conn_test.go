@@ -50,6 +50,10 @@ func (c *mockClient) Close() {
 	c.closed = true
 }
 
+func (c *mockClient) Kick(reason string, kvs ...interface{}) {
+	c.Close()
+}
+
 func (c *mockClient) getMessages() []mockDelivery {
 	c.mu.Lock()
 	defer c.mu.Unlock()

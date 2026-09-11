@@ -41,6 +41,7 @@ use futures::future::poll_immediate;
 use glommio::channels::local_channel::{self, LocalReceiver, LocalSender};
 use glommio::timer::Timer;
 use serde_json::Value;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::storage::glommio_blob_io::GlommioBlobIO;
@@ -523,19 +524,48 @@ const MAX_DATABASE_SIZE_BYTES: u64 = 1024 * 1024 * 1024 * 1024; // 1 TiB
 /// triggers a `promote_path_deep` (blob read + WAL replay) on the database's
 /// single-threaded inbox, so an unbounded count lets one ~16 MB request serialize
 /// many disk round trips and stall every client on the database. This is a generous DoS rail well
-/// under the 16 MB message ceiling (audit M-2).
-const MAX_TRANSACTION_OPS: usize = 1_000;
+/// under the 16 MB message ceiling (audit M-2). Default 1,000; override at
+/// startup via `set_max_transaction_ops` (`LARK_MAX_TRANSACTION_OPS`). Clamped to >= 1.
+pub static MAX_TRANSACTION_OPS: AtomicUsize = AtomicUsize::new(1_000);
+
+pub fn set_max_transaction_ops(n: usize) {
+    MAX_TRANSACTION_OPS.store(n.max(1), Ordering::SeqCst);
+}
+
+pub fn max_transaction_ops() -> usize {
+    MAX_TRANSACTION_OPS.load(Ordering::Relaxed)
+}
 
 /// Maximum number of onDisconnect actions a single client connection may have
 /// registered at once. They accumulate in memory until the client disconnects,
 /// so an unbounded count is an asymmetric per-connection memory sink whose OOM
 /// would abort the whole core (every tenant on the node). See audit M-3.
-const MAX_ON_DISCONNECT_ACTIONS_PER_CLIENT: usize = 100;
+/// Default 100; override at startup via `set_max_on_disconnect_actions_per_client`
+/// (`LARK_MAX_ON_DISCONNECT_ACTIONS_PER_CLIENT`). Clamped to >= 1.
+pub static MAX_ON_DISCONNECT_ACTIONS_PER_CLIENT: AtomicUsize = AtomicUsize::new(100);
+
+pub fn set_max_on_disconnect_actions_per_client(n: usize) {
+    MAX_ON_DISCONNECT_ACTIONS_PER_CLIENT.store(n.max(1), Ordering::SeqCst);
+}
+
+pub fn max_on_disconnect_actions_per_client() -> usize {
+    MAX_ON_DISCONNECT_ACTIONS_PER_CLIENT.load(Ordering::Relaxed)
+}
 
 /// Maximum aggregate payload bytes across a single client's registered
 /// onDisconnect actions. Mirrors Firebase's documented 1 MB event-size limit and
-/// bounds the memory one connection can pin. See audit M-3.
-const MAX_ON_DISCONNECT_BYTES_PER_CLIENT: usize = 1024 * 1024;
+/// bounds the memory one connection can pin. See audit M-3. Default 1 MiB;
+/// override at startup via `set_max_on_disconnect_bytes_per_client`
+/// (`LARK_MAX_ON_DISCONNECT_BYTES_PER_CLIENT`). Clamped to >= 1.
+pub static MAX_ON_DISCONNECT_BYTES_PER_CLIENT: AtomicUsize = AtomicUsize::new(1024 * 1024);
+
+pub fn set_max_on_disconnect_bytes_per_client(n: usize) {
+    MAX_ON_DISCONNECT_BYTES_PER_CLIENT.store(n.max(1), Ordering::SeqCst);
+}
+
+pub fn max_on_disconnect_bytes_per_client() -> usize {
+    MAX_ON_DISCONNECT_BYTES_PER_CLIENT.load(Ordering::Relaxed)
+}
 
 /// Rough in-memory byte estimate for a JSON value. Used only to bound aggregate
 /// onDisconnect payload per client — approximate is fine, it just needs to be
@@ -670,6 +700,40 @@ pub trait ConnectionSender {
 pub enum SendError {
     Closed,
     BufferFull,
+}
+
+/// Count of reliable messages dropped because a client's send buffer was full.
+/// Drives the throttling in [`log_dropped_send`].
+static DROPPED_SENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Log a failed `try_send` to a client at the right level.
+///
+/// A reliable message that fails with `BufferFull` is lost for good: the
+/// client's view of the data is now wrong until it reconnects. That must show
+/// up in the logs, so it is logged at `warn` (the first drop, then every
+/// 1000th, so a wedged link cannot flood the log). `Closed` means the client
+/// already left, and a volatile drop is by design; both stay at `trace`.
+pub fn log_dropped_send(client_id: &str, context: &str, volatile: bool, err: &SendError) {
+    match err {
+        SendError::BufferFull if !volatile => {
+            let n = DROPPED_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n == 1 || n.is_multiple_of(1000) {
+                warn!(
+                    "Dropped reliable message to client {} ({}): send buffer full (total dropped: {})",
+                    client_id, context, n
+                );
+            } else {
+                trace!(
+                    "Dropped reliable message to client {} ({}): send buffer full",
+                    client_id, context
+                );
+            }
+        }
+        _ => trace!(
+            "Failed to send to client {} ({}), dropping message: {:?}",
+            client_id, context, err
+        ),
+    }
 }
 
 /// Client info tracked by the database.

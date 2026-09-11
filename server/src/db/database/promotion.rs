@@ -102,7 +102,7 @@ impl Database {
 
         match session.navigate(&blob_path).await {
             Ok(location) => {
-                let limit = crate::protocol::MAX_RESPONSE_SIZE as u64 * 3 / 2;
+                let limit = crate::protocol::max_response_size() as u64 * 3 / 2;
                 if location.subtree_size > limit {
                     warn!(
                         "[Size Check] {}: blob subtree at {} is {} bytes (limit {}), rejecting before promotion",

@@ -106,6 +106,11 @@ type Client interface {
 	// Safe to call multiple times (subsequent calls are no-ops).
 	// Must not block; actual cleanup can happen asynchronously.
 	Close()
+
+	// Kick terminates the connection because the edge chose to drop it (an
+	// artificial limit was hit) and logs the reason at WARN with the client's
+	// context. Same guarantees as Close.
+	Kick(reason string, kvs ...interface{})
 }
 
 // ConfigProvider is the interface for database operations the pool needs.

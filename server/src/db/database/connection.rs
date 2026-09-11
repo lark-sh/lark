@@ -80,18 +80,19 @@ impl Database {
         // path (blob read + WAL replay) on this database's single inbox, so an
         // oversized transaction would serialize many disk round trips and stall
         // every client on the database. See audit M-2.
-        if operations.len() > MAX_TRANSACTION_OPS {
-            debug!(
+        let max_ops = max_transaction_ops();
+        if operations.len() > max_ops {
+            warn!(
                 "NACK {}: transaction has {} ops, exceeds cap {}",
                 self.id,
                 operations.len(),
-                MAX_TRANSACTION_OPS
+                max_ops
             );
             self.record_nacked_write(client_id, request_id);
             return Some(ServerMessage::nack(
                 request_id,
                 error::PAYLOAD_TOO_LARGE,
-                &format!("transaction exceeds {} operations", MAX_TRANSACTION_OPS),
+                &format!("transaction exceeds {} operations", max_ops),
             ));
         }
 

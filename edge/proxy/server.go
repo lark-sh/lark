@@ -83,10 +83,13 @@ type Server struct {
 	authValidator *auth.MultiValidator
 
 	// Client tracking
-	clients   sync.Map // clientID -> *ClientConn
-	nextID    atomic.Uint32
-	freeIDs   []uint32 // recycled client IDs
-	freeIDsMu sync.Mutex
+	clients sync.Map // clientID -> *ClientConn
+	// Bytes queued in client outboxes across the whole edge. Maintained by
+	// ClientConn.Deliver/popOutbox/Close; read by OutboxStats.
+	outboxBytesTotal atomic.Int64
+	nextID           atomic.Uint32
+	freeIDs          []uint32 // recycled client IDs
+	freeIDsMu        sync.Mutex
 
 	// Connection metrics (for proxy_metrics emission)
 	wsConnections  atomic.Int32 // WebSocket connections
@@ -215,7 +218,9 @@ func (n *clientNotifier) OnBackendDisconnected(serverID string) {
 	})
 
 	if len(toClose) > 0 {
-		logger.Debug("Closing clients for disconnected backend", "count", len(toClose), "server_id", serverID)
+		// One WARN for the event rather than one per client: the backend is
+		// what failed, and the count is the useful number.
+		logger.Warn("Dropping clients for disconnected backend", "count", len(toClose), "server_id", serverID)
 		for _, client := range toClose {
 			client.Close()
 		}
@@ -667,6 +672,24 @@ func (s *Server) unregisterClient(client *ClientConn) {
 }
 
 // ConnectionCount returns the number of active connections
+// OutboxStats reports how many bytes are queued in client outboxes across the
+// edge, and the single largest client queue with the client holding it. This
+// is the gauge for deciding whether the per-client cap is ever approached in
+// practice; there is deliberately no edge-wide limit, so this is observation
+// only.
+func (s *Server) OutboxStats() (totalBytes, maxClientBytes int64, maxClient *ClientConn) {
+	totalBytes = s.outboxBytesTotal.Load()
+	s.clients.Range(func(_, value interface{}) bool {
+		client := value.(*ClientConn)
+		if queued, _ := client.OutboxBytes(); queued > maxClientBytes {
+			maxClientBytes = queued
+			maxClient = client
+		}
+		return true
+	})
+	return totalBytes, maxClientBytes, maxClient
+}
+
 func (s *Server) ConnectionCount() int {
 	count := 0
 	s.clients.Range(func(key, value interface{}) bool {
