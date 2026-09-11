@@ -8,6 +8,8 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 
 ### Fixed
 
+- Firebase-protocol responses over 16 KB were split into frames at byte offsets, so a multi-byte character (an em dash, a bullet, any non-ASCII text) landing on a 16,384-byte boundary produced a frame that was not valid UTF-8 on its own. Browsers fail the whole WebSocket on such a frame (close code 1007), and because the client then reconnected and re-requested the same data, any database containing such a character at that position could never finish loading. Frames are now split only at character boundaries. The edge also logs a WARN when a client closes with a protocol-fault code, since that always indicates a server-side bug.
+- The server rejected inbound Firebase frames over 16,384 bytes, but the Firebase JS SDK splits at 16,384 UTF-16 code units, so a large write containing non-ASCII text could be refused as malformed. The inbound cap is now three bytes per unit.
 - The edge dropped clients whose per-connection outbox exceeded 1000 messages. Firebase-protocol responses are split into 16 KB frames, so a client loading a large database on an ordinary connection could exhaust the count mid-sync, be disconnected, reconnect, re-issue every query, and loop forever without ever finishing. The outbox is now bounded by bytes (`CLIENT_OUTBOX_MAX_BYTES`, default 256 MB) rather than by message count.
 - The edge's flat 10-second write deadline could drop a native-protocol client on a slow link while it was still receiving a single large frame. The deadline now scales with payload size (`CLIENT_WRITE_DEADLINE` + payload / `CLIENT_WRITE_MIN_BYTES_PER_SEC`), so it only fires when a client has stopped taking bytes.
 

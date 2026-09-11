@@ -25,9 +25,19 @@ use std::sync::atomic::{AtomicI64, Ordering};
 // Constants
 // =============================================================================
 
-/// Maximum size of a single WebSocket frame.
+/// Maximum size of a single outbound WebSocket frame, in bytes.
 /// Messages larger than this are split into multiple frames with a count prefix.
+/// Frames are split only at UTF-8 character boundaries: each frame is its own
+/// WebSocket text message, and browsers fail the whole connection (close code
+/// 1007) on a text frame that is not valid UTF-8 on its own. A frame may
+/// therefore be up to 3 bytes short of this size.
 pub const FIREBASE_MAX_FRAME_SIZE: usize = 16384; // 16KB, matches Firebase SDK
+
+/// Maximum size of a single *inbound* data frame, in bytes. The Firebase JS
+/// SDK splits outgoing strings at 16384 UTF-16 code units, not bytes, so a
+/// legitimate frame carrying non-ASCII text can be up to three bytes per unit
+/// once encoded as UTF-8.
+pub const FIREBASE_MAX_INBOUND_FRAME_BYTES: usize = 3 * FIREBASE_MAX_FRAME_SIZE;
 
 /// Maximum number of frames allowed in a multi-frame message.
 /// 16KB per frame × 1024 frames = 16MB max message (matches MAX_WRITE_SIZE).
@@ -37,13 +47,11 @@ pub const MAX_FRAMES: usize = 1024;
 /// Maximum total bytes allowed across all frames of a single reassembled
 /// message: 16KB × 1024 = 16MB.
 ///
-/// The operative bound is the per-frame cap in `handle_incoming_frame`: with
-/// every inbound frame held to FIREBASE_MAX_FRAME_SIZE and the frame *count*
-/// held to MAX_FRAMES, total reassembly is already bounded to 16MB. This
-/// cumulative check is defense-in-depth — it keeps the 16MB ceiling intact if
-/// MAX_FRAMES is ever raised or the per-frame check is weakened, decoupling the
-/// memory bound from the frame count. Without any byte cap, inbound frame size
-/// is otherwise limited only by the proxy's 257MB MAX_MESSAGE_SIZE.
+/// This is the operative memory bound for reassembly. The per-frame cap in
+/// `handle_incoming_frame` allows up to FIREBASE_MAX_INBOUND_FRAME_BYTES per
+/// frame (three bytes per UTF-16 unit for non-ASCII text), so frame count
+/// alone would admit 48MB; this cumulative check holds the total to the 16MB
+/// write ceiling regardless of how the bytes are spread across frames.
 pub const MAX_REASSEMBLED_SIZE: usize = MAX_FRAMES * FIREBASE_MAX_FRAME_SIZE;
 
 // =============================================================================
@@ -392,17 +400,17 @@ impl FirebaseAdapter {
         frame: &[u8],
     ) -> Result<(Option<ClientMessage>, Option<Vec<u8>>), String> {
         // While reassembling a multi-frame message, enforce the per-frame size
-        // cap before allocating anything. A legitimate Firebase data frame is
-        // never larger than FIREBASE_MAX_FRAME_SIZE (the SDK splits on exactly
-        // that boundary), so an oversized inbound frame is either malformed or
-        // an amplification attempt — reject it and drop the partial message
-        // rather than copy it into `self.frames`.
-        if self.frame_count > 0 && frame.len() > FIREBASE_MAX_FRAME_SIZE {
+        // cap before allocating anything. The SDK splits at 16384 UTF-16 code
+        // units, so a legitimate data frame is never larger than
+        // FIREBASE_MAX_INBOUND_FRAME_BYTES once UTF-8 encoded; an inbound frame
+        // beyond that is either malformed or an amplification attempt — reject
+        // it and drop the partial message rather than copy it into `self.frames`.
+        if self.frame_count > 0 && frame.len() > FIREBASE_MAX_INBOUND_FRAME_BYTES {
             self.reset_frame_state();
             return Err(format!(
                 "inbound frame size {} exceeds maximum allowed ({})",
                 frame.len(),
-                FIREBASE_MAX_FRAME_SIZE
+                FIREBASE_MAX_INBOUND_FRAME_BYTES
             ));
         }
 
@@ -1194,13 +1202,40 @@ fn apply_query_params(msg: &mut ClientMessage, q: &FirebaseQuery) {
     }
 }
 
-/// Split data into chunks of at most chunk_size bytes.
+/// Split data into chunks of at most chunk_size bytes, never cutting a UTF-8
+/// character in half.
+///
+/// Each chunk becomes a standalone WebSocket text frame. A frame whose last
+/// bytes are the leading half of a multi-byte character is not valid UTF-8 on
+/// its own, and browsers respond by failing the entire connection (close code
+/// 1007) rather than delivering the frame — so a single em dash or bullet
+/// landing on a 16KB boundary would disconnect the client mid-sync. The chunk
+/// end is backed up to the nearest character boundary (a byte that is not a
+/// UTF-8 continuation byte), which costs at most 3 bytes per frame. Data that
+/// is not valid UTF-8 at all falls back to a plain byte split.
 fn split_into_chunks(data: &[u8], chunk_size: usize) -> Vec<Vec<u8>> {
     if data.len() <= chunk_size {
         return vec![data.to_vec()];
     }
 
-    data.chunks(chunk_size).map(|c| c.to_vec()).collect()
+    let mut chunks = Vec::with_capacity(data.len() / chunk_size + 2);
+    let mut start = 0;
+    while start < data.len() {
+        let limit = (start + chunk_size).min(data.len());
+        let mut end = limit;
+        // A continuation byte is 0b10xxxxxx; the character it belongs to
+        // started earlier, so move the cut back until we're at a lead byte.
+        while end > start && end < data.len() && (data[end] & 0xC0) == 0x80 {
+            end -= 1;
+        }
+        if end == start {
+            // No boundary within the whole chunk: not UTF-8. Cut on bytes.
+            end = limit;
+        }
+        chunks.push(data[start..end].to_vec());
+        start = end;
+    }
+    chunks
 }
 
 /// Global counter for session ID generation (fallback).
@@ -1515,10 +1550,10 @@ mod tests {
         // Enter multi-frame mode expecting 2 frames.
         adapter.handle_incoming_frame(b"2").unwrap();
 
-        // A single inbound data frame larger than FIREBASE_MAX_FRAME_SIZE must
-        // be rejected before it is copied into the accumulator — the SDK never
-        // produces a data frame this large.
-        let oversized = vec![b'x'; FIREBASE_MAX_FRAME_SIZE + 1];
+        // A single inbound data frame larger than FIREBASE_MAX_INBOUND_FRAME_BYTES
+        // must be rejected before it is copied into the accumulator — the SDK
+        // never produces a data frame this large.
+        let oversized = vec![b'x'; FIREBASE_MAX_INBOUND_FRAME_BYTES + 1];
         let err = adapter.handle_incoming_frame(&oversized).unwrap_err();
         assert!(err.contains("inbound frame size"));
 
@@ -1563,7 +1598,7 @@ mod tests {
 
         // Trip the per-frame cap.
         adapter.handle_incoming_frame(b"2").unwrap();
-        let oversized = vec![b'x'; FIREBASE_MAX_FRAME_SIZE + 1];
+        let oversized = vec![b'x'; FIREBASE_MAX_INBOUND_FRAME_BYTES + 1];
         assert!(adapter.handle_incoming_frame(&oversized).is_err());
 
         // A normal multi-frame message must still reassemble cleanly afterward.
@@ -1582,13 +1617,79 @@ mod tests {
 
     #[test]
     fn test_split_into_chunks() {
-        let data = vec![1u8; 40000]; // 40KB
+        let data = vec![b'x'; 40000]; // 40KB of ASCII
         let chunks = split_into_chunks(&data, FIREBASE_MAX_FRAME_SIZE);
 
         assert_eq!(chunks.len(), 3); // 16KB + 16KB + 8KB
         assert_eq!(chunks[0].len(), FIREBASE_MAX_FRAME_SIZE);
         assert_eq!(chunks[1].len(), FIREBASE_MAX_FRAME_SIZE);
         assert_eq!(chunks[2].len(), 40000 - 2 * FIREBASE_MAX_FRAME_SIZE);
+    }
+
+    #[test]
+    fn test_split_into_chunks_never_cuts_a_utf8_character() {
+        // Place a 3-byte character (em dash, E2 80 94) so it straddles the
+        // 16384-byte boundary: bytes 16383..16386. A byte split would leave
+        // the first frame ending in E2 and the second starting with 80 94,
+        // neither of which is valid UTF-8 on its own.
+        let mut text = String::with_capacity(40000);
+        text.push_str(&"x".repeat(16383));
+        text.push('—');
+        text.push_str(&"y".repeat(20000));
+        let data = text.as_bytes();
+        assert_eq!(&data[16383..16386], "—".as_bytes());
+
+        let chunks = split_into_chunks(data, FIREBASE_MAX_FRAME_SIZE);
+
+        // Every frame is valid UTF-8 and within the size cap.
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(c.len() <= FIREBASE_MAX_FRAME_SIZE, "chunk {} too large", i);
+            assert!(
+                std::str::from_utf8(c).is_ok(),
+                "chunk {} is not valid UTF-8 on its own",
+                i
+            );
+        }
+        // The first frame stopped just short of the boundary to keep the
+        // character whole.
+        assert_eq!(chunks[0].len(), 16383);
+        assert_eq!(&chunks[1][..3], "—".as_bytes());
+
+        // Reassembly is lossless.
+        let joined: Vec<u8> = chunks.concat();
+        assert_eq!(joined, data);
+    }
+
+    #[test]
+    fn test_split_into_chunks_dense_multibyte_text() {
+        // Every character is 3 bytes, so no boundary is ever a multiple of
+        // 16384. Each frame must still be valid and reassemble losslessly.
+        let text = "•".repeat(20000); // 60000 bytes
+        let data = text.as_bytes();
+        let chunks = split_into_chunks(data, FIREBASE_MAX_FRAME_SIZE);
+        for c in &chunks {
+            assert!(c.len() <= FIREBASE_MAX_FRAME_SIZE);
+            assert!(std::str::from_utf8(c).is_ok());
+            assert!(c.len() >= FIREBASE_MAX_FRAME_SIZE - 2 || c.len() == data.len() % 16383);
+        }
+        assert_eq!(chunks.concat(), data);
+    }
+
+    #[test]
+    fn test_inbound_frame_may_exceed_16kb_bytes_for_non_ascii() {
+        // The SDK splits at 16384 UTF-16 units; a frame of 16384 three-byte
+        // characters is 49152 bytes and must be accepted.
+        let mut adapter = FirebaseAdapter::new("proj", "host");
+        adapter.handle_incoming_frame(b"2").unwrap();
+        let frame = "•".repeat(FIREBASE_MAX_FRAME_SIZE);
+        assert_eq!(frame.len(), FIREBASE_MAX_INBOUND_FRAME_BYTES);
+        let result = adapter.handle_incoming_frame(frame.as_bytes());
+        assert!(
+            result.is_ok(),
+            "legit non-ASCII frame rejected: {:?}",
+            result
+        );
+        assert_eq!(adapter.frame_count, 2);
     }
 
     // ==========================================================================
