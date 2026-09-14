@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"errors"
 	"sync"
 	"testing"
@@ -359,5 +360,54 @@ func TestDeliverAfterCloseIsRefused(t *testing.T) {
 	}
 	if got := server.outboxBytesTotal.Load(); got != 0 {
 		t.Fatalf("server total=%d after Deliver-after-Close, want 0", got)
+	}
+}
+
+func TestFirebaseInvalidUTF8FrameKicksClient(t *testing.T) {
+	transport := NewMockTransport(backend.ProtocolWebSocket)
+	client := newTestClient(1, transport, ProtocolFirebase)
+	done := make(chan struct{})
+	go func() {
+		client.writeLoop()
+		close(done)
+	}()
+	// A 3-byte character cut after its first byte, the way a byte-offset
+	// split or a reused buffer would produce.
+	client.Deliver([]byte("{\"d\":\"abc\xe2"), true)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("writeLoop should exit after kicking on an invalid frame")
+	}
+	if transport.MessageCount() != 0 {
+		t.Fatalf("invalid frame must not be sent, got %d messages", transport.MessageCount())
+	}
+	if !transport.IsClosed() {
+		t.Fatal("client should be closed after an invalid frame")
+	}
+}
+
+func TestLarkProtocolFramesAreNotUTF8Checked(t *testing.T) {
+	transport := NewMockTransport(backend.ProtocolWebSocket)
+	client := newTestClient(1, transport, ProtocolLark)
+	go client.writeLoop()
+	client.Deliver([]byte{0xff, 0xfe}, true)
+	deadline := time.Now().Add(2 * time.Second)
+	for transport.MessageCount() < 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if transport.MessageCount() != 1 {
+		t.Fatal("Lark-protocol frame should be sent as-is")
+	}
+	client.Close()
+}
+
+func TestInvalidUTF8Context(t *testing.T) {
+	if got := invalidUTF8Context([]byte("all good")); got != "" {
+		t.Fatalf("valid data should yield empty context, got %q", got)
+	}
+	got := invalidUTF8Context([]byte("abc\xe2def"))
+	if got == "" || !bytes.Contains([]byte(got), []byte("offset=3")) {
+		t.Fatalf("context should name offset 3, got %q", got)
 	}
 }

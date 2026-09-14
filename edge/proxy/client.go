@@ -92,6 +92,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bytedance/sonic"
 
@@ -430,6 +431,16 @@ func (c *ClientConn) writeLoop() {
 			}
 		}
 
+		// Every frame to a Firebase client is a WebSocket text message and
+		// must be valid UTF-8 on its own; a browser fails the whole socket
+		// (close 1007) on one that is not, with nothing in our logs. Catch
+		// it here, say exactly which bytes were bad, and drop the client
+		// ourselves so the failure is attributed and visible.
+		if c.protocol == ProtocolFirebase && !utf8.Valid(msg.data) {
+			c.Kick("invalid utf-8 frame", "frame_bytes", len(msg.data), "context", invalidUTF8Context(msg.data))
+			return
+		}
+
 		if err := c.transport.Send(msg.data, msg.reliable); err != nil {
 			var netErr net.Error
 			if errors.As(err, &netErr) && netErr.Timeout() {
@@ -530,6 +541,36 @@ func (c *ClientConn) Kick(reason string, kvs ...interface{}) {
 	logger.Warn("Client dropped", args...)
 
 	c.Close()
+}
+
+// invalidUTF8Context describes the first invalid byte sequence in data for a
+// log line: its offset, a hex dump around it, and the printable prefix of the
+// frame so the message can be identified.
+func invalidUTF8Context(data []byte) string {
+	bad := -1
+	for i := 0; i < len(data); {
+		r, size := utf8.DecodeRune(data[i:])
+		if r == utf8.RuneError && size <= 1 {
+			bad = i
+			break
+		}
+		i += size
+	}
+	if bad < 0 {
+		return ""
+	}
+	lo, hi := bad-16, bad+16
+	if lo < 0 {
+		lo = 0
+	}
+	if hi > len(data) {
+		hi = len(data)
+	}
+	prefix := data
+	if len(prefix) > 80 {
+		prefix = prefix[:80]
+	}
+	return fmt.Sprintf("offset=%d hex[%d:%d]=%x prefix=%q", bad, lo, hi, data[lo:hi], prefix)
 }
 
 // Describe returns a short "id/protocol/project/database" label for logs.

@@ -1303,3 +1303,63 @@ func BenchmarkCompressedMultiDispatch(b *testing.B) {
 		conn.handleCompressedMulti(wireData)
 	}
 }
+
+// aliasingClient keeps the exact slice it was handed, the way the real
+// ClientConn.Deliver does, so a test can detect a payload that still points
+// into a buffer the caller goes on to reuse.
+type aliasingClient struct {
+	mu       sync.Mutex
+	payloads [][]byte
+}
+
+func (c *aliasingClient) Deliver(payload []byte, reliable bool) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.payloads = append(c.payloads, payload)
+	return true
+}
+func (c *aliasingClient) Close()                                 {}
+func (c *aliasingClient) Kick(reason string, kvs ...interface{}) {}
+
+type aliasingRegistry struct{ client *aliasingClient }
+
+func (r *aliasingRegistry) GetClient(clientID uint32) Client {
+	if clientID == 7 {
+		return r.client
+	}
+	return nil
+}
+
+// A broadcast's message bytes must not alias the read buffer: the read loop
+// shifts and refills that buffer as soon as it moves on, while the queued
+// message is sent later by the client's write goroutine. This was the cause of
+// browsers receiving binary garbage as a text frame under backlog.
+func TestBroadcastDoesNotAliasReadBuffer(t *testing.T) {
+	client := &aliasingClient{}
+
+	pool := NewPool(1, "test-secret")
+	pool.SetClientRegistry(&aliasingRegistry{client: client})
+	defer pool.Close()
+	conn := &Conn{backend: &Backend{ServerID: "test", pool: pool}}
+
+	message := []byte(`{"t":"d","d":{"a":"m","b":{"p":"x","d":{"k":"v"}}}}`)
+	// [Type][Flags][Payload], exactly as the read loop slices it out of its
+	// buffer (the 4-byte length prefix already stripped).
+	body := createBroadcastMessage([]BroadcastClient{{ID: 7, Tag: 0}}, message, BroadcastFlagReliable)
+
+	conn.handleBroadcast(body)
+
+	// The read loop reuses its buffer: overwrite what handleBroadcast saw.
+	for i := range body {
+		body[i] = 0xFF
+	}
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.payloads) != 1 {
+		t.Fatalf("expected 1 delivery, got %d", len(client.payloads))
+	}
+	if !bytes.Equal(client.payloads[0], message) {
+		t.Fatalf("delivered payload was corrupted by buffer reuse: %q", client.payloads[0])
+	}
+}
