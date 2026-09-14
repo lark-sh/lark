@@ -384,18 +384,27 @@ func (c *Conn) handleBroadcast(data []byte) {
 		return
 	}
 
-	// Get the message bytes
-	msgBytes := broadcast.Message
-
-	// --- Stage 3: Decompression (future) ---
-	// When COMPRESSED flag is set, decompress msgBytes before fan-out
+	// Get the message bytes. `data` is a window into the read loop's reusable
+	// buffer, and broadcast.Message aliases it. Deliver queues the slice for a
+	// write goroutine to send later, by which time the buffer has been shifted
+	// or refilled with the next batch of wire bytes. An uncompressed broadcast
+	// to an untagged client used to be queued without a copy, so under backlog
+	// the frame that eventually reached the browser was whatever binary
+	// happened to occupy those bytes — browsers fail the whole WebSocket on a
+	// text frame that is not UTF-8 (close 1007). Decompression and tag
+	// insertion both allocate fresh slices; this copy covers the remaining
+	// path. One copy per broadcast, shared read-only by every recipient.
+	var msgBytes []byte
 	if flags&BroadcastFlagCompressed != 0 {
-		decompressed, err := zstdDecoder.DecodeAll(msgBytes, nil)
+		decompressed, err := zstdDecoder.DecodeAll(broadcast.Message, nil)
 		if err != nil {
 			logger.Error("Failed to decompress BROADCAST message", "server_id", c.backend.ServerID, "error", err)
 			return
 		}
 		msgBytes = decompressed
+	} else {
+		msgBytes = make([]byte, len(broadcast.Message))
+		copy(msgBytes, broadcast.Message)
 	}
 
 	reliable := flags&BroadcastFlagReliable != 0
