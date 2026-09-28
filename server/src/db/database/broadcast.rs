@@ -230,11 +230,18 @@ impl Database {
         }
     }
 
+    /// Encode `msg` and send it to `client_id`.
+    ///
+    /// `request_path` is the path of the client request this message answers,
+    /// if any. It is only used to diagnose encode failures: responses such as
+    /// once() results carry no path of their own, so without it the warning
+    /// can't say which read went wrong.
     pub(super) async fn send_to_client(
         &self,
         client_id: &str,
         msg: &ServerMessage,
         volatile: bool,
+        request_path: Option<&str>,
     ) {
         let client = match self.clients.get(client_id) {
             Some(c) => c,
@@ -269,7 +276,7 @@ impl Database {
                         Some(crate::protocol::MessageValue::Arc(v)) => v.find_first_sentinel_path(),
                         _ => None,
                     });
-                let req_path = msg.path.as_deref().unwrap_or("");
+                let req_path = request_path.or(msg.path.as_deref()).unwrap_or("");
                 let req_id = msg.request_id().unwrap_or("");
                 warn!(
                     "Database {} failed to encode message for client {} (req_id={}, req_path={:?}, sentinel_at={:?}): {}",

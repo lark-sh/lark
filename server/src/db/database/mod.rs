@@ -223,7 +223,8 @@ struct PromotionSnapshot {
 }
 
 /// Canonical form for path-keyed maps inside `Database` (`WalIndex.by_path`,
-/// `Database.promoted_paths`, and any future map keyed by tree path).
+/// `Database.promoted_paths`, `Database.sentinel_paths`, and any future map
+/// keyed by tree path).
 ///
 /// Callers reach these maps from two worlds with different leading-slash
 /// conventions:
@@ -245,14 +246,20 @@ struct PromotionSnapshot {
 /// `promoted_paths` had the same shape (a path could end up tracked under
 /// both forms — only a perf regression, but worth keeping clean).
 ///
-/// Canonical form: **leading slash present** (root is `"/"`). This matches
-/// `sentinel_paths`'s convention and the prefix-based descendant scans that
-/// build `format!("{}/", path)` from a key in `promoted_paths` to find
-/// related sentinel-tracking entries — those scans assume the key already
-/// has a leading slash, so a no-slash canonical form here would silently
-/// miss every descendant during eviction cleanup.
+/// `sentinel_paths` had the same shape with a worse outcome: a rules-driven
+/// shallow promotion of `C` recorded its Sentinel children as `C/graphics`,
+/// so a later read of `/C` found nothing tracked, skipped deep promotion, and
+/// tried to serialize the Sentinels.
+///
+/// Canonical form: **leading slash present, no trailing slash** (root is
+/// `"/"`). The prefix-based descendant scans build `format!("{}/", path)`
+/// from a key, so they need the leading slash to find anything, and a
+/// trailing slash (`/C/` is a valid wire path) would turn the scan prefix
+/// into `/C//` and miss every descendant. Trimming both ends matches how
+/// `Path::parse` reads the same string, so a key always names the same tree
+/// node the path does.
 fn normalize_path_key(path: &str) -> String {
-    let trimmed = path.trim_start_matches('/');
+    let trimmed = path.trim_matches('/');
     if trimmed.is_empty() {
         "/".to_string()
     } else {

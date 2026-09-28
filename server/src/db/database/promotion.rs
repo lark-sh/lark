@@ -364,7 +364,7 @@ impl Database {
                     // can spend a slot here without exhausting.
                     self.promoted_paths
                         .insert(normalize_path_key(path), Instant::now());
-                    self.sentinel_paths.remove(path);
+                    self.sentinel_paths.remove(&normalize_path_key(path));
                     self.promotion_stats.record(
                         promote_start.elapsed(),
                         read_start.elapsed(),
@@ -477,11 +477,17 @@ impl Database {
         // `<cid>` and violate the I3 invariant (`sentinel_paths` must be a
         // superset of every Sentinel actually in the tree). Clear the old
         // subtree's entries and walk the full new value.
+        //
+        // The walk's prefix must be canonical: the rules-eval retry loop
+        // promotes paths like `C` (no leading slash), and collecting under
+        // that prefix would record `C/graphics` while every lookup asks for
+        // `/C/graphics`.
         self.remove_sentinel_paths_below(path);
-        let mut prefix = if path == "/" {
+        let canonical = normalize_path_key(path);
+        let mut prefix = if canonical == "/" {
             String::new()
         } else {
-            path.to_string()
+            canonical
         };
         Self::collect_sentinel_paths(&promoted_value, &mut prefix, &mut self.sentinel_paths);
 
