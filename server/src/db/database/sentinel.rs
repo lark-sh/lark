@@ -105,9 +105,11 @@ impl Database {
 
     /// Check if there are any sentinels at or below `path` in the tree.
     /// O(log n) BTreeSet range query instead of O(tree_size) recursive walk.
+    /// `path` may be in any form `Path::parse` accepts (`C`, `/C/`, ...).
     pub(super) fn has_sentinel_at_or_below(&self, path: &str) -> bool {
+        let path = normalize_path_key(path);
         // Exact match
-        if self.sentinel_paths.contains(path) {
+        if self.sentinel_paths.contains(&path) {
             return true;
         }
         // Check for any descendant: entries starting with "{path}/"
@@ -150,8 +152,10 @@ impl Database {
 
     /// Remove sentinel tracking for a path and all its descendants (range removal).
     /// Used after deep/unchecked promotion replaces a full subtree with real data.
+    /// `path` may be in any form `Path::parse` accepts (`C`, `/C/`, ...).
     pub(super) fn remove_sentinel_paths_below(&mut self, path: &str) {
-        self.sentinel_paths.remove(path);
+        let path = normalize_path_key(path);
+        self.sentinel_paths.remove(&path);
         if path == "/" {
             self.sentinel_paths.clear();
         } else {

@@ -3526,3 +3526,94 @@ fn test_drain_inbox_with_error_disconnects_pending_clients() {
         );
     })
 }
+
+/// Regression: a rules-driven promotion recorded Sentinel children under
+/// non-canonical keys, so a read of the same node served them unpromoted.
+///
+/// The rules-eval retry loop promotes `NeedsPromotion.path`, which has no
+/// leading slash (`C`). `promote_path_shallow` installed `/C` as an Object
+/// with Sentinel children and recorded them as `C/graphics`, `C/paths`. The
+/// once() handler then asked `has_sentinel_at_or_below("/C")`, found nothing,
+/// skipped deep promotion, and failed to encode the response ("attempted to
+/// serialize ArcValue::Sentinel"). Seen in production as REST GETs of a
+/// campaign node failing with `sentinel_at=Some("/graphics")` and friends.
+#[test]
+fn test_rules_promotion_tracks_sentinel_children_canonically() {
+    block_on(async {
+        let (mut db, _dir) = make_blob_backed_db(json!({
+            "C": {"name": "camp", "graphics": {"g1": {"x": 1}}, "paths": {"p1": {"y": 2}}}
+        }))
+        .await;
+        let rules = crate::rules::parse_rules(&json!({
+            "rules": {"$c": {".read": "data.exists()"}}
+        }))
+        .unwrap();
+        db.set_rules(rules);
+        let (conn, _messages) = MockConnection::new();
+        db.add_client_internal("client1", None, "conn1", conn);
+
+        let msg = ClientMessage {
+            op: "o".to_string(),
+            path: Some("/C".to_string()),
+            request_id: Some("r1".to_string()),
+            ..Default::default()
+        };
+        let resp = db.handle_once("client1", &msg).await.unwrap();
+        assert!(
+            resp.nack.is_none(),
+            "once() should succeed, got: {:?}",
+            resp
+        );
+        assert!(
+            resp.encode().is_ok(),
+            "once() response must not contain Sentinels"
+        );
+        assert_eq!(
+            resp.once_value.map(|v| v.to_value()),
+            Some(json!({"name": "camp", "graphics": {"g1": {"x": 1}}, "paths": {"p1": {"y": 2}}}))
+        );
+        let violations = db.find_sentinel_tracking_violations();
+        assert!(
+            violations.is_empty(),
+            "untracked Sentinels: {:?}",
+            violations
+        );
+    })
+}
+
+/// Regression: a read path with a trailing slash (`/C/`, valid on the wire)
+/// skipped deep promotion. `has_sentinel_at_or_below("/C/")` looked for
+/// `/C/` and `/C//...`, missed the tracked `/C/graphics`, and the response
+/// carried the Sentinel.
+#[test]
+fn test_trailing_slash_read_promotes_sentinel_children() {
+    block_on(async {
+        let (mut db, _dir) = make_blob_backed_db(json!({
+            "C": {"name": "camp", "graphics": {"g1": {"x": 1}}}
+        }))
+        .await;
+        let (conn, _messages) = MockConnection::new();
+        db.add_client_internal("client1", None, "conn1", conn);
+
+        // Shallow promotion leaves /C/graphics as a (tracked) Sentinel.
+        db.promote_path("/C").await.unwrap();
+        assert!(db.has_sentinel_at_or_below("/C/"));
+
+        let msg = ClientMessage {
+            op: "o".to_string(),
+            path: Some("/C/".to_string()),
+            request_id: Some("r1".to_string()),
+            ..Default::default()
+        };
+        let resp = db.handle_once("client1", &msg).await.unwrap();
+        assert!(
+            resp.nack.is_none(),
+            "once() should succeed, got: {:?}",
+            resp
+        );
+        assert_eq!(
+            resp.once_value.map(|v| v.to_value()),
+            Some(json!({"name": "camp", "graphics": {"g1": {"x": 1}}}))
+        );
+    })
+}

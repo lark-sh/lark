@@ -196,7 +196,8 @@ impl Database {
             event_msg.tag = Some(tag);
         }
 
-        self.send_to_client(client_id, &event_msg, false).await;
+        self.send_to_client(client_id, &event_msg, false, Some(path_str))
+            .await;
 
         // Now send ack
         Some(ServerMessage::ack(request_id))

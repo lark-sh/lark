@@ -486,7 +486,8 @@ impl Database {
 
         // Send response
         if let Some(resp) = response {
-            self.send_to_client(client_id, &resp, false).await;
+            self.send_to_client(client_id, &resp, false, msg.path.as_deref())
+                .await;
         }
     }
 }
