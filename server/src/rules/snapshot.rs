@@ -724,20 +724,17 @@ impl SnapshotTrait for LazyUpdateSnapshot {
 
     fn exists(&self) -> Result<bool, NeedsPromotion> {
         match self.region() {
-            UpdateRegion::AtUpdateLeaf { value } => Ok(!value.is_null()),
+            UpdateRegion::AtUpdateLeaf { value } => Ok(json_exists(value)),
             UpdateRegion::InsideUpdateValue { value, trailing } => {
-                Ok(matches!(descend_into(value, trailing), Some(v) if !v.is_null()))
+                Ok(descend_into(value, trailing).is_some_and(json_exists))
             }
             UpdateRegion::Overlay => {
-                // Exists if either the tree has the path OR any update
-                // writes a non-null value at-or-below view_path.
-                self.check_tree_promotion(&self.view_path)?;
-                if self.tree.node_exists(&self.view_path) {
-                    return Ok(true);
-                }
+                // Exists if any update writes a non-null value at-or-below
+                // view_path OR the tree has the path. Updates are checked
+                // first so a write's ancestors resolve without tree access.
                 let view = self.view_path.as_str();
                 for (key, value) in self.updates.iter() {
-                    if value.is_null() {
+                    if !json_exists(value) {
                         continue;
                     }
                     let full = self.full_update_path(key);
@@ -748,7 +745,8 @@ impl SnapshotTrait for LazyUpdateSnapshot {
                         return Ok(true);
                     }
                 }
-                Ok(false)
+                self.check_tree_promotion(&self.view_path)?;
+                Ok(self.tree.node_exists(&self.view_path))
             }
             UpdateRegion::TreeOnly => {
                 self.check_tree_promotion(&self.view_path)?;
@@ -1114,6 +1112,16 @@ impl NewData {
         }
 
         by_child.into_iter().collect()
+    }
+}
+
+/// Whether a written value leaves data behind: null, and objects whose
+/// children are all null, store nothing.
+fn json_exists(value: &JsonValue) -> bool {
+    match value {
+        JsonValue::Null => false,
+        JsonValue::Object(map) => map.values().any(json_exists),
+        _ => true,
     }
 }
 

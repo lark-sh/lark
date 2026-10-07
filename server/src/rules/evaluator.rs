@@ -170,6 +170,13 @@ impl Evaluator {
         let segments: Vec<&str> = parse_path(&ctx.path);
         let (nodes, captures) = rules.find_rules_on_path(&segments);
 
+        // A delete arrives with no `new_data`; it is a write of null, so
+        // `newData` at the deleted path is an empty snapshot.
+        let new_data = ctx
+            .new_data
+            .clone()
+            .unwrap_or_else(|| NewData::from_set(ctx.path.clone(), JsonValue::Null));
+
         // Check .write rules (cascading - any true grants access)
         // Each rule at level N is evaluated with data/newData at level N
         let mut write_allowed = false;
@@ -198,7 +205,7 @@ impl Evaluator {
                 // across every level; the level snapshot is built lazily by
                 // `eval_expr` at the level's `ctx.path`.
                 let ancestor_new_data = if write_expr.uses_new_data {
-                    ctx.new_data.clone()
+                    Some(new_data.clone())
                 } else {
                     None
                 };
@@ -227,53 +234,67 @@ impl Evaluator {
             return Ok(false);
         }
 
-        // Check .validate rules (non-cascading - all must pass)
-        // Skip validation entirely for deletes (new_data is None)
-        if ctx.new_data.is_some() {
-            for (node_idx, node) in nodes.iter().enumerate() {
-                if let Some(ref validate_expr) = node.validate {
-                    // Compute context at this level (same logic as .write)
-                    let ancestor_segments = if node_idx == 0 {
-                        &segments[0..0]
-                    } else {
-                        &segments[0..node_idx]
-                    };
+        // Check .validate rules (non-cascading - all must pass). A level
+        // whose newData is null (deleted) skips its .validate.
+        for (node_idx, node) in nodes.iter().enumerate() {
+            if let Some(ref validate_expr) = node.validate {
+                // Compute context at this level (same logic as .write)
+                let ancestor_segments = if node_idx == 0 {
+                    &segments[0..0]
+                } else {
+                    &segments[0..node_idx]
+                };
 
-                    let ancestor_path = if ancestor_segments.is_empty() {
-                        String::new()
-                    } else {
-                        format!("/{}", ancestor_segments.join("/"))
-                    };
+                let ancestor_path = if ancestor_segments.is_empty() {
+                    String::new()
+                } else {
+                    format!("/{}", ancestor_segments.join("/"))
+                };
 
-                    // Same lazy carry as the .write cascade above.
-                    let ancestor_new_data = if validate_expr.uses_new_data {
-                        ctx.new_data.clone()
-                    } else {
-                        None
-                    };
+                if !self.new_data_exists(&new_data, ctx, &ancestor_path)? {
+                    continue;
+                }
 
-                    let level_ctx = RulesContext {
-                        auth: ctx.auth.clone(),
-                        root_tree: ctx.root_tree.clone(),
-                        path: ancestor_path,
-                        new_data: ancestor_new_data,
-                        is_volatile: ctx.is_volatile,
-                        database_id: ctx.database_id.clone(),
-                        project_id: ctx.project_id.clone(),
-                        query: ctx.query.clone(),
-                    };
+                // Same lazy carry as the .write cascade above.
+                let ancestor_new_data = if validate_expr.uses_new_data {
+                    Some(new_data.clone())
+                } else {
+                    None
+                };
 
-                    let valid = self.eval_expr(validate_expr, &level_ctx, &captures)?;
-                    if !valid {
-                        return Ok(false);
-                    }
+                let level_ctx = RulesContext {
+                    auth: ctx.auth.clone(),
+                    root_tree: ctx.root_tree.clone(),
+                    path: ancestor_path,
+                    new_data: ancestor_new_data,
+                    is_volatile: ctx.is_volatile,
+                    database_id: ctx.database_id.clone(),
+                    project_id: ctx.project_id.clone(),
+                    query: ctx.query.clone(),
+                };
+
+                let valid = self.eval_expr(validate_expr, &level_ctx, &captures)?;
+                if !valid {
+                    return Ok(false);
                 }
             }
+        }
 
-            // Also validate all children being written — but only if there are
-            // .validate rules somewhere below the deepest matched rule node.
-            let has_validate_below = nodes.last().is_some_and(|n| n.has_validate_below);
-            if has_validate_below && !self.validate_children(ctx, &segments, &captures)? {
+        // Also validate all children being written — but only if there are
+        // .validate rules somewhere below the deepest matched rule node.
+        let has_validate_below = nodes.last().is_some_and(|n| n.has_validate_below);
+        if has_validate_below {
+            let write_ctx = RulesContext {
+                auth: ctx.auth.clone(),
+                root_tree: ctx.root_tree.clone(),
+                path: ctx.path.clone(),
+                new_data: Some(new_data.clone()),
+                is_volatile: ctx.is_volatile,
+                database_id: ctx.database_id.clone(),
+                project_id: ctx.project_id.clone(),
+                query: ctx.query.clone(),
+            };
+            if !self.validate_children(&write_ctx, &new_data, &segments, &captures)? {
                 return Ok(false);
             }
         }
@@ -292,9 +313,14 @@ impl Evaluator {
     /// multi-path UPDATE case (e.g. `{"a/b": v1, "a/c": v2}` produces a
     /// single `("a", {b: v1, c: v2})` entry whose recursion validates
     /// `b` and `c` as nested writes).
+    ///
+    /// `full_new_data` is the whole write; it decides whether a child's
+    /// newData is null (deleted), in which case the child and everything
+    /// beneath it skip `.validate`.
     fn validate_children(
         &self,
         ctx: &RulesContext,
+        full_new_data: &NewData,
         path_segments: &[&str],
         captures: &HashMap<String, String>,
     ) -> Result<bool, NeedsPromotion> {
@@ -334,6 +360,10 @@ impl Evaluator {
             };
 
             if let Some(child_rule_node) = child_node {
+                if !self.new_data_exists(full_new_data, ctx, &child_path)? {
+                    continue;
+                }
+
                 if let Some(ref validate_expr) = child_rule_node.validate {
                     let child_ctx = RulesContext {
                         auth: ctx.auth.clone(),
@@ -365,7 +395,12 @@ impl Evaluator {
                         query: ctx.query.clone(),
                     };
 
-                    if !self.validate_children(&child_ctx, &child_segments, &child_captures)? {
+                    if !self.validate_children(
+                        &child_ctx,
+                        full_new_data,
+                        &child_segments,
+                        &child_captures,
+                    )? {
                         return Ok(false);
                     }
                 }
@@ -373,6 +408,17 @@ impl Evaluator {
         }
 
         Ok(true)
+    }
+
+    /// Returns whether `new_data` leaves a non-null value at `path`.
+    fn new_data_exists(
+        &self,
+        new_data: &NewData,
+        ctx: &RulesContext,
+        path: &str,
+    ) -> Result<bool, NeedsPromotion> {
+        let tree = ctx.root_tree.clone().unwrap_or_else(|| Arc::new(EmptyTree));
+        new_data.snapshot_at(tree, path).exists()
     }
 
     /// Evaluates a compiled expression with the given context.
