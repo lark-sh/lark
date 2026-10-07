@@ -911,6 +911,276 @@ fn test_validate_rules_skipped_for_delete() {
     });
 }
 
+/// Test that a multi-path UPDATE nulling several validated nodes succeeds.
+/// Each nulled node has a newData of null, so its .validate is skipped —
+/// the same as a remove() of each path.
+#[test]
+fn test_validate_rules_skipped_for_multi_path_update_nulls() {
+    run_test(|| async {
+        let server = TestServer::new();
+
+        server
+            .set_rules(
+                "validate-multi-null-db",
+                json!({
+                    "rules": {
+                        ".read": true,
+                        ".write": true,
+                        "characters": {
+                            "$id": { ".validate": "newData.hasChildren(['name', 'level'])" }
+                        },
+                        "names": {
+                            "$id": { ".validate": "newData.isString()" }
+                        },
+                        "stats": {
+                            "$id": {
+                                ".validate": "newData.hasChild('hp')",
+                                "hp": { ".validate": "newData.isNumber()" }
+                            }
+                        }
+                    }
+                }),
+            )
+            .expect("Failed to set rules");
+
+        let mut client = server.client();
+        client.connect("validate-multi-null-db").await;
+
+        client
+            .update(
+                "/",
+                json!({
+                    "characters/c1": {"name": "Ada", "level": 3},
+                    "names/c1": "Ada",
+                    "stats/c1": {"hp": 10},
+                    "stats/c2": {"hp": 7}
+                }),
+            )
+            .await
+            .expect("Creating character should succeed");
+
+        let result = client
+            .update(
+                "/",
+                json!({
+                    "characters/c1": null,
+                    "names/c1": null,
+                    "stats/c1": null
+                }),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "Multi-path null UPDATE should succeed - .validate skipped for null. Error: {:?}",
+            result.err()
+        );
+
+        assert_eq!(client.once("/characters").await.unwrap(), json!(null));
+        assert_eq!(client.once("/names").await.unwrap(), json!(null));
+        assert_eq!(
+            client.once("/stats").await.unwrap(),
+            json!({"c2": {"hp": 7}})
+        );
+    });
+}
+
+/// Test that SET of null to a validated path skips .validate, like remove().
+#[test]
+fn test_validate_rules_skipped_for_set_null() {
+    run_test(|| async {
+        let server = TestServer::new();
+
+        server
+            .set_rules(
+                "validate-set-null-db",
+                json!({
+                    "rules": {
+                        ".read": true,
+                        ".write": true,
+                        "widget": {
+                            ".validate": "newData.hasChildren(['color', 'size'])",
+                            "size": { ".validate": "newData.isNumber()" }
+                        }
+                    }
+                }),
+            )
+            .expect("Failed to set rules");
+
+        let mut client = server.client();
+        client.connect("validate-set-null-db").await;
+
+        client
+            .set("/widget", json!({"size": 50, "color": "blue"}))
+            .await
+            .expect("Creating widget should succeed");
+
+        let result = client.set("/widget", json!(null)).await;
+        assert!(
+            result.is_ok(),
+            "SET null should succeed - .validate skipped for null. Error: {:?}",
+            result.err()
+        );
+        assert_eq!(client.once("/widget").await.unwrap(), json!(null));
+    });
+}
+
+/// Test that nulling a required child is still denied by the parent's
+/// .validate: the parent's newData is non-null and lacks the child.
+#[test]
+fn test_validate_null_child_still_checks_non_null_parent() {
+    run_test(|| async {
+        let server = TestServer::new();
+
+        server
+            .set_rules(
+                "validate-null-child-db",
+                json!({
+                    "rules": {
+                        ".read": true,
+                        ".write": true,
+                        "widget": {
+                            ".validate": "newData.hasChildren(['color', 'size'])",
+                            "size": { ".validate": "newData.isNumber()" }
+                        }
+                    }
+                }),
+            )
+            .expect("Failed to set rules");
+
+        let mut client = server.client();
+        client.connect("validate-null-child-db").await;
+
+        client
+            .set("/widget", json!({"size": 50, "color": "blue"}))
+            .await
+            .expect("Creating widget should succeed");
+
+        let result = client.update("/widget", json!({"size": null})).await;
+        assert!(
+            result.is_err(),
+            "Nulling required child via UPDATE should be denied"
+        );
+
+        let result = client.update("/", json!({"widget/size": null})).await;
+        assert!(
+            result.is_err(),
+            "Nulling required child via multi-path UPDATE should be denied"
+        );
+
+        let result = client.set("/widget/size", json!(null)).await;
+        assert!(
+            result.is_err(),
+            "Nulling required child via SET should be denied"
+        );
+
+        let result = client.remove("/widget/size").await;
+        assert!(result.is_err(), "Removing required child should be denied");
+
+        assert_eq!(
+            client.once("/widget").await.unwrap(),
+            json!({"size": 50, "color": "blue"})
+        );
+    });
+}
+
+/// Test that a delete's newData is an empty snapshot, so a delete-only
+/// .write rule allows remove() and SET null but not other writes.
+#[test]
+fn test_write_rule_sees_null_new_data_on_delete() {
+    run_test(|| async {
+        let server = TestServer::new();
+
+        server
+            .set_rules(
+                "write-delete-only-db",
+                json!({
+                    "rules": {
+                        ".read": true,
+                        "inbox": {
+                            "$msg": { ".write": "data.exists() && !newData.exists()" }
+                        }
+                    }
+                }),
+            )
+            .expect("Failed to set rules");
+
+        let mut client = server.client();
+        client
+            .connect_as_admin("write-delete-only-db", "admin")
+            .await;
+        client
+            .set("/inbox", json!({"m1": "hi", "m2": "yo"}))
+            .await
+            .expect("Admin seed should succeed");
+
+        let mut client = server.client();
+        client.connect("write-delete-only-db").await;
+
+        let result = client.set("/inbox/m1", json!("edited")).await;
+        assert!(result.is_err(), "Non-null write should be denied");
+
+        let result = client.remove("/inbox/m1").await;
+        assert!(
+            result.is_ok(),
+            "remove() should satisfy !newData.exists(). Error: {:?}",
+            result.err()
+        );
+
+        let result = client.set("/inbox/m2", json!(null)).await;
+        assert!(
+            result.is_ok(),
+            "SET null should satisfy !newData.exists(). Error: {:?}",
+            result.err()
+        );
+
+        assert_eq!(client.once("/inbox").await.unwrap(), json!(null));
+    });
+}
+
+/// Test that a multi-path UPDATE below a validated node evaluates that
+/// node's .validate against the merged newData, including untouched
+/// siblings already in the tree.
+#[test]
+fn test_validate_multi_path_update_sees_tree_siblings() {
+    run_test(|| async {
+        let server = TestServer::new();
+
+        server
+            .set_rules(
+                "validate-multi-siblings-db",
+                json!({
+                    "rules": {
+                        ".read": true,
+                        ".write": true,
+                        "widget": {
+                            ".validate": "newData.hasChildren(['color', 'size'])"
+                        }
+                    }
+                }),
+            )
+            .expect("Failed to set rules");
+
+        let mut client = server.client();
+        client.connect("validate-multi-siblings-db").await;
+
+        client
+            .set("/widget", json!({"size": 50, "color": "blue"}))
+            .await
+            .expect("Creating widget should succeed");
+
+        let result = client.update("/", json!({"widget/size": 60})).await;
+        assert!(
+            result.is_ok(),
+            "Multi-path UPDATE should see existing color sibling. Error: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            client.once("/widget").await.unwrap(),
+            json!({"size": 60, "color": "blue"})
+        );
+    });
+}
+
 /// Test that all .validate rules in the hierarchy must pass.
 /// Writing to a child must satisfy parent's .validate as well.
 #[test]
