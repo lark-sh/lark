@@ -20,12 +20,12 @@ use crate::transport::protocol::ProjectConfig;
 use crate::transport::proxy::{
     ConnectResult, ProxyAuthInfo, ProxyHandler, SendError, UnloadNotification, VirtualClient,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
 
 // =============================================================================
@@ -122,8 +122,13 @@ pub struct CoreHandler {
     /// reason on its notification.
     evicted_databases: RefCell<std::collections::HashSet<String>>,
 
-    /// Whether shutdown has been requested
+    /// Whether shutdown has been requested. While set, new connections are
+    /// refused and databases that stop report `unload_reason::SHUTDOWN`.
     shutting_down: RefCell<bool>,
+
+    /// Database tasks on this core whose `run()` has not returned yet.
+    /// Shutdown waits on this to know every final WAL sync has finished.
+    running_databases: Cell<usize>,
 
     /// Pending database unload notifications to send to proxy
     pending_unloads: RefCell<Vec<UnloadNotification>>,
@@ -166,6 +171,7 @@ impl CoreHandler {
             client_databases: RefCell::new(HashMap::new()),
             evicted_databases: RefCell::new(std::collections::HashSet::new()),
             shutting_down: RefCell::new(false),
+            running_databases: Cell::new(0),
             pending_unloads: RefCell::new(Vec::new()),
             compaction_tx,
             metrics_tx,
@@ -281,9 +287,13 @@ impl CoreHandler {
         let data_dir_for_marker = self.config.data_dir.clone();
         let self_clone = self.clone();
 
+        self.running_databases.set(self.running_databases.get() + 1);
         glommio::spawn_local(async move {
             db.run().await;
             debug!("Database {} stopped", database_id_owned);
+            self_clone
+                .running_databases
+                .set(self_clone.running_databases.get() - 1);
 
             // Remove from registry (handle_evict_database may have already done
             // this; remove is idempotent).
@@ -297,10 +307,12 @@ impl CoreHandler {
                 .evicted_databases
                 .borrow_mut()
                 .remove(&database_id_owned);
-            let reason = if was_evicted {
-                unload_reason::EXPLICIT_EVICTION
+            let (reason, reason_name) = if was_evicted {
+                (unload_reason::EXPLICIT_EVICTION, "EXPLICIT_EVICTION")
+            } else if *self_clone.shutting_down.borrow() {
+                (unload_reason::SHUTDOWN, "SHUTDOWN")
             } else {
-                unload_reason::IDLE
+                (unload_reason::IDLE, "IDLE")
             };
 
             self_clone
@@ -314,12 +326,7 @@ impl CoreHandler {
                 });
             debug!(
                 "Queued DATABASE_UNLOADED notification for {} (reason={})",
-                database_id_owned,
-                if was_evicted {
-                    "EXPLICIT_EVICTION"
-                } else {
-                    "IDLE"
-                }
+                database_id_owned, reason_name
             );
 
             // Note: We no longer create segmentation markers on eviction.
@@ -693,6 +700,73 @@ impl CoreHandler {
         );
     }
 
+    /// Stop every database on this core and wait, up to `timeout`, for each to
+    /// finish its final WAL sync and close. Returns once all have stopped or the
+    /// timeout passes.
+    ///
+    /// Dropping a database's handle is what stops it: its run loop sees the
+    /// last external handle gone, exits, and flushes the WAL on the way out.
+    /// Connected clients are closed and new connections refused, so no write
+    /// is acknowledged after its database has started shutting down.
+    pub async fn shutdown(&self, timeout: Duration) {
+        *self.shutting_down.borrow_mut() = true;
+
+        let handles: Vec<DatabaseHandle> = self
+            .databases
+            .borrow_mut()
+            .drain()
+            .map(|(_, h)| h)
+            .collect();
+        let clients: Vec<Rc<VirtualClient>> = self
+            .client_databases
+            .borrow_mut()
+            .drain()
+            .map(|(_, (_, client))| client)
+            .collect();
+        let pending: Vec<PendingConnect> = self
+            .pending_configs
+            .borrow_mut()
+            .drain()
+            .flat_map(|(_, list)| list)
+            .collect();
+        self.pending_client_messages.borrow_mut().clear();
+        self.pending_client_auth.borrow_mut().clear();
+
+        let stopping = handles.len();
+        if stopping > 0 {
+            info!(
+                "Core {} shutting down: stopping {} databases, closing {} clients",
+                self.config.core_id,
+                stopping,
+                clients.len() + pending.len()
+            );
+        }
+        drop(handles);
+        for client in clients.iter().chain(pending.iter().map(|pc| &pc.client)) {
+            client.close();
+        }
+
+        let started = Instant::now();
+        while self.running_databases.get() > 0 && started.elapsed() < timeout {
+            glommio::timer::Timer::new(Duration::from_millis(10)).await;
+        }
+
+        let still_running = self.running_databases.get();
+        if still_running > 0 {
+            warn!(
+                "Core {} shutdown timed out after {:?} with {} databases still running; \
+                 their unflushed writes are lost",
+                self.config.core_id, timeout, still_running
+            );
+        } else if stopping > 0 {
+            info!(
+                "Core {} databases stopped and flushed in {:?}",
+                self.config.core_id,
+                started.elapsed()
+            );
+        }
+    }
+
     /// Handle shutdown request.
     pub fn handle_shutdown(&self, _grace_period_secs: u32) {
         *self.shutting_down.borrow_mut() = true;
@@ -703,6 +777,17 @@ impl CoreHandler {
     /// Process a client connect after config is available.
     /// Returns (project_id, database_id) if a new database was created.
     fn process_connect(self: &Rc<Self>, client: Rc<VirtualClient>) -> Option<(String, String)> {
+        if *self.shutting_down.borrow() {
+            debug!("Rejecting client {} - server is shutting down", client.id);
+            if let Ok(data) =
+                ServerMessage::nack("", error::UNAVAILABLE, "server is shutting down").encode()
+            {
+                let _ = client.try_send(data.into(), false);
+            }
+            client.close();
+            return None;
+        }
+
         let database_id = if client.project_id.is_empty() {
             client.database_id.clone()
         } else {
@@ -1723,6 +1808,44 @@ mod tests {
                 );
                 assert!(handler.client_databases.borrow().contains_key(&client.id));
                 assert!(handler.databases.borrow().contains_key("my-project/room-a"));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_shutdown_stops_databases_and_refuses_new_connects() {
+        glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+            .spawn(|| async {
+                let handler = make_test_handler();
+                let client = Rc::new(VirtualClient::new_for_test(1, "my-project", "room-a"));
+                ProxyHandler::on_connect(&handler, client.clone());
+                assert_eq!(handler.running_databases.get(), 1);
+
+                handler.shutdown(Duration::from_secs(5)).await;
+
+                assert_eq!(
+                    handler.running_databases.get(),
+                    0,
+                    "shutdown should wait for the database task to finish"
+                );
+                assert!(handler.databases.borrow().is_empty());
+                assert!(handler.client_databases.borrow().is_empty());
+                let unloads = handler.pending_unloads.borrow();
+                assert_eq!(unloads.len(), 1);
+                assert_eq!(
+                    unloads[0].reason,
+                    crate::transport::protocol::unload_reason::SHUTDOWN
+                );
+                drop(unloads);
+
+                // A connect after shutdown must not start a new database.
+                let late = Rc::new(VirtualClient::new_for_test(2, "my-project", "room-b"));
+                let result = ProxyHandler::on_connect(&handler, late);
+                assert!(result.database_loaded.is_none());
+                assert!(handler.databases.borrow().is_empty());
+                assert_eq!(handler.running_databases.get(), 0);
             })
             .unwrap()
             .join()

@@ -11,6 +11,7 @@ use lark_server::server::{CoreHandler, CoreHandlerConfig};
 use lark_server::storage::StorageWorker;
 use lark_server::transport::proxy::ProxyListener;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -18,6 +19,14 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// JSON line per emit (~60s); a few thousand slots is ample headroom while
 /// capping memory if the shipper stalls (excess samples are dropped, not queued).
 const METRICS_CHANNEL_CAPACITY: usize = 4096;
+
+/// How long a core waits for its databases to flush and stop after SIGTERM or
+/// SIGINT before exiting anyway. Kept under the 10s Docker and Kubernetes give
+/// a container between SIGTERM and SIGKILL.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Set by the signal thread on the first SIGTERM or SIGINT; each core polls it.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Lark - Fast Multiplayer Database Server (Rust + Glommio)
 #[derive(Parser, Debug, Clone)]
@@ -220,6 +229,10 @@ fn validate_server_secret(secret: &str) -> Result<(), String> {
 }
 
 fn main() {
+    // Must run before any other thread exists, so every thread inherits the
+    // blocked signal mask and SIGTERM/SIGINT reach only the signal thread.
+    let shutdown_signals = block_shutdown_signals();
+
     // Initialize logging
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
@@ -322,6 +335,8 @@ fn main() {
         (false, _) => None,
     };
 
+    spawn_signal_thread(shutdown_signals);
+
     // Run the executor pool
     let pool = ExecutorPool::new(pool_config);
     pool.run(move |core_id, nr_cores, config| {
@@ -333,6 +348,57 @@ fn main() {
     });
 
     tracing::info!("Server stopped");
+}
+
+/// Block SIGTERM and SIGINT on the calling thread and return the set. Threads
+/// spawned afterwards inherit the mask, so the signals stay pending until the
+/// signal thread takes them with `sigwait` (this also works when the server
+/// runs as PID 1 in a container, where unhandled SIGTERM would be ignored).
+fn block_shutdown_signals() -> libc::sigset_t {
+    // SAFETY: sigset_t is plain data initialized by sigemptyset before use, and
+    // pthread_sigmask only changes the calling thread's mask.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        let rc = libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        assert_eq!(rc, 0, "pthread_sigmask failed");
+        set
+    }
+}
+
+/// Wait for SIGTERM/SIGINT. The first starts a graceful shutdown: every core
+/// stops its databases, which flush their WALs before the process exits. A
+/// second signal exits immediately without waiting for the flush.
+fn spawn_signal_thread(set: libc::sigset_t) {
+    std::thread::Builder::new()
+        .name("lark-signals".to_string())
+        .spawn(move || {
+            let mut sig: libc::c_int = 0;
+            // SAFETY: `set` was built by block_shutdown_signals and those
+            // signals are blocked on every thread, as sigwait requires.
+            if unsafe { libc::sigwait(&set, &mut sig) } != 0 {
+                tracing::error!("sigwait failed; SIGTERM will not shut down gracefully");
+                return;
+            }
+            tracing::info!(
+                "Received signal {}, flushing databases and shutting down (up to {:?})",
+                sig,
+                SHUTDOWN_TIMEOUT
+            );
+            SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+
+            // SAFETY: as above.
+            if unsafe { libc::sigwait(&set, &mut sig) } == 0 {
+                tracing::warn!(
+                    "Received signal {} during shutdown, exiting without waiting for databases to flush",
+                    sig
+                );
+                std::process::exit(1);
+            }
+        })
+        .expect("Failed to spawn signal thread");
 }
 
 /// Register this server with the coordinator.
@@ -601,12 +667,12 @@ async fn run_core(
         });
     }
 
-    // Run forever (or until killed)
-    // In production, this would be wired up to signal handling
-    // Database metrics are emitted by each Database in its run loop
-    loop {
-        glommio::timer::Timer::new(Duration::from_secs(60)).await;
+    // Serve until SIGTERM/SIGINT, then stop this core's databases so each
+    // flushes its WAL before the process exits.
+    while !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+        glommio::timer::Timer::new(Duration::from_millis(100)).await;
     }
+    handler.shutdown(SHUTDOWN_TIMEOUT).await;
 }
 
 #[cfg(test)]
