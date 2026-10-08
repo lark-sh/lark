@@ -19,9 +19,16 @@
 //!   produces for a multi-path PATCH with slash-keyed values, and it goes
 //!   through `handle_transaction` (which had multiple bugs around blob-backed
 //!   writes — set_lazy/update_lazy/remove_sentinel_paths_below).
+//!
+//! Deletes also come as nulls inside writes: multi-path UPDATE entries that
+//! null an existing path, and null fields nested in written objects. Half of
+//! all deletes are followed immediately by a write below the deleted path, so
+//! the delete and the rewrite land in the same WAL file and are compacted in
+//! one batch.
 
 use rand::Rng;
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 
 /// A generated operation to execute.
 ///
@@ -73,6 +80,8 @@ pub struct OperationGenerator {
     /// Paths that currently hold an array, as (path, element_count, is_object_array).
     /// Used to target valid indices for partial-element writes.
     array_paths: Vec<(String, usize, bool)>,
+    /// Writes queued to go out right after the op that queued them.
+    follow_ups: VecDeque<Operation>,
 }
 
 impl OperationGenerator {
@@ -88,6 +97,7 @@ impl OperationGenerator {
             ],
             written_paths: Vec::new(),
             array_paths: Vec::new(),
+            follow_ups: VecDeque::new(),
         }
     }
 
@@ -103,6 +113,9 @@ impl OperationGenerator {
 
     /// Generate a random operation.
     pub fn generate<R: Rng>(&mut self, rng: &mut R) -> Operation {
+        if let Some(op) = self.follow_ups.pop_front() {
+            return op;
+        }
         let roll: u32 = rng.gen_range(0..100);
 
         match roll {
@@ -224,12 +237,30 @@ impl OperationGenerator {
             let item_id: u32 = rng.gen_range(0..1000);
             format!("/data/-item-abcdefg-{}", item_id)
         };
+        self.maybe_rewrite_below(rng, &path);
         Operation {
             path,
             op_type: OpType::Set,
             value: Value::Null,
             tx_ops: None,
         }
+    }
+
+    /// Half the time, queue a SET below a path that is being deleted, so the
+    /// next op writes under it. The deleted node's other children must stay
+    /// gone once the delete and the rewrite are compacted together.
+    fn maybe_rewrite_below<R: Rng>(&mut self, rng: &mut R, deleted: &str) {
+        if !rng.gen_bool(0.5) {
+            return;
+        }
+        let path = format!("{}/rewritten", deleted);
+        self.written_paths.push(path.clone());
+        self.follow_ups.push_back(Operation {
+            path,
+            op_type: OpType::Set,
+            value: json!({"n": rng.gen_range(0..1000), "at": chrono_like_timestamp()}),
+            tx_ops: None,
+        });
     }
 
     /// Edge case writes: unicode, emoji, deep nesting, large values, empty strings.
@@ -438,6 +469,12 @@ impl OperationGenerator {
         };
         let updated_field: i32 = rng.gen_range(0..10000);
         let updated_at = chrono_like_timestamp();
+        // A quarter of updates delete a field instead of writing it.
+        let updated_field = if rng.gen_bool(0.25) {
+            Value::Null
+        } else {
+            json!(updated_field)
+        };
         let value = json!({
             "updated_field": updated_field,
             "updated_at": updated_at,
@@ -494,6 +531,9 @@ impl OperationGenerator {
         let entry_count = rng.gen_range(2..=5);
         for _ in 0..entry_count {
             let (key, value) = self.random_multi_path_entry(rng, /* base */ "");
+            if value.is_null() {
+                self.maybe_rewrite_below(rng, &format!("/{}", key));
+            }
             insert_non_overlapping(&mut updates, key, value);
         }
         // Track each leaf path as written so deletes/updates can target them.
@@ -518,6 +558,9 @@ impl OperationGenerator {
         let entry_count = rng.gen_range(2..=4);
         for _ in 0..entry_count {
             let (key, value) = self.random_multi_path_entry(rng, &base);
+            if value.is_null() {
+                self.maybe_rewrite_below(rng, &format!("{}/{}", base, key));
+            }
             insert_non_overlapping(&mut updates, key, value);
         }
         for key in updates.keys() {
@@ -533,9 +576,27 @@ impl OperationGenerator {
 
     /// Generate a single (key, value) entry for a multi-path UPDATE.
     /// `key` will contain at least one '/' so it exercises Tree::update's
-    /// `path.join(key)` sub-path interpretation. `_base` is the UPDATE path —
+    /// `path.join(key)` sub-path interpretation. `base` is the UPDATE path —
     /// caller uses it to track the resulting leaf path for later ops.
-    fn random_multi_path_entry<R: Rng>(&mut self, rng: &mut R, _base: &str) -> (String, Value) {
+    ///
+    /// A quarter of entries null a path already written below `base`, which
+    /// is how a multi-path PATCH deletes several nodes at once.
+    fn random_multi_path_entry<R: Rng>(&mut self, rng: &mut R, base: &str) -> (String, Value) {
+        if rng.gen_bool(0.25) {
+            let prefix = format!("{}/", base);
+            let under_base: Vec<&String> = self
+                .written_paths
+                .iter()
+                .filter(|p| {
+                    p.starts_with(&prefix) && p.matches('/').count() > prefix.matches('/').count()
+                })
+                .collect();
+            if !under_base.is_empty() {
+                let path = under_base[rng.gen_range(0..under_base.len())];
+                return (path[prefix.len()..].to_string(), Value::Null);
+            }
+        }
+
         // Pick a depth — 2 segments (e.g. "users/alice") or 3 (e.g. "users/alice/score").
         let depth = rng.gen_range(2..=3);
         let mut segs = Vec::with_capacity(depth);
@@ -558,11 +619,18 @@ impl OperationGenerator {
         let variant = rng.gen_range(0..3);
         let value = match variant {
             0 => json!(rng.gen_range(0..10000)),
-            1 => json!({
-                "n": rng.gen_range(0..1000),
-                "active": rng.gen_bool(0.5),
-                "name": format!("entry-{}", rng.gen_range(0..100)),
-            }),
+            1 => {
+                let mut obj = json!({
+                    "n": rng.gen_range(0..1000),
+                    "active": rng.gen_bool(0.5),
+                    "name": format!("entry-{}", rng.gen_range(0..100)),
+                });
+                // A null field inside a written object is never stored.
+                if rng.gen_bool(0.25) {
+                    obj["gone"] = Value::Null;
+                }
+                obj
+            }
             _ => {
                 self.push_counter += 1;
                 let pid = generate_push_id(self.push_counter, rng);

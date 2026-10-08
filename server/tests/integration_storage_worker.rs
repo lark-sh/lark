@@ -447,6 +447,82 @@ fn test_storage_worker_compacts_deletes() {
     });
 }
 
+/// Null values in an UPDATE delete their paths, and compaction must store
+/// them as deletions: after compaction and eviction, reads must not return
+/// the deleted keys as null children.
+#[test]
+#[ignore] // Slow test — writes 5MB+ to trigger rotation
+fn test_storage_worker_compacts_update_nulls_as_deletes() {
+    run_test(|| async {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+
+        let tree = ArcValue::from_value(json!({
+            "characters": {"c1": {"name": "Ada", "level": 3}, "c2": {"name": "Bo", "level": 1}},
+            "names": {"c1": "Ada", "c2": "Bo"},
+            "stats": {"c1": {"hp": 10}, "c2": {"hp": 7}}
+        }));
+        write_test_blob(data_dir, "test-project", "update-null-compact-db", &tree);
+
+        let server = TestServer::with_persistence(data_dir);
+        server
+            .set_rules_with_ephemeral(
+                "test-project",
+                json!({"rules": {".read": true, ".write": true}}),
+                false,
+            )
+            .unwrap();
+
+        let mut client = server.client();
+        client.connect("test-project/update-null-compact-db").await;
+
+        // Multi-path delete, plus a nested null inside a written value.
+        client
+            .update(
+                "/",
+                json!({
+                    "characters/c1": null,
+                    "names/c1": null,
+                    "stats/c1": null,
+                    "stats/c2": {"hp": 8, "mp": null}
+                }),
+            )
+            .await
+            .unwrap();
+
+        trigger_rotation_and_wait(&client).await;
+
+        let seq = read_sequence(data_dir, "test-project", "update-null-compact-db");
+        assert!(seq > 0, "Compaction should have happened");
+
+        for path in [
+            &["characters", "c1"][..],
+            &["names", "c1"],
+            &["stats", "c1"],
+        ] {
+            assert_eq!(
+                read_blob_value(data_dir, "test-project", "update-null-compact-db", path),
+                None,
+                "{path:?} should be deleted from the blob after compaction"
+            );
+        }
+
+        client.force_evict_all().await;
+
+        assert_eq!(
+            client.once("/characters").await.unwrap(),
+            json!({"c2": {"name": "Bo", "level": 1}})
+        );
+        assert_eq!(client.once("/names").await.unwrap(), json!({"c2": "Bo"}));
+        assert_eq!(
+            client.once("/stats").await.unwrap(),
+            json!({"c2": {"hp": 8}})
+        );
+
+        client.disconnect().await;
+    });
+}
+
 /// Verify that a new database (no pre-existing blob) gets a blob created
 /// and the storage worker can compact into it.
 #[test]

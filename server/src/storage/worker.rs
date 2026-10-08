@@ -364,27 +364,24 @@ pub fn coalesce_wal_entries(entries: Vec<WalEntry>) -> Vec<(Vec<String>, Option<
     for entry in entries {
         match entry.op {
             WalOp::Set => {
+                // A SET whose value cleans to nothing (null, or only null
+                // children) is a delete. serde reads {"v": null} as None.
                 let segments = split_path(&entry.path);
-                // SET always means "set to this value" — never delete.
-                // serde deserializes {"v": null} as None for Option<Value>,
-                // so we must map None back to ArcValue::Null.
-                let value = match entry.value {
-                    Some(v) => ArcValue::from_value(v),
-                    None => ArcValue::Null,
-                };
-                result.push((segments, Some(value)));
+                let value = entry.value.and_then(ArcValue::from_value_cleaned);
+                result.push((segments, value));
             }
             WalOp::Delete => {
                 let segments = split_path(&entry.path);
                 result.push((segments, None));
             }
             WalOp::Update => {
-                // Expand UPDATE into per-child-key SETs
+                // Expand UPDATE into per-child-key SETs; a null child is a
+                // delete of that key.
                 if let Some(Value::Object(map)) = entry.value {
                     for (key, val) in map {
                         let expanded = format!("{}/{}", entry.path, key);
                         let segments = split_path(&expanded);
-                        result.push((segments, Some(ArcValue::from_value(val))));
+                        result.push((segments, ArcValue::from_value_cleaned(val)));
                     }
                 }
             }
@@ -414,23 +411,45 @@ mod tests {
         local_ex.run(f)
     }
 
-    /// SET with v:null must produce Some(Null), not None (which would be a delete).
-    /// serde deserializes {"v": null} as Option::None for Option<Value>, so
-    /// coalesce_wal_entries must map that back to Some(ArcValue::Null).
+    /// SET with v:null is a delete. serde reads {"v": null} as None.
     #[test]
-    fn test_coalesce_set_null_is_not_delete() {
+    fn test_coalesce_set_null_is_delete() {
         let line = r#"{"o":"s","p":"/users/alice","v":null}"#;
         let entry: WalEntry = serde_json::from_str(line).unwrap();
         let updates = coalesce_wal_entries(vec![entry]);
 
-        assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].0, vec!["users", "alice"]);
-        // Must be Some(Null), NOT None — None would mean delete
-        assert!(
-            updates[0].1.is_some(),
-            "SET with v:null must produce Some(Null), not None"
+        assert_eq!(
+            updates,
+            vec![(vec!["users".to_string(), "alice".to_string()], None)]
         );
-        assert_eq!(updates[0].1.as_ref().unwrap(), &ArcValue::Null);
+    }
+
+    /// A null child of an UPDATE deletes that key; nested nulls inside a
+    /// written value are dropped rather than stored.
+    #[test]
+    fn test_coalesce_update_nulls_are_deletes() {
+        let entries = vec![WalEntry::update(
+            "/",
+            json!({
+                "characters/c1": null,
+                "stats/c2": {"hp": 8, "mp": null},
+                "empty": {"x": null}
+            }),
+        )];
+        let mut updates = coalesce_wal_entries(entries);
+        updates.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(
+            updates,
+            vec![
+                (vec!["characters".to_string(), "c1".to_string()], None),
+                (vec!["empty".to_string()], None),
+                (
+                    vec!["stats".to_string(), "c2".to_string()],
+                    Some(ArcValue::from_value(json!({"hp": 8})))
+                ),
+            ]
+        );
     }
 
     #[test]

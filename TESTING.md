@@ -38,9 +38,10 @@ The tool that holds Lark to this contract is [`tools/chaos-monkey`](tools/chaos-
 Some details of the harness:
 
 - It verifies data before each kill as well as after the restart, so a violation can be attributed to recovery rather than to a live-server bug.
+- It checks deletes as well as writes. Every acknowledged value is read back individually, and every subtree the run replaced or deleted is read whole and must hold exactly what the run wrote there: no deleted children coming back, no null stored as a value.
 - It inspects the raw on-disk state after each crash: WAL files must be valid JSONL, the blob and sequence files must parse.
 - Between kill and restart it can run `lark-compact` to force a full blob re-compaction, so recovery is verified through the compactor, the piece of a storage engine where bugs are most expensive.
-- The operation mix is weighted toward writes that have actually broken things in the past: multi-path updates at the root (a real WAL-replay bug), transactions on blob-backed paths, unicode and deeply nested keys, burst writes that force WAL rotation.
+- The operation mix is weighted toward writes that have actually broken things in the past: multi-path updates at the root (a real WAL-replay bug), multi-path updates that null existing paths and deletes immediately followed by a write beneath them (real compaction bugs), transactions on blob-backed paths, unicode and deeply nested keys, burst writes that force WAL rotation.
 - Runs are seeded. A violating run replays exactly with the same `--seed`, so a failure is a reproducible artifact rather than an anecdote.
 - It can run with security rules enabled, so durability is exercised with the authorization path in play.
 

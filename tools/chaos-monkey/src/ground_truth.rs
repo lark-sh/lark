@@ -8,7 +8,7 @@
 
 use crate::operations::{TxOp, TxOpKind};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use tracing::{debug, trace};
 
@@ -200,6 +200,61 @@ impl GroundTruth {
         }
 
         state
+    }
+
+    /// Subtrees whose entire contents this cycle's writes determine, paired
+    /// with the leaves expected under each.
+    ///
+    /// Every SET, DELETE and UPDATE child replaces the subtree at its path, so
+    /// once a committed write lands there, everything below comes from writes
+    /// ground truth tracked — data from earlier cycles can't survive in it. A
+    /// read of such a subtree must hold exactly the expected leaves: an extra
+    /// key means deleted data came back. Only the outermost of these roots is
+    /// returned, and any root that a pending (unacknowledged) write touches is
+    /// skipped, since that write may or may not have landed.
+    pub fn get_replaced_subtrees(&self) -> Vec<(String, HashMap<String, Value>)> {
+        let mut committed: Vec<&WriteRecord> = self
+            .writes
+            .values()
+            .filter(|w| matches!(w.state, WriteState::Committed))
+            .collect();
+        committed.sort_by_key(|w| w.sequence);
+
+        let mut roots: Vec<String> = committed.iter().flat_map(|w| replaced_roots(w)).collect();
+        roots.sort_by_key(|r| r.len());
+        roots.dedup();
+
+        let pending_roots: Vec<String> = self
+            .writes
+            .values()
+            .filter(|w| matches!(w.state, WriteState::Sent))
+            .flat_map(replaced_roots)
+            .collect();
+
+        let mut outermost: HashSet<String> = HashSet::new();
+        for root in roots {
+            let covered = ancestors_of(&root).any(|a| outermost.contains(a));
+            if !covered {
+                outermost.insert(root);
+            }
+        }
+
+        let state = self.build_expected_state();
+        let mut out: Vec<(String, HashMap<String, Value>)> = outermost
+            .into_iter()
+            .filter(|root| !pending_roots.iter().any(|p| paths_overlap(p, root)))
+            .map(|root| {
+                let prefix = format!("{}/", root);
+                let leaves = state
+                    .iter()
+                    .filter(|(k, _)| **k == root || k.starts_with(&prefix))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                (root, leaves)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     /// Get the count of writes in each state.
@@ -552,12 +607,57 @@ fn join_path(base: &str, key: &str) -> String {
     }
 }
 
+/// Paths whose whole subtree `record` replaces, joined the same way
+/// `build_expected_state` builds its keys.
+fn replaced_roots(record: &WriteRecord) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut children = |base: &str, value: Option<&Value>| {
+        if let Some(Value::Object(obj)) = value {
+            for key in obj.keys() {
+                out.push(format!("{}/{}", base, key));
+            }
+        }
+    };
+    let mut roots = Vec::new();
+    match &record.operation {
+        WriteOp::Set(_) => roots.push(record.path.clone()),
+        WriteOp::Update(v) => children(&record.path, Some(v)),
+        WriteOp::Transaction(tx_ops) => {
+            for sub in tx_ops {
+                match sub.kind {
+                    TxOpKind::Set | TxOpKind::Delete => roots.push(sub.path.clone()),
+                    TxOpKind::Update => children(&sub.path, sub.value.as_ref()),
+                }
+            }
+        }
+    }
+    out.extend(roots);
+    // The root itself would cover data this cycle never saw.
+    out.retain(|r| !r.is_empty() && r != "/");
+    out
+}
+
+/// Strict ancestors of `path`, nearest first: `/a/b/c` → `/a/b`, `/a`.
+fn ancestors_of(path: &str) -> impl Iterator<Item = &str> {
+    path.char_indices()
+        .rev()
+        .filter(|&(i, c)| c == '/' && i > 0)
+        .map(move |(i, _)| &path[..i])
+}
+
+/// True if `a` and `b` are the same path or one contains the other.
+fn paths_overlap(a: &str, b: &str) -> bool {
+    a == b || a.starts_with(&format!("{}/", b)) || b.starts_with(&format!("{}/", a))
+}
+
 /// Flatten a JSON value into leaf paths.
 /// For {"a": {"b": 1, "c": 2}} at path "/x", produces:
 ///   "/x/a/b" -> 1
 ///   "/x/a/c" -> 2
 fn flatten_value(path: &str, value: &Value, state: &mut HashMap<String, Value>) {
     match value {
+        // A null anywhere in a written value is absent, never stored.
+        Value::Null => {}
         Value::Object(obj) => {
             // Remove the parent path itself (it's not a leaf)
             state.remove(path);
@@ -622,6 +722,66 @@ mod tests {
 
         let state = gt.build_expected_state();
         assert_eq!(state.get("/users/alice/name"), Some(&json!("Alice")));
+    }
+
+    #[test]
+    fn test_nested_null_is_absent() {
+        let mut gt = GroundTruth::new();
+        gt.record_sent(
+            "r1",
+            1,
+            "",
+            WriteOp::Update(json!({"a/b": {"x": 1, "y": null}})),
+        );
+        gt.mark_committed("r1");
+
+        let state = gt.build_expected_state();
+        assert_eq!(state.get("/a/b/x"), Some(&json!(1)));
+        assert!(!state.contains_key("/a/b/y"));
+    }
+
+    #[test]
+    fn test_replaced_subtrees_outermost_with_expected_leaves() {
+        let mut gt = GroundTruth::new();
+        gt.record_sent("r1", 1, "/a", WriteOp::Set(json!({"x": 1, "old": 2})));
+        gt.record_sent(
+            "r2",
+            1,
+            "",
+            WriteOp::Update(json!({"b/c": null, "a/old": null})),
+        );
+        gt.record_sent("r3", 1, "/a/y", WriteOp::Set(json!(3)));
+        for r in ["r1", "r2", "r3"] {
+            gt.mark_committed(r);
+        }
+
+        let subtrees = gt.get_replaced_subtrees();
+        let roots: Vec<&str> = subtrees.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(roots, vec!["/a", "/b/c"]);
+
+        let a = &subtrees[0].1;
+        assert_eq!(a.len(), 2);
+        assert_eq!(a.get("/a/x"), Some(&json!(1)));
+        assert_eq!(a.get("/a/y"), Some(&json!(3)));
+        assert!(subtrees[1].1.is_empty());
+    }
+
+    #[test]
+    fn test_replaced_subtrees_skip_pending_overlap() {
+        let mut gt = GroundTruth::new();
+        gt.record_sent("r1", 1, "/a", WriteOp::Set(json!(null)));
+        gt.record_sent("r2", 1, "/b", WriteOp::Set(json!(1)));
+        gt.mark_committed("r1");
+        gt.mark_committed("r2");
+        // Unacknowledged write below /a: it may or may not have landed.
+        gt.record_sent("r3", 1, "/a/z", WriteOp::Set(json!(1)));
+
+        let roots: Vec<String> = gt
+            .get_replaced_subtrees()
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect();
+        assert_eq!(roots, vec!["/b".to_string()]);
     }
 
     #[test]

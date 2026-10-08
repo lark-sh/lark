@@ -253,6 +253,10 @@ pub async fn verify_before_kill(
         }
     }
 
+    let subtree_violations =
+        verify_replaced_subtrees(client, ground_truth, verify_client_id, "PRE-KILL").await;
+    result.wrong_values.extend(subtree_violations);
+
     let violation_count = result.missing_committed.len() + result.wrong_values.len();
     if violation_count > 0 {
         error!(
@@ -387,6 +391,11 @@ pub async fn verify_after_restart(
     }
 
     result.paths_checked = checked;
+
+    let subtree_violations =
+        verify_replaced_subtrees(client, ground_truth, verify_client_id, "POST-RESTART").await;
+    result.wrong_values.extend(subtree_violations);
+
     let violation_count = result.missing_committed.len() + result.wrong_values.len();
     info!(
         "Verified {}/{} paths ({} violations)",
@@ -428,6 +437,140 @@ pub async fn verify_after_restart(
     }
 
     result
+}
+
+/// Read every subtree this cycle fully replaced (see
+/// `GroundTruth::get_replaced_subtrees`) and check it holds nothing beyond
+/// the expected leaves, and no null inside an object.
+///
+/// Leaf reads alone can't see either failure: reading a deleted path returns
+/// null whether the key is gone or stored as a literal null, and a deleted
+/// child that came back is not in ground truth, so no leaf read ever visits
+/// it. Missing or wrong expected leaves are left to the leaf reads.
+async fn verify_replaced_subtrees(
+    client: &mut ProxyClient,
+    ground_truth: &GroundTruth,
+    verify_client_id: u32,
+    label: &str,
+) -> Vec<ViolationInfo> {
+    let subtrees = ground_truth.get_replaced_subtrees();
+    info!(
+        "{}: checking {} replaced subtrees for extra or null keys",
+        label,
+        subtrees.len()
+    );
+
+    let mut violations = Vec::new();
+    let mut checked = 0;
+    let batch_size = 50;
+    let mut pending: HashMap<String, (&str, &HashMap<String, Value>)> = HashMap::new();
+
+    for chunk in subtrees.chunks(batch_size) {
+        pending.clear();
+        for (root, expected) in chunk {
+            let req_id = client.next_request_id();
+            if let Err(e) = client.send_once(verify_client_id, root, &req_id).await {
+                warn!("{}: failed to send subtree ONCE for {}: {}", label, root, e);
+                continue;
+            }
+            pending.insert(req_id, (root.as_str(), expected));
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !pending.is_empty() && tokio::time::Instant::now() < deadline {
+            match client.recv_event(Duration::from_millis(500)).await {
+                Some(ServerEvent::Once {
+                    request_id, value, ..
+                }) => {
+                    if let Some((root, expected)) = pending.remove(&request_id) {
+                        checked += 1;
+                        // A null read is an empty subtree.
+                        let mut actual = Vec::new();
+                        if !value.is_null() {
+                            flatten_read(root, &value, false, &mut actual);
+                        }
+                        for (path, leaf) in actual {
+                            let problem = if leaf.is_null() {
+                                "Null stored inside an object"
+                            } else if !expected.contains_key(&path) {
+                                "data this cycle deleted or never wrote"
+                            } else {
+                                continue;
+                            };
+                            error!(
+                                "{} VIOLATION: {} under replaced subtree {} — {} ({})",
+                                label,
+                                path,
+                                root,
+                                problem,
+                                value_type_summary(&leaf),
+                            );
+                            if violations.len() < 10 {
+                                log_writes_affecting(ground_truth, &path);
+                            }
+                            violations.push(ViolationInfo {
+                                path,
+                                expected_type: "absent".to_string(),
+                                actual_type: format!("{}: {}", problem, value_type_summary(&leaf)),
+                                ack_age_secs: None,
+                            });
+                        }
+                    }
+                }
+                Some(ServerEvent::Nack {
+                    request_id, error, ..
+                }) => {
+                    if let Some((root, _)) = pending.remove(&request_id) {
+                        warn!("{}: subtree ONCE for {} was NACKed: {}", label, root, error);
+                    }
+                }
+                Some(ServerEvent::Heartbeat) => {
+                    let _ = client.send_heartbeat_ack().await;
+                }
+                Some(ServerEvent::Disconnected) => {
+                    error!(
+                        "{}: server disconnected during subtree verification!",
+                        label
+                    );
+                    return violations;
+                }
+                Some(_) | None => {}
+            }
+        }
+        for (_, (root, _)) in pending.drain() {
+            warn!("{}: subtree ONCE timed out for {}", label, root);
+        }
+    }
+
+    info!(
+        "{}: {}/{} replaced subtrees checked, {} extra or null keys",
+        label,
+        checked,
+        subtrees.len(),
+        violations.len()
+    );
+    violations
+}
+
+/// Flatten a read into `(leaf path, value)` pairs, keyed the way ground truth
+/// keys its expected state. Arrays expand under their indices; a null array
+/// element is a gap in a sparse array and is skipped, while a null inside an
+/// object is kept so the caller can flag it.
+fn flatten_read(path: &str, value: &Value, in_array: bool, out: &mut Vec<(String, Value)>) {
+    match value {
+        Value::Object(obj) => {
+            for (key, val) in obj {
+                flatten_read(&format!("{}/{}", path, key), val, false, out);
+            }
+        }
+        Value::Array(arr) => {
+            for (i, val) in arr.iter().enumerate() {
+                flatten_read(&format!("{}/{}", path, i), val, true, out);
+            }
+        }
+        Value::Null if in_array => {}
+        _ => out.push((path.to_string(), value.clone())),
+    }
 }
 
 /// Compare two JSON values for equality.
