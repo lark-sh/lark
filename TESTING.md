@@ -23,7 +23,7 @@ If your app works against Firebase through the JS SDK, this suite is the evidenc
 
 The durability contract has two modes, chosen per deployment:
 
-- Default: the write-ahead log is flushed every 2 seconds. A write acknowledged inside that window may be lost if the server dies before the flush; any write acknowledged before the window must survive.
+- Default: the write-ahead log is flushed every 2 seconds. A write acknowledged inside that window may be lost if the server dies before the flush; any write acknowledged before the window must survive. A graceful stop (SIGTERM or SIGINT) flushes before exiting, so the window applies only to crashes.
 - Strict (`--durability strict` in the harness, fsync tuning in deployment): the WAL is fsync'd before the ACK is sent. No acknowledged write may be lost.
 
 The tool that holds Lark to this contract is [`tools/chaos-monkey`](tools/chaos-monkey), a standalone binary that plays the role of the gateway: it writes continuously to a real `lark-server` over the actual wire protocol, SIGKILLs the process at random moments, restarts it, and compares what the server recovers against its own ground-truth model of every acknowledged write.
