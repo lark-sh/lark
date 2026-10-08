@@ -96,7 +96,18 @@ impl UpdateNode {
             Some(UpdateNode::Merge(children)) => {
                 Self::insert_into_tree(children, rest, value);
             }
-            Some(UpdateNode::Delete) | None => {
+            Some(UpdateNode::Delete) => {
+                // Deleted earlier in this batch, so the node holds only what
+                // later writes put under it: replace it rather than merging
+                // into its old blob children.
+                if let Some(v) = value.filter(|v| !v.is_null()) {
+                    let remaining_refs: Vec<&str> = rest.iter().map(|s| s.as_str()).collect();
+                    let mut replacement = ArcValue::empty_object();
+                    replacement.set_path_mut(&remaining_refs, v);
+                    tree.insert(key.clone(), UpdateNode::Set(replacement));
+                }
+            }
+            None => {
                 // Create a new Merge node and descend
                 let mut children = HashMap::new();
                 Self::insert_into_tree(&mut children, rest, value);
@@ -338,6 +349,29 @@ mod tests {
             // Names unchanged
             let abc_name = read_value_at_path(&io, &["characters", "abc", "name"]).await;
             assert_eq!(abc_name.as_str(), Some("Hero"));
+        });
+    }
+
+    /// A write below a path deleted earlier in the same batch replaces the
+    /// deleted node; its old children must not come back.
+    #[test]
+    fn test_delete_then_deeper_write_replaces_node() {
+        block_on(async {
+            let io = setup_blob(json!({"a": {"old": 1, "keep": 2}, "z": 1})).await;
+
+            let updates = vec![
+                (vec!["a".to_string()], None),
+                (
+                    vec!["a".to_string(), "new".to_string()],
+                    Some(ArcValue::from_value(json!(5))),
+                ),
+            ];
+            apply_updates(&io, &updates).await.unwrap();
+
+            assert_eq!(
+                read_root(&io).await.to_value(),
+                json!({"a": {"new": 5}, "z": 1})
+            );
         });
     }
 
@@ -2397,8 +2431,9 @@ mod tests {
     }
 
     #[test]
-    fn test_update_node_build_delete_then_deeper_creates_merge() {
-        // Delete at /a, then set at /a/b — the Delete is replaced by a Merge
+    fn test_update_node_build_delete_then_deeper_replaces() {
+        // Delete at /a, then set at /a/b — /a becomes Set({b: 1}), so the
+        // old children of /a stay deleted.
         let updates = vec![
             (vec!["a".to_string()], None),
             (
@@ -2408,15 +2443,19 @@ mod tests {
         ];
         let tree = UpdateNode::build(&updates);
         match tree.get("a").unwrap() {
-            UpdateNode::Merge(children) => {
-                assert_eq!(children.len(), 1);
-                match children.get("b").unwrap() {
-                    UpdateNode::Set(v) => assert_eq!(v.as_i64(), Some(1)),
-                    _ => panic!("expected Set at b"),
-                }
-            }
-            _ => panic!("expected Merge at a (deeper set should replace delete)"),
+            UpdateNode::Set(v) => assert_eq!(v.to_value(), json!({"b": 1})),
+            _ => panic!("expected Set at a (deeper set should replace delete)"),
         }
+    }
+
+    #[test]
+    fn test_update_node_build_delete_then_deeper_delete_stays_delete() {
+        let updates = vec![
+            (vec!["a".to_string()], None),
+            (vec!["a".to_string(), "b".to_string()], None),
+        ];
+        let tree = UpdateNode::build(&updates);
+        assert!(matches!(tree.get("a").unwrap(), UpdateNode::Delete));
     }
 
     // -----------------------------------------------------------------------
