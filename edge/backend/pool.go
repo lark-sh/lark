@@ -13,8 +13,14 @@
 // # Connection Management
 //
 // For each backend server, the pool maintains `connsPerCore` TCP connections to each core.
-// The default is 2 connections per core (64 cores = 128 connections per backend). Connections
-// are established lazily on first use and automatically reconnected on failure.
+// The default is 2 connections per core (64 cores = 128 connections per backend). All of
+// them are established when the backend is added. When one dies, the clients routed
+// through it are closed (the server has dropped their sessions) and a background refill
+// redials until every core again has `connsPerCore` live connections.
+//
+// The server assigns each accepted connection to a core of its own choosing (SO_REUSEPORT),
+// so neither the initial fill nor the refill can dial a specific core: each new connection
+// fills an empty slot on whichever core it landed on, or is closed if that core is full.
 //
 // # Message Flow (Client → Backend)
 //
@@ -503,10 +509,19 @@ type Backend struct {
 	controlChan  chan *ControlMessage // Control messages from server (HEARTBEAT, DATABASE_LOADED, etc.)
 	evictionChan chan EvictionRequest // Eviction requests to batch
 
+	// refilling is true while refillLoop is restoring dead connections.
+	refilling bool
+
 	// Shutdown
 	done   chan struct{}
 	closed bool
 }
+
+const (
+	// Backoff between failed redials while refilling dead connections.
+	refillMinBackoff = 100 * time.Millisecond
+	refillMaxBackoff = 5 * time.Second
+)
 
 // QueueStats returns current channel depths for monitoring
 type QueueStats struct {
@@ -745,8 +760,9 @@ func (b *Backend) flushEvictions(batch []EvictionRequest) {
 // connection, ensuring ordering. Different clients can use different connections,
 // giving us parallelism without sacrificing per-client ordering.
 //
-// Connection recovery happens lazily here: if a connection is dead, we reconnect
-// before writing. This is simpler than a separate health-check goroutine.
+// flushBatch never dials. A message whose connection slot is dead can't be sent:
+// its client is closed so it reconnects, rather than waiting on a reply that will
+// never come, and the background refill restores the slot.
 func (b *Backend) flushBatch(batch []*inboxMessage) {
 	if len(batch) == 0 {
 		return
@@ -760,6 +776,9 @@ func (b *Backend) flushBatch(batch []*inboxMessage) {
 		coreMessages[im.coreID] = append(coreMessages[im.coreID], im.msg)
 	}
 
+	// Messages with no live connection to carry them, by core.
+	undeliverable := make(map[int][]*Message)
+
 	// Process each core's messages
 	var wg sync.WaitGroup
 	for coreID, messages := range coreMessages {
@@ -768,35 +787,14 @@ func (b *Backend) flushBatch(batch []*inboxMessage) {
 			continue
 		}
 
-		conns := b.coreConns[coreID]
-		if len(conns) == 0 {
-			logger.Warn("No connections for core", "server_id", b.ServerID, "core_id", coreID)
-			continue
-		}
-
-		// Check for dead connections and reconnect
-		for i, conn := range conns {
-			if conn == nil || conn.IsClosed() {
-				newConn, newCoreID, err := b.connectWithHandshake()
-				if err != nil {
-					logger.Warn("Reconnect failed for core", "server_id", b.ServerID, "core_id", coreID, "error", err)
-					continue
-				}
-				// Verify we got assigned to the same core
-				if newCoreID != coreID {
-					// Got assigned to different core, close and retry
-					newConn.Close()
-					continue
-				}
-				b.coreConns[coreID][i] = newConn
-				go newConn.readLoop()
-			}
-		}
-
 		// Copy connections for parallel writes
 		connsCopy := make([]*Conn, len(b.coreConns[coreID]))
 		copy(connsCopy, b.coreConns[coreID])
 		numConns := len(connsCopy)
+		if numConns == 0 {
+			undeliverable[coreID] = append(undeliverable[coreID], messages...)
+			continue
+		}
 
 		// Shard messages by ClientID within this core's connections
 		shards := make([][]*Message, numConns)
@@ -812,7 +810,8 @@ func (b *Backend) flushBatch(batch []*inboxMessage) {
 			}
 
 			conn := connsCopy[i]
-			if conn == nil {
+			if conn == nil || conn.IsClosed() {
+				undeliverable[coreID] = append(undeliverable[coreID], shard...)
 				continue
 			}
 
@@ -837,22 +836,190 @@ func (b *Backend) flushBatch(batch []*inboxMessage) {
 
 	b.mu.Unlock()
 	wg.Wait()
+
+	if len(undeliverable) > 0 {
+		b.dropUndeliverable(undeliverable)
+		b.startRefill()
+	}
 }
 
-// handleConnDeath is called when a connection dies
+// dropUndeliverable closes the clients whose messages had no live connection.
+// A DISCONNECT needs no delivery: the server dropped that client's session
+// when its connection died.
+func (b *Backend) dropUndeliverable(byCore map[int][]*Message) {
+	for coreID, msgs := range byCore {
+		clientIDs := make(map[uint32]bool)
+		for _, msg := range msgs {
+			if msg.Type != MsgTypeDisconnect {
+				clientIDs[msg.ClientID] = true
+			}
+		}
+		if len(clientIDs) == 0 {
+			continue
+		}
+		logger.Warn("No live connection to backend core, dropping messages and closing their clients",
+			"server_id", b.ServerID, "core_id", coreID, "messages", len(msgs), "clients", len(clientIDs))
+		b.closeClients(clientIDs)
+	}
+}
+
+// closeClients closes the given clients so they reconnect. Must not be called
+// with b.mu held: closing a client sends it a DISCONNECT through this backend.
+func (b *Backend) closeClients(clientIDs map[uint32]bool) {
+	if b.pool.clients == nil {
+		return
+	}
+	for id := range clientIDs {
+		if c := b.pool.clients.GetClient(id); c != nil {
+			c.Close()
+		}
+	}
+}
+
+// startRefill starts refillLoop unless it is already running.
+func (b *Backend) startRefill() {
+	b.mu.Lock()
+	if b.closed || b.refilling {
+		b.mu.Unlock()
+		return
+	}
+	b.refilling = true
+	b.mu.Unlock()
+	go b.refillLoop()
+}
+
+// refillLoop redials until every core again has connsPerCore live connections,
+// or the backend closes. Each new connection fills an empty slot on whichever
+// core the server assigned it to; one that lands on a full core is closed.
+func (b *Backend) refillLoop() {
+	backoff := refillMinBackoff
+	dialFailing := false
+	// Dials in a row that landed on full cores. Past a few per open slot, the
+	// open slots are on cores the server isn't assigning (its core count
+	// changed), so slow down instead of spinning.
+	misses := 0
+
+	for {
+		b.mu.Lock()
+		empty := b.emptySlotsLocked()
+		if b.closed || empty == 0 {
+			b.refilling = false
+			closed := b.closed
+			b.mu.Unlock()
+			if !closed {
+				logger.Info("Backend connections restored", "server_id", b.ServerID)
+			}
+			return
+		}
+		b.mu.Unlock()
+
+		if misses > 4*b.nrCores*b.pool.connsPerCore {
+			logger.Warn("Backend keeps assigning new connections to full cores, slowing refill",
+				"server_id", b.ServerID, "empty_slots", empty)
+			misses = 0
+			if !b.sleepOrDone(refillMaxBackoff) {
+				return
+			}
+		}
+
+		conn, coreID, err := b.connectWithHandshake()
+		if err != nil {
+			if !dialFailing {
+				logger.Warn("Reconnect to backend failed, retrying", "server_id", b.ServerID, "empty_slots", empty, "error", err)
+				dialFailing = true
+			}
+			if !b.sleepOrDone(backoff) {
+				return
+			}
+			backoff = min(backoff*2, refillMaxBackoff)
+			continue
+		}
+		dialFailing = false
+		backoff = refillMinBackoff
+
+		if b.placeConn(conn, coreID) {
+			misses = 0
+		} else {
+			conn.Close()
+			misses++
+		}
+	}
+}
+
+// sleepOrDone waits for d and reports true, or reports false (and ends the
+// refill) if the backend closes first.
+func (b *Backend) sleepOrDone(d time.Duration) bool {
+	select {
+	case <-time.After(d):
+		return true
+	case <-b.done:
+		b.mu.Lock()
+		b.refilling = false
+		b.mu.Unlock()
+		return false
+	}
+}
+
+// emptySlotsLocked counts dead connection slots. Caller holds b.mu.
+func (b *Backend) emptySlotsLocked() int {
+	empty := 0
+	for _, conns := range b.coreConns {
+		for _, c := range conns {
+			if c == nil || c.IsClosed() {
+				empty++
+			}
+		}
+	}
+	return empty
+}
+
+// placeConn puts conn in an empty slot of its core and starts reading from it.
+// Reports false if that core has no empty slot.
+func (b *Backend) placeConn(conn *Conn, coreID int) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed || coreID < 0 || coreID >= len(b.coreConns) {
+		return false
+	}
+	for i, c := range b.coreConns[coreID] {
+		if c == nil || c.IsClosed() {
+			b.coreConns[coreID][i] = conn
+			go conn.readLoop()
+			return true
+		}
+	}
+	return false
+}
+
+// handleConnDeath is called when a connection dies. The server drops the
+// sessions of every client routed through it, so those clients are closed to
+// make them reconnect, and the refill restores the slot.
 func (b *Backend) handleConnDeath(conn *Conn) {
 	b.mu.Lock()
 
+	if b.closed {
+		// Backend.Close closed this connection and notifies clients itself.
+		b.mu.Unlock()
+		return
+	}
+
 	coreID := conn.coreID
+	orphaned := make(map[uint32]bool)
 	if coreID >= 0 && coreID < len(b.coreConns) {
-		for i, c := range b.coreConns[coreID] {
+		conns := b.coreConns[coreID]
+		for i, c := range conns {
 			if c == conn {
-				b.coreConns[coreID][i] = nil
+				conns[i] = nil
+				for clientID, core := range b.clientToCore {
+					if core == coreID && int(clientID)%len(conns) == i {
+						orphaned[clientID] = true
+					}
+				}
 				break
 			}
 		}
 	}
-	logger.Warn("Connection died, will reconnect on next flush", "server_id", b.ServerID, "core_id", coreID)
+	logger.Warn("Connection died, reconnecting", "server_id", b.ServerID, "core_id", coreID, "clients_closed", len(orphaned))
 
 	// Check if ALL connections to the backend are now dead
 	// If so, notify clients immediately rather than waiting for discovery loop
@@ -871,12 +1038,16 @@ func (b *Backend) handleConnDeath(conn *Conn) {
 
 	b.mu.Unlock()
 
+	b.closeClients(orphaned)
+
 	// If all connections are dead, notify proxy to close clients immediately
 	// This provides faster detection than waiting for the 15s discovery loop
-	if allDead && !b.closed && b.pool.clientNotifier != nil {
+	if allDead && b.pool.clientNotifier != nil {
 		logger.Warn("All connections dead, notifying clients", "server_id", b.ServerID)
 		b.pool.clientNotifier.OnBackendDisconnected(b.ServerID)
 	}
+
+	b.startRefill()
 }
 
 // Close closes the backend and all its connections

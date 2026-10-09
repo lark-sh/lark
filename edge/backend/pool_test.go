@@ -3,8 +3,10 @@ package backend
 import (
 	"encoding/binary"
 	"io"
+	"math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -663,4 +665,206 @@ func TestQueueStats(t *testing.T) {
 	if _, ok := stats["test-server"]; !ok {
 		t.Error("Expected stats for test-server")
 	}
+}
+
+// reusePortMock is a backend that, like the real server's SO_REUSEPORT
+// listeners, assigns each accepted connection to a random core. It tracks the
+// server side of each connection by core so tests can drop them.
+type reusePortMock struct {
+	ln      net.Listener
+	nrCores uint8
+
+	mu    sync.Mutex
+	rng   *rand.Rand
+	conns map[int][]net.Conn
+}
+
+func newReusePortMock(t *testing.T, nrCores uint8) *reusePortMock {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	m := &reusePortMock{ln: ln, nrCores: nrCores, rng: rand.New(rand.NewSource(1)), conns: map[int][]net.Conn{}}
+	go m.acceptLoop()
+	t.Cleanup(m.close)
+	return m
+}
+
+func (m *reusePortMock) addr() string { return m.ln.Addr().String() }
+
+func (m *reusePortMock) acceptLoop() {
+	for {
+		conn, err := m.ln.Accept()
+		if err != nil {
+			return
+		}
+		readFrame(conn) // HELLO
+
+		m.mu.Lock()
+		core := m.rng.Intn(int(m.nrCores))
+		m.conns[core] = append(m.conns[core], conn)
+		m.mu.Unlock()
+
+		resp := make([]byte, 41)
+		binary.BigEndian.PutUint32(resp[0:4], 37)
+		resp[4] = MsgTypeHelloAck
+		resp[5] = uint8(core)
+		resp[6] = m.nrCores
+		binary.BigEndian.PutUint16(resp[7:9], 1)
+		if _, err := conn.Write(resp); err != nil {
+			conn.Close()
+			continue
+		}
+		readFrame(conn) // HELLO_AUTH
+		go func() { _, _ = io.Copy(io.Discard, conn) }()
+	}
+}
+
+// dropCore closes the server side of every connection assigned to core.
+func (m *reusePortMock) dropCore(core int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, c := range m.conns[core] {
+		c.Close()
+	}
+	delete(m.conns, core)
+}
+
+// dropAll closes every connection, as a server restart does.
+func (m *reusePortMock) dropAll() {
+	for core := 0; core < int(m.nrCores); core++ {
+		m.dropCore(core)
+	}
+}
+
+// stopAccepting closes the listener so redials are refused.
+func (m *reusePortMock) stopAccepting() { m.ln.Close() }
+
+func (m *reusePortMock) close() {
+	m.ln.Close()
+	m.dropAll()
+}
+
+type recordingClient struct{ closed atomic.Bool }
+
+func (c *recordingClient) Deliver([]byte, bool) bool { return true }
+func (c *recordingClient) Close()                    { c.closed.Store(true) }
+func (c *recordingClient) Kick(string, ...interface{}) {
+	c.closed.Store(true)
+}
+
+type mapRegistry map[uint32]*recordingClient
+
+func (r mapRegistry) GetClient(id uint32) Client {
+	if c, ok := r[id]; ok {
+		return c
+	}
+	return nil
+}
+
+// liveSlots counts live connections across all cores.
+func liveSlots(b *Backend) int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	live := 0
+	for _, conns := range b.coreConns {
+		for _, c := range conns {
+			if c != nil && !c.IsClosed() {
+				live++
+			}
+		}
+	}
+	return live
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestRefillRestoresAllConnectionsAfterServerRestart(t *testing.T) {
+	m := newReusePortMock(t, 16)
+	pool := NewPool(2, "test-secret")
+	defer pool.Close()
+	if err := pool.AddBackend("srv", m.addr()); err != nil {
+		t.Fatalf("AddBackend: %v", err)
+	}
+	b, _ := pool.GetBackend("srv")
+	if got := liveSlots(b); got != 32 {
+		t.Fatalf("live slots after add: got %d, want 32", got)
+	}
+
+	m.dropAll()
+
+	// Every slot must come back, not just the ones a later send happens to need.
+	waitFor(t, "all 32 slots to be refilled", func() bool { return liveSlots(b) == 32 })
+}
+
+func TestConnDeathClosesClientsRoutedThroughIt(t *testing.T) {
+	m := newReusePortMock(t, 4)
+	pool := NewPool(2, "test-secret")
+	defer pool.Close()
+	registry := mapRegistry{}
+	pool.SetClientRegistry(registry)
+	if err := pool.AddBackend("srv", m.addr()); err != nil {
+		t.Fatalf("AddBackend: %v", err)
+	}
+	b, _ := pool.GetBackend("srv")
+
+	// Clients 10 and 11 share core 2 but shard to different slots (id % 2);
+	// client 12 is on core 3.
+	b.mu.Lock()
+	for id, core := range map[uint32]int{10: 2, 11: 2, 12: 3} {
+		b.clientToCore[id] = core
+		registry[id] = &recordingClient{}
+	}
+	b.mu.Unlock()
+
+	m.dropCore(2)
+
+	waitFor(t, "core 2 clients to be closed", func() bool {
+		return registry[10].closed.Load() && registry[11].closed.Load()
+	})
+	if registry[12].closed.Load() {
+		t.Error("client on an unaffected core was closed")
+	}
+	waitFor(t, "core 2 slots to be refilled", func() bool { return liveSlots(b) == 8 })
+}
+
+func TestSendToDeadCoreClosesClientInsteadOfDropping(t *testing.T) {
+	m := newReusePortMock(t, 4)
+	pool := NewPool(1, "test-secret")
+	defer pool.Close()
+	registry := mapRegistry{}
+	pool.SetClientRegistry(registry)
+	if err := pool.AddBackend("srv", m.addr()); err != nil {
+		t.Fatalf("AddBackend: %v", err)
+	}
+	b, _ := pool.GetBackend("srv")
+
+	// Core 1 goes away and can't be redialed.
+	m.stopAccepting()
+	m.dropCore(1)
+	waitFor(t, "core 1 slot to die", func() bool { return liveSlots(b) == 3 })
+
+	// A client that connects after the death has nothing to orphan; its first
+	// message is what finds the dead slot.
+	b.mu.Lock()
+	b.clientToCore[20] = 1
+	b.mu.Unlock()
+	registry[20] = &recordingClient{}
+
+	if err := b.SendMessage(&Message{Type: MsgTypeConnect, ClientID: 20}); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	waitFor(t, "client with an undeliverable message to be closed", func() bool {
+		return registry[20].closed.Load()
+	})
 }
