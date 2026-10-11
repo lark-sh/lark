@@ -6,6 +6,8 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-10-11
+
 ### Fixed
 
 - A SET or DELETE of the database root (a client setting or removing the whole database, or a REST PUT or DELETE on `/.json`) never reached the blob: compaction skipped root-path WAL entries, so the server's in-memory data changed but the old data came back after a restart or eviction. Updates at the root were not affected. Compaction now applies a root write by deleting every existing top-level key and then applying the batch's writes.
@@ -17,15 +19,26 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 - The server rejected inbound Firebase frames over 16,384 bytes, but the Firebase JS SDK splits at 16,384 UTF-16 code units, so a large write containing non-ASCII text could be refused as malformed. The inbound cap is now three bytes per unit.
 - The edge dropped clients whose per-connection outbox exceeded 1000 messages. Firebase-protocol responses are split into 16 KB frames, so a client loading a large database on an ordinary connection could exhaust the count mid-sync, be disconnected, reconnect, re-issue every query, and loop forever without ever finishing. The outbox is now bounded by bytes (`CLIENT_OUTBOX_MAX_BYTES`, default 256 MB) rather than by message count.
 - The edge's flat 10-second write deadline could drop a native-protocol client on a slow link while it was still receiving a single large frame. The deadline now scales with payload size (`CLIENT_WRITE_DEADLINE` + payload / `CLIENT_WRITE_MIN_BYTES_PER_SEC`), so it only fires when a client has stopped taking bytes.
+- Compaction stored nulls written by updates instead of treating them as deletes, and when a batch deleted a node and then wrote beneath it, the node's old children came back. Nulls written by updates are now deletes, and a deleted node's old children stay deleted.
+- `.validate` rules were evaluated at nodes a write leaves null, so nulling a validated path in a multi-path update was denied, and removing a field its parent requires was allowed. Lark now skips `.validate` at any node a write leaves null and checks it everywhere else, the same way for set, update and remove.
+- Paths that arrived without a leading slash or with a trailing slash could leak not-yet-loaded data into reads, and the response then failed to encode. Such paths are now handled like their canonical form, and a response that fails to encode logs the request path.
+- The edge could crash when a client sent a second AUTH message while the first was still being validated before its connection finished routing: both auth handlers closed the same channel. A second AUTH in that window is now dropped, and the handler already running picks up the newer token. CI now runs the Go tests with the race detector.
+- When a connection between the edge and a server died, messages that needed it were dropped silently. The edge now redials until every core has its full set of connections again, closes the clients that were routed through the dead connection so they reconnect, and fails a message that has no live connection right away, with a WARN.
 
 ### Added
 
+- Graceful shutdown: on SIGTERM or SIGINT, lark-server stops its databases so each flushes its WAL before the process exits, giving each core up to 8 seconds (under the 10 seconds Docker and Kubernetes allow before SIGKILL). This works when the server runs as PID 1 in a container.
 - Server tunables for the remaining per-client and per-request caps that used to be compile-time constants: `LARK_MAX_TRANSACTION_OPS`, `LARK_MAX_ON_DISCONNECT_ACTIONS_PER_CLIENT`, `LARK_MAX_ON_DISCONNECT_BYTES_PER_CLIENT`, and `LARK_MAX_RESPONSE_SIZE` (each also a `--flag`). Defaults are unchanged.
 
 ### Changed
 
 - Every place the edge or server drops a client or a message because a defensive limit was hit now logs at WARN with the reason and context: outbox full, write deadline exceeded, backend disconnected, SSE buffer overflow, subscription cap, onDisconnect cap, transaction op cap, response-size rejections, and reliable messages dropped on a full send buffer (throttled to the first and every 1000th). These used to be at debug or trace, or not logged at all.
 - The edge logs `Client outbox approaching limit` at WARN when one client's queue crosses `CLIENT_OUTBOX_WARN_BYTES` (default 64 MB), and `Client outbox usage` at INFO once a minute while anything is queued, so the headroom on the cap is visible before anyone hits it.
+
+### Security
+
+- Updated rustls to 0.23.45 (GHSA-2mjx-qc3c-rqvc: TLS 1.3 handshake messages accepted across encryption-level boundaries). lark-server uses it only for outbound HTTPS through `ureq`; inbound TLS is terminated by lark-edge.
+- Updated xxhash-rust to 0.8.19 (GHSA-6g2r-675j-hx59, in the xxh3 custom-secret API). Lark uses only xxh64, so it wasn't affected; the update clears the alert.
 
 ## [0.2.0] — 2026-08-11
 
