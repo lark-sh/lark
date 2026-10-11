@@ -292,6 +292,9 @@ impl<IO: BlobIO> BlobSession<IO> {
                 if is_forwarded_flag(existing_type_flags) {
                     self.free_list
                         .free(existing_child_abs_offset, existing_child_size);
+                } else {
+                    // Still inside its parent's region: not reused, but dead.
+                    self.free_list.waste(existing_child_size);
                 }
 
                 let (new_bytes, _) = self.serialize_value_to_bytes(&wrapped)?;
@@ -354,6 +357,8 @@ impl<IO: BlobIO> BlobSession<IO> {
                     old_type_tag == TYPE_COLLECTION || old_type_tag == TYPE_ARRAY;
                 if new_size <= old_size && !old_is_container {
                     self.io.pwrite(child_abs_offset, &new_bytes).await?;
+                    // The old value's tail past the new one is dead.
+                    self.free_list.waste(old_size - new_size);
 
                     let new_type_tag = new_bytes[0];
                     if new_type_tag != old_type_tag || new_size != old_size {
@@ -374,6 +379,9 @@ impl<IO: BlobIO> BlobSession<IO> {
                 } else {
                     if is_forwarded_flag(type_flags) {
                         self.free_list.free(child_abs_offset, old_size);
+                    } else {
+                        // Still inside its parent's region: not reused, but dead.
+                        self.free_list.waste(old_size);
                     }
 
                     let new_abs_offset = self
@@ -403,7 +411,7 @@ impl<IO: BlobIO> BlobSession<IO> {
             }
 
             // Target exists and we're deleting — NULL tombstone
-            (Some((index_entry_abs_pos, _type_flags, child_abs_offset, _child_size)), None) => {
+            (Some((index_entry_abs_pos, _type_flags, child_abs_offset, child_size)), None) => {
                 trace!(
                     offset = child_abs_offset,
                     parent_offset = parent_nav.resolved_offset,
@@ -427,8 +435,11 @@ impl<IO: BlobIO> BlobSession<IO> {
                 self.io.pwrite_deferred(type_flags_pos, &entry_buf).await?;
                 self.io.sync().await?;
                 stats.in_place_updates += 1;
+                // The deleted child's bytes are dead (the tombstone keeps
+                // only its index entry).
+                self.free_list.waste(child_size);
 
-                self.bump_and_cascade(src, &ancestors, _child_size as u32, stats)
+                self.bump_and_cascade(src, &ancestors, child_size as u32, stats)
                     .await?;
                 stats.updates_applied += 1;
             }
@@ -606,6 +617,9 @@ impl<IO: BlobIO> BlobSession<IO> {
             if parent.is_forwarded {
                 self.free_list
                     .free(parent.resolved_offset, parsed.subtree_size);
+            } else {
+                // Still inside its parent's region: not reused, but dead.
+                self.free_list.waste(parsed.subtree_size);
             }
 
             let (new_offset, copy_stats) = crate::compact::compact_container(
@@ -737,6 +751,9 @@ impl<IO: BlobIO> BlobSession<IO> {
             if parent.is_forwarded {
                 self.free_list
                     .free(parent.resolved_offset, parsed.subtree_size);
+            } else {
+                // Still inside its parent's region: not reused, but dead.
+                self.free_list.waste(parsed.subtree_size);
             }
 
             let entries: Vec<(&str, &[u8])> = serialized
@@ -838,6 +855,9 @@ impl<IO: BlobIO> BlobSession<IO> {
             if parent.is_forwarded {
                 self.free_list
                     .free(parent.resolved_offset, parsed.subtree_size);
+            } else {
+                // Still inside its parent's region: not reused, but dead.
+                self.free_list.waste(parsed.subtree_size);
             }
 
             let op = crate::compact::CompactOp::InsertCollectionBatch { entries: &entries };
