@@ -393,6 +393,50 @@ mod tests {
 
     /// A write below a path deleted earlier in the same batch replaces the
     /// deleted node; its old children must not come back.
+    /// Deleting a key that's already deleted must not write anywhere. A moved
+    /// child's delete marker keeps its absolute offset but loses the moved
+    /// flag, so a second delete used to read that offset as relative to the
+    /// parent and write a null byte into whatever live data was there.
+    #[test]
+    fn test_delete_of_deleted_moved_child_leaves_other_data_alone() {
+        block_on(async {
+            for nested in [false, true] {
+                let at = |k: &str| -> Vec<String> {
+                    if nested {
+                        vec!["p".to_string(), k.to_string()]
+                    } else {
+                        vec![k.to_string()]
+                    }
+                };
+                let start = if nested {
+                    json!({"p": {"x": "s", "y": "keep"}})
+                } else {
+                    json!({"x": "s", "y": "keep"})
+                };
+                let io = setup_blob(start).await;
+                // Grow x so it moves to the end of the file.
+                let moved = vec![(at("x"), Some(ArcValue::from_value(json!("x".repeat(40)))))];
+                apply_updates(&io, &moved).await.unwrap();
+                // Live data after x's new location, long enough to cover where
+                // the stale offset points.
+                let long = "q".repeat(40000);
+                let q = vec![(
+                    vec!["q".to_string()],
+                    Some(ArcValue::from_value(json!(long.clone()))),
+                )];
+                apply_updates(&io, &q).await.unwrap();
+                apply_updates(&io, &[(at("x"), None)]).await.unwrap();
+                apply_updates(&io, &[(at("x"), None)]).await.unwrap();
+
+                assert_eq!(
+                    read_value_at_path(&io, &["q"]).await.to_value(),
+                    json!(long),
+                    "nested={nested}"
+                );
+            }
+        });
+    }
+
     #[test]
     fn test_delete_then_deeper_write_replaces_node() {
         block_on(async {

@@ -402,6 +402,13 @@ impl<IO: BlobIO> BlobSession<IO> {
                 stats.updates_applied += 1;
             }
 
+            // Already deleted (a zero-size null entry): nothing to do. Its offset
+            // is stale — a moved child's entry keeps its absolute offset but
+            // loses the moved flag — so writing there would hit other data.
+            (Some((_, type_flags, _, 0)), None) if extract_type_tag(type_flags) == TYPE_NULL => {
+                stats.updates_applied += 1;
+            }
+
             // Target exists and we're deleting — NULL tombstone
             (Some((index_entry_abs_pos, _type_flags, child_abs_offset, _child_size)), None) => {
                 trace!(
