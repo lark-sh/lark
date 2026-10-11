@@ -39,16 +39,39 @@ impl UpdateNode {
     /// - If a Set already exists at a prefix and a deeper path is added,
     ///   the Set's ArcValue is modified via `set_path_mut`.
     pub fn build(updates: &[(Vec<String>, Option<ArcValue>)]) -> HashMap<String, UpdateNode> {
+        Self::build_with_root(updates).1
+    }
+
+    /// Like [`UpdateNode::build`], and also handles writes to the root path
+    /// (a SET or DELETE of the whole tree). Returns true when the batch
+    /// replaced the root: the caller then deletes every existing top-level key
+    /// before applying the returned tree. Entries before the last root write
+    /// are dropped, a root SET's top-level keys become Sets, and later entries
+    /// are merged on top as usual.
+    ///
+    /// The blob's root is always a collection, so a root SET of a non-object
+    /// value leaves it empty.
+    pub fn build_with_root(
+        updates: &[(Vec<String>, Option<ArcValue>)],
+    ) -> (bool, HashMap<String, UpdateNode>) {
         let mut root: HashMap<String, UpdateNode> = HashMap::new();
+        let mut replaced = false;
 
         for (path, value) in updates {
             if path.is_empty() {
+                replaced = true;
+                root.clear();
+                if let Some(map) = value.as_ref().and_then(ArcValue::as_object) {
+                    for (key, child) in map {
+                        root.insert(key.clone(), UpdateNode::Set(child.clone()));
+                    }
+                }
                 continue;
             }
             Self::insert_into_tree(&mut root, path, value.clone());
         }
 
-        root
+        (replaced, root)
     }
 
     fn insert_into_tree(
@@ -435,6 +458,90 @@ mod tests {
                 );
             }
         });
+    }
+
+    type Update = (Vec<String>, Option<ArcValue>);
+
+    fn root_update(value: Option<serde_json::Value>) -> Update {
+        (Vec::new(), value.map(ArcValue::from_value))
+    }
+
+    fn key_update(path: &str, value: Option<serde_json::Value>) -> Update {
+        (
+            path.split('/').map(String::from).collect(),
+            value.map(ArcValue::from_value),
+        )
+    }
+
+    /// A SET or DELETE of the root replaces the whole tree, and later writes
+    /// in the same batch land on the new root.
+    #[test]
+    fn test_root_set_and_delete_replace_the_tree() {
+        block_on(async {
+            let start = json!({"a": 1, "b": {"c": 2}, "-Pk": {"long": "x".repeat(300)}});
+            let cases: Vec<(Vec<Update>, serde_json::Value)> = vec![
+                (vec![root_update(Some(json!({"x": 1})))], json!({"x": 1})),
+                (vec![root_update(None)], json!({})),
+                (
+                    vec![
+                        root_update(Some(json!({"a": {"b": 1}}))),
+                        key_update("a/c", Some(json!(2))),
+                    ],
+                    json!({"a": {"b": 1, "c": 2}}),
+                ),
+                (
+                    vec![
+                        key_update("z", Some(json!(1))),
+                        root_update(Some(json!({"x": 1}))),
+                    ],
+                    json!({"x": 1}),
+                ),
+                (
+                    vec![
+                        root_update(Some(json!({"x": 1, "y": 2}))),
+                        key_update("x", None),
+                    ],
+                    json!({"y": 2}),
+                ),
+                (
+                    vec![root_update(None), key_update("b/c", Some(json!(3)))],
+                    json!({"b": {"c": 3}}),
+                ),
+            ];
+            for (i, (updates, expected)) in cases.into_iter().enumerate() {
+                let io = setup_blob(start.clone()).await;
+                apply_updates(&io, &updates).await.unwrap();
+                assert_eq!(read_root(&io).await.to_value(), expected, "case {i}");
+
+                // The next batch applies normally on the replaced root.
+                apply_updates(&io, &[key_update("after", Some(json!(true)))])
+                    .await
+                    .unwrap();
+                let mut expected_after = expected.clone();
+                expected_after["after"] = json!(true);
+                assert_eq!(
+                    read_root(&io).await.to_value(),
+                    expected_after,
+                    "case {i}, next batch"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_update_node_build_with_root() {
+        let (replaced, tree) = UpdateNode::build_with_root(&[
+            key_update("z", Some(json!(1))),
+            root_update(Some(json!({"a": 1}))),
+            key_update("b/c", Some(json!(2))),
+        ]);
+        assert!(replaced);
+        assert!(!tree.contains_key("z"));
+        assert!(matches!(tree.get("a"), Some(UpdateNode::Set(_))));
+        assert!(matches!(tree.get("b"), Some(UpdateNode::Merge { .. })));
+
+        let (replaced, _) = UpdateNode::build_with_root(&[key_update("a", Some(json!(1)))]);
+        assert!(!replaced);
     }
 
     #[test]

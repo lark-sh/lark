@@ -162,7 +162,7 @@ impl<IO: BlobIO> BlobSession<IO> {
         }
 
         // Build the update tree (handles coalescing internally)
-        let tree = crate::incremental::UpdateNode::build(updates);
+        let (root_replaced, tree) = crate::incremental::UpdateNode::build_with_root(updates);
 
         // One read clone per batch — shared by all compactions
         let src = self.io.clone_for_reading().await?;
@@ -175,6 +175,20 @@ impl<IO: BlobIO> BlobSession<IO> {
         // Apply updates. If anything fails, discard all write-back state
         // so partial index updates don't contaminate the next batch.
         let apply_result: Result<()> = async {
+            if root_replaced {
+                // A root SET or DELETE replaced the whole tree: every
+                // top-level key on disk goes before this batch's writes apply.
+                let existing = match self.read_shallow(&[]).await? {
+                    ShallowValue::Children(children) => {
+                        children.into_iter().map(|c| c.key).collect()
+                    }
+                    ShallowValue::Primitive(_) => Vec::new(),
+                };
+                for key in existing {
+                    self.apply_single_update(&src, &[key.as_str()], None, &mut stats)
+                        .await?;
+                }
+            }
             if !tree.is_empty() {
                 let mut path_buf = Vec::new();
                 self.apply_tree(&src, &tree, &mut path_buf, &mut stats)
