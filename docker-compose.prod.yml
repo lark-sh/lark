@@ -25,7 +25,7 @@
 #
 # The images track `latest` by default; pin a version in the same .env:
 #
-#   echo "LARK_VERSION=0.2.0" >> .env
+#   echo "LARK_VERSION=0.3.0" >> .env
 #
 # Note: this serves plain HTTP on localhost (browsers exempt *.localhost from
 # mixed-content rules), which is right for trying Lark on your machine. For a
