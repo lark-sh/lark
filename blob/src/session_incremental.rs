@@ -49,10 +49,21 @@ impl<IO: BlobIO> BlobSession<IO> {
                         .await?;
                     path_so_far.pop();
                 }
-                UpdateNode::Merge(children) => {
+                UpdateNode::Merge {
+                    children,
+                    written_through,
+                } => {
                     path_so_far.push(key.clone());
 
                     let path_refs: Vec<&str> = path_so_far.iter().map(|s| s.as_str()).collect();
+                    if *written_through
+                        && self
+                            .replace_unless_container(src, &path_refs, children, stats)
+                            .await?
+                    {
+                        path_so_far.pop();
+                        continue;
+                    }
                     let nav_result = self.navigate_to_depth(&path_refs).await?;
 
                     let is_collection = if nav_result.1 == path_refs.len() {
@@ -145,15 +156,31 @@ impl<IO: BlobIO> BlobSession<IO> {
                                         .await?;
                                     path_so_far.pop();
                                 }
-                                UpdateNode::Merge(sub_children) => {
+                                UpdateNode::Merge {
+                                    children: sub_children,
+                                    written_through,
+                                } => {
                                     path_so_far.push(child_key.clone());
-                                    Box::pin(self.apply_tree(
-                                        src,
-                                        sub_children,
-                                        path_so_far,
-                                        stats,
-                                    ))
-                                    .await?;
+                                    let full_path: Vec<&str> =
+                                        path_so_far.iter().map(|s| s.as_str()).collect();
+                                    let replaced = *written_through
+                                        && self
+                                            .replace_unless_container(
+                                                src,
+                                                &full_path,
+                                                sub_children,
+                                                stats,
+                                            )
+                                            .await?;
+                                    if !replaced {
+                                        Box::pin(self.apply_tree(
+                                            src,
+                                            sub_children,
+                                            path_so_far,
+                                            stats,
+                                        ))
+                                        .await?;
+                                    }
                                     path_so_far.pop();
                                 }
                                 UpdateNode::Set(val) => {
@@ -176,6 +203,29 @@ impl<IO: BlobIO> BlobSession<IO> {
         }
 
         Ok(())
+    }
+
+    /// For a `Merge` node that a write in this batch went through: if the node
+    /// isn't a container on disk (it's a primitive, or absent), that write
+    /// replaced whatever was there, so the node ends up holding only this
+    /// batch's writes below it. Applies that as one set (or a delete, when
+    /// nothing survives) and returns true. Returns false for a container, which
+    /// the caller merges into as usual.
+    async fn replace_unless_container(
+        &mut self,
+        src: &IO,
+        path: &[&str],
+        children: &HashMap<String, UpdateNode>,
+        stats: &mut IncrementalStats,
+    ) -> Result<bool> {
+        let (_, depth) = self.navigate_to_depth(path).await?;
+        if depth == path.len() {
+            return Ok(false);
+        }
+        let value = UpdateNode::materialize(children);
+        self.apply_single_update(src, path, value.as_ref(), stats)
+            .await?;
+        Ok(true)
     }
 
     /// Apply a single update at a specific path.

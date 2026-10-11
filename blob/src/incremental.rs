@@ -18,7 +18,15 @@ pub enum UpdateNode {
     /// Delete this path.
     Delete,
     /// Merge child updates into the existing container on disk.
-    Merge(HashMap<String, UpdateNode>),
+    ///
+    /// `written_through` is set when a non-null write in this batch lands
+    /// below this node. Applied in order, that write turns the node into a
+    /// container even if it's a primitive on disk, so later deletes below it
+    /// act on that container rather than being no-ops under the primitive.
+    Merge {
+        children: HashMap<String, UpdateNode>,
+        written_through: bool,
+    },
 }
 
 impl UpdateNode {
@@ -93,7 +101,11 @@ impl UpdateNode {
                     existing_val.set_path_mut(&remaining_refs, value.unwrap());
                 }
             }
-            Some(UpdateNode::Merge(children)) => {
+            Some(UpdateNode::Merge {
+                children,
+                written_through,
+            }) => {
+                *written_through |= value.as_ref().is_some_and(|v| !v.is_null());
                 Self::insert_into_tree(children, rest, value);
             }
             Some(UpdateNode::Delete) => {
@@ -109,11 +121,38 @@ impl UpdateNode {
             }
             None => {
                 // Create a new Merge node and descend
+                let written_through = value.as_ref().is_some_and(|v| !v.is_null());
                 let mut children = HashMap::new();
                 Self::insert_into_tree(&mut children, rest, value);
-                tree.insert(key.clone(), UpdateNode::Merge(children));
+                tree.insert(
+                    key.clone(),
+                    UpdateNode::Merge {
+                        children,
+                        written_through,
+                    },
+                );
             }
         }
+    }
+
+    /// The value a node holds when only this batch's writes below it survive:
+    /// Sets become values, Deletes drop out, and nested Merges are built the
+    /// same way. `None` when nothing is left.
+    pub(crate) fn materialize(children: &HashMap<String, UpdateNode>) -> Option<ArcValue> {
+        let map: HashMap<String, ArcValue> = children
+            .iter()
+            .filter_map(|(key, node)| {
+                let value = match node {
+                    UpdateNode::Set(v) => Some(v.clone()),
+                    UpdateNode::Delete => None,
+                    UpdateNode::Merge { children, .. } => Self::materialize(children),
+                };
+                value
+                    .filter(|v| !v.is_null() && !v.is_empty_container())
+                    .map(|v| (key.clone(), v))
+            })
+            .collect();
+        (!map.is_empty()).then(|| ArcValue::Object(std::sync::Arc::new(map)))
     }
 }
 
@@ -372,6 +411,86 @@ mod tests {
                 read_root(&io).await.to_value(),
                 json!({"a": {"new": 5}, "z": 1})
             );
+        });
+    }
+
+    fn path(p: &str) -> Vec<String> {
+        p.split('/').map(String::from).collect()
+    }
+
+    /// Writing below a primitive replaces it with a container; deleting that
+    /// write again in the same batch leaves the container empty, so the
+    /// primitive must not come back.
+    #[test]
+    fn test_write_below_primitive_then_delete_in_same_batch() {
+        block_on(async {
+            // `p` sits in a collection; `s` is a primitive at the root.
+            let io = setup_blob(json!({"a": {"p": ",", "keep": 1}, "s": "str", "z": 1})).await;
+
+            let x = Some(ArcValue::from_value(json!({"fill": "transparent"})));
+            let updates = vec![
+                (path("a/p/x"), x.clone()),
+                (path("a/p/x"), None),
+                (path("s/b/c"), x.clone()),
+                (path("s/b/c"), None),
+            ];
+            apply_updates(&io, &updates).await.unwrap();
+
+            assert_eq!(
+                read_root(&io).await.to_value(),
+                json!({"a": {"keep": 1}, "z": 1})
+            );
+        });
+    }
+
+    /// Only the batch's surviving writes replace the primitive.
+    #[test]
+    fn test_write_below_primitive_keeps_surviving_writes() {
+        block_on(async {
+            let io = setup_blob(json!({"a": {"p": ",", "keep": 1}})).await;
+
+            let updates = vec![
+                (path("a/p/x"), Some(ArcValue::from_value(json!(1)))),
+                (path("a/p/y"), Some(ArcValue::from_value(json!(2)))),
+                (path("a/p/x"), None),
+            ];
+            apply_updates(&io, &updates).await.unwrap();
+
+            assert_eq!(
+                read_root(&io).await.to_value(),
+                json!({"a": {"keep": 1, "p": {"y": 2}}})
+            );
+        });
+    }
+
+    /// Below a container, write-then-delete leaves the existing children alone.
+    #[test]
+    fn test_write_then_delete_below_container_keeps_children() {
+        block_on(async {
+            let io = setup_blob(json!({"a": {"p": {"z": 1}}})).await;
+
+            let updates = vec![
+                (path("a/p/x"), Some(ArcValue::from_value(json!(1)))),
+                (path("a/p/x"), None),
+            ];
+            apply_updates(&io, &updates).await.unwrap();
+
+            assert_eq!(
+                read_root(&io).await.to_value(),
+                json!({"a": {"p": {"z": 1}}})
+            );
+        });
+    }
+
+    /// A delete below a primitive with no write before it is still a no-op.
+    #[test]
+    fn test_delete_below_primitive_alone_keeps_primitive() {
+        block_on(async {
+            let io = setup_blob(json!({"a": {"p": ","}})).await;
+
+            apply_updates(&io, &[(path("a/p/x"), None)]).await.unwrap();
+
+            assert_eq!(read_root(&io).await.to_value(), json!({"a": {"p": ","}}));
         });
     }
 
@@ -2238,8 +2357,11 @@ mod tests {
         let tree = UpdateNode::build(&updates);
         assert_eq!(tree.len(), 1);
         match tree.get("a").unwrap() {
-            UpdateNode::Merge(children) => match children.get("b").unwrap() {
-                UpdateNode::Merge(grandchildren) => match grandchildren.get("c").unwrap() {
+            UpdateNode::Merge { children, .. } => match children.get("b").unwrap() {
+                UpdateNode::Merge {
+                    children: grandchildren,
+                    ..
+                } => match grandchildren.get("c").unwrap() {
                     UpdateNode::Set(v) => assert_eq!(v.as_i64(), Some(1)),
                     _ => panic!("expected Set at c"),
                 },
@@ -2278,7 +2400,7 @@ mod tests {
         ];
         let tree = UpdateNode::build(&updates);
         match tree.get("a").unwrap() {
-            UpdateNode::Merge(children) => {
+            UpdateNode::Merge { children, .. } => {
                 match children.get("b").unwrap() {
                     UpdateNode::Set(v) => {
                         // The ArcValue should have both "x" and "c"
@@ -2355,7 +2477,7 @@ mod tests {
         ];
         let tree = UpdateNode::build(&updates);
         match tree.get("a").unwrap() {
-            UpdateNode::Merge(children) => match children.get("b").unwrap() {
+            UpdateNode::Merge { children, .. } => match children.get("b").unwrap() {
                 UpdateNode::Set(v) => assert_eq!(v.as_i64(), Some(2)),
                 _ => panic!("expected Set at b (parent set should replace child merge)"),
             },
@@ -2400,7 +2522,7 @@ mod tests {
         ];
         let tree = UpdateNode::build(&updates);
         match tree.get("chat").unwrap() {
-            UpdateNode::Merge(children) => {
+            UpdateNode::Merge { children, .. } => {
                 assert_eq!(children.len(), 3);
                 assert!(matches!(
                     children.get("-msg001").unwrap(),
@@ -2456,6 +2578,38 @@ mod tests {
         ];
         let tree = UpdateNode::build(&updates);
         assert!(matches!(tree.get("a").unwrap(), UpdateNode::Delete));
+    }
+
+    #[test]
+    fn test_update_node_build_marks_written_through() {
+        let updates = vec![
+            (path("a/p/x"), Some(ArcValue::from_value(json!(1)))),
+            (path("a/p/x"), None),
+            (path("d/q"), None),
+        ];
+        let tree = UpdateNode::build(&updates);
+        let UpdateNode::Merge {
+            children,
+            written_through,
+        } = tree.get("a").unwrap()
+        else {
+            panic!("expected Merge at a");
+        };
+        assert!(*written_through);
+        assert!(matches!(
+            children.get("p").unwrap(),
+            UpdateNode::Merge {
+                written_through: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            tree.get("d").unwrap(),
+            UpdateNode::Merge {
+                written_through: false,
+                ..
+            }
+        ));
     }
 
     // -----------------------------------------------------------------------
