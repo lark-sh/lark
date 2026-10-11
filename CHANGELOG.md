@@ -35,6 +35,11 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 - Every place the edge or server drops a client or a message because a defensive limit was hit now logs at WARN with the reason and context: outbox full, write deadline exceeded, backend disconnected, SSE buffer overflow, subscription cap, onDisconnect cap, transaction op cap, response-size rejections, and reliable messages dropped on a full send buffer (throttled to the first and every 1000th). These used to be at debug or trace, or not logged at all.
 - The edge logs `Client outbox approaching limit` at WARN when one client's queue crosses `CLIENT_OUTBOX_WARN_BYTES` (default 64 MB), and `Client outbox usage` at INFO once a minute while anything is queued, so the headroom on the cap is visible before anyone hits it.
 
+### Security
+
+- Updated rustls to 0.23.45 (GHSA-2mjx-qc3c-rqvc: TLS 1.3 handshake messages accepted across encryption-level boundaries). lark-server uses it only for outbound HTTPS through `ureq`; inbound TLS is terminated by lark-edge.
+- Updated xxhash-rust to 0.8.19 (GHSA-6g2r-675j-hx59, in the xxh3 custom-secret API). Lark uses only xxh64, so it wasn't affected; the update clears the alert.
+
 ## [0.2.0] — 2026-08-11
 
 The first public release of Lark, a realtime database server that is also wire-compatible with the Firebase Realtime Database, comprising the `lark-server` database engine (thread-per-core Rust on Glommio/io_uring, per-database write-ahead log, the `lark-blob` on-disk format with lazy loading and incremental compaction, and tunable durability up to fsync-before-ACK), the `lark-edge` gateway in Go (TLS termination, WebSocket/WebTransport/REST transports, JWT auth across four token formats, an embedded admin dashboard), the Firebase security-rules language and query surface, per-database resource limits, and deployment, backup, and observability guides with a one-command Fly.io quickstart.
