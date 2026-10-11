@@ -428,6 +428,12 @@ impl<IO: BlobIO> BlobSession<IO> {
                 k
             };
 
+            // A deleted child stays in the index as a TYPE_NULL entry with size
+            // 0, and its offset no longer points at a value. It isn't a child.
+            if tag == TYPE_NULL && size == 0 {
+                continue;
+            }
+
             let value = if Self::is_primitive_tag(tag) {
                 Some(Self::read_primitive_from(io, abs_offset).await?)
             } else {

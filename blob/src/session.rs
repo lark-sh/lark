@@ -2423,6 +2423,40 @@ mod tests {
     }
 
     #[test]
+    fn test_read_shallow_skips_deleted_children() {
+        // A deleted child stays in the parent's index as a TYPE_NULL entry with
+        // size 0. A shallow read must leave it out instead of reading a value
+        // at its stale offset.
+        block_on(async {
+            let tree = ArcValue::from_value(json!({
+                "characters": {
+                    "-Mabc123": {"hp": 100},
+                    "-Mdef456": {"hp": 50},
+                    "-Mghi789": "retired"
+                }
+            }));
+            let io = MemBlobIO::new();
+            write_blob(&io, &tree).await.unwrap();
+
+            let mut session = BlobSession::open(io.clone()).await.unwrap();
+            let updates = vec![
+                (vec!["characters".to_string(), "-Mabc123".to_string()], None),
+                (vec!["characters".to_string(), "-Mghi789".to_string()], None),
+            ];
+            apply(&mut session, &updates).await;
+
+            match session.read_shallow(&["characters"]).await.unwrap() {
+                ShallowValue::Primitive(_) => panic!("expected Children"),
+                ShallowValue::Children(children) => {
+                    let keys: Vec<&str> = children.iter().map(|c| c.key.as_str()).collect();
+                    assert_eq!(keys, vec!["-Mdef456"]);
+                    assert!(children[0].value.is_none());
+                }
+            }
+        });
+    }
+
+    #[test]
     fn test_read_shallow_nonexistent_path() {
         block_on(async {
             let tree = ArcValue::from_value(json!({"hp": 100}));
