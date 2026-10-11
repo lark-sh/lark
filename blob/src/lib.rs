@@ -16,6 +16,7 @@ pub mod session_incremental;
 pub mod session_reader;
 pub mod session_writer;
 pub mod test_helpers;
+pub mod wal;
 pub mod writer;
 
 // Public API re-exports

@@ -5,84 +5,17 @@
 //!
 //! The WalWriter is async and uses Glommio's io_uring-based async I/O.
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::io;
 use std::path::{Path, PathBuf};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::fsync::AppendFile;
 
 /// Maximum size of a single WAL file before rotation (5MB).
 pub const WAL_MAX_FILE_SIZE: u64 = 5 * 1024 * 1024;
 
-/// WAL operation types.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WalOp {
-    #[serde(rename = "s")]
-    Set,
-    #[serde(rename = "u")]
-    Update,
-    #[serde(rename = "d")]
-    Delete,
-}
-
-/// A single entry in the write-ahead log.
-///
-/// For SET: stores the value being set.
-/// For UPDATE: stores the delta (map of updates).
-/// For DELETE: value is None.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WalEntry {
-    /// Operation type.
-    #[serde(rename = "o")]
-    pub op: WalOp,
-
-    /// Database path for the operation.
-    #[serde(rename = "p")]
-    pub path: String,
-
-    /// Value for set/update operations.
-    #[serde(rename = "v", skip_serializing_if = "Option::is_none")]
-    pub value: Option<Value>,
-
-    /// WAL file sequence this entry belongs to (not persisted to disk).
-    /// Set by WalReader when loading and by Database when writing.
-    #[serde(skip)]
-    pub sequence: i64,
-}
-
-impl WalEntry {
-    /// Create a SET entry.
-    pub fn set(path: &str, value: Value) -> Self {
-        Self {
-            op: WalOp::Set,
-            path: path.to_string(),
-            value: Some(value),
-            sequence: 0,
-        }
-    }
-
-    /// Create an UPDATE entry.
-    pub fn update(path: &str, value: Value) -> Self {
-        Self {
-            op: WalOp::Update,
-            path: path.to_string(),
-            value: Some(value),
-            sequence: 0,
-        }
-    }
-
-    /// Create a DELETE entry.
-    pub fn delete(path: &str) -> Self {
-        Self {
-            op: WalOp::Delete,
-            path: path.to_string(),
-            value: None,
-            sequence: 0,
-        }
-    }
-}
+pub use lark_blob::wal::{WalEntry, WalOp};
+use lark_blob::wal::{parse_wal_lines, parse_wal_sequence};
 
 /// Async WAL writer that handles appending entries and file rotation.
 ///
@@ -453,7 +386,7 @@ impl WalReader {
         let bytes = super::fsync::read_file_async(&path).await?;
         let content =
             String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Self::parse_wal_lines(&content, &path, allow_trailing_truncation)
+        parse_wal_lines(&content, &path, allow_trailing_truncation)
     }
 
     /// Validate that WAL files form a contiguous sequence starting from min_sequence.
@@ -517,62 +450,6 @@ impl WalReader {
         Ok(())
     }
 
-    /// Parse WAL entries from lines, with strict corruption detection.
-    ///
-    /// If `allow_trailing_truncation` is true (only valid for the LAST WAL file
-    /// during replay), a malformed final line is tolerated — this handles the case
-    /// where the server crashed mid-write. Any malformed line that is NOT the last
-    /// line is always a fatal error, because it means data was lost or corrupted
-    /// in the middle of the file.
-    fn parse_wal_lines(
-        content: &str,
-        path: &Path,
-        allow_trailing_truncation: bool,
-    ) -> io::Result<Vec<WalEntry>> {
-        let non_empty_lines: Vec<(usize, &str)> = content
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| !line.trim().is_empty())
-            .collect();
-
-        let mut entries = Vec::new();
-        let total = non_empty_lines.len();
-
-        for (idx, (line_num, line)) in non_empty_lines.iter().enumerate() {
-            let is_last_line = idx == total - 1;
-
-            match serde_json::from_str::<WalEntry>(line) {
-                Ok(entry) => entries.push(entry),
-                Err(e) => {
-                    if is_last_line && allow_trailing_truncation {
-                        // Last line of last file — likely truncated on crash, acceptable
-                        warn!(
-                            "[WAL Reader] Skipping truncated last line in {:?} line {}: {}",
-                            path,
-                            line_num + 1,
-                            e
-                        );
-                    } else {
-                        // Corruption in the middle of a file — fatal
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "WAL corruption in {:?} at line {} (not last line): {}. \
-                                 This indicates data loss — refusing to load. \
-                                 Manual inspection required.",
-                                path,
-                                line_num + 1,
-                                e
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-
-        Ok(entries)
-    }
-
     /// Delete all WAL files with sequence < max_sequence.
     pub async fn delete_before(&self, max_sequence: i64) -> io::Result<()> {
         let files = self.list_files().await?;
@@ -588,13 +465,6 @@ impl WalReader {
 
         Ok(())
     }
-}
-
-/// Parse WAL sequence number from filename (e.g., "000001.wal" -> 1).
-fn parse_wal_sequence(filename: &str) -> Option<i64> {
-    filename
-        .strip_suffix(".wal")
-        .and_then(|s| s.parse::<i64>().ok())
 }
 
 #[cfg(test)]
