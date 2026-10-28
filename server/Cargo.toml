@@ -55,7 +55,7 @@ jsonwebtoken = { version = "10.3", default-features = true, features = ["rust_cr
 zstd = "0.13"
 
 # Crypto
-sha1 = "0.10"
+sha1 = "0.11"
 sha2 = "0.10"
 hmac = "0.12"      # edge↔server proxy-handshake authentication (HMAC over nonce)
 getrandom = "0.2"  # random per-connection handshake nonces
