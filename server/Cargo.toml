@@ -30,7 +30,7 @@ indexmap = "2"
 smallvec = { version = "1", features = ["serde"] }
 
 # Utilities
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 thiserror = "2"
 tracing = { version = "0.1", features = ["max_level_debug"] }
