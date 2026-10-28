@@ -6,6 +6,11 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 
 ## [Unreleased]
 
+### Security
+
+- Updated klauspost/compress to 1.18.7 (GHSA-259r-337f-4rfw, an integer overflow in `s2.NewDict`). lark-edge uses only the package's zstd decoder, so it wasn't affected; the update clears the alert.
+- Refreshed the dashboard's and the sticky-notes example's npm lockfiles to pick up fixed versions of vite, source-map-js, browserslist, baseline-browser-mapping, js-yaml and brace-expansion. These are build and dev-server tools; none of them ships in the edge image, which embeds only the built dashboard.
+
 ## [0.3.0] — 2026-10-11
 
 ### Fixed
