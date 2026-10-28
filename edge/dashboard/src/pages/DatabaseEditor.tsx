@@ -116,7 +116,7 @@ export function DatabaseEditor() {
 
   const currentPath = (splatPath || '').replace(/^\/+|\/+$/g, '');
   const currentRefPath = currentPath ? `/${currentPath}` : '/';
-  const pathSegments = currentPath ? currentPath.split('/') : [];
+  const pathSegments = useMemo(() => (currentPath ? currentPath.split('/') : []), [currentPath]);
 
   const [project, setProject] = useState<Project | null>(null);
   const [db, setDb] = useState<LarkDatabase | null>(null);
@@ -233,7 +233,7 @@ export function DatabaseEditor() {
       if (unsubscribeRef.current) unsubscribeRef.current();
       database?.disconnect();
     };
-  }, [projectId, databaseId]);
+  }, [projectId, databaseId, urls]);
 
   // Shallow prefetch — if a subtree is huge, render a key list instead of
   // pulling the whole thing into a JSON editor.
@@ -246,6 +246,7 @@ export function DatabaseEditor() {
       unsubscribeRef.current = null;
     }
     shallowCheckDoneRef.current = false;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset the view when the path changes, before the async fetch
     setViewMode('loading');
     setData(null);
     prevDataRef.current = null;

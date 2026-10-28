@@ -91,3 +91,39 @@ jobs:
       - name: Test
         working-directory: edge
         run: go test -race ./...
+
+  dashboard:
+    name: Dashboard — lint, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Matches the node:22 image edge/Dockerfile builds the SPA with.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            edge/dashboard/package-lock.json
+            examples/sticky-notes/package-lock.json
+
+      # Mirrors `make build-spa`. The build also type-checks (tsc -b).
+      - name: Install
+        working-directory: edge/dashboard
+        run: npm ci --no-audit --no-fund
+
+      - name: Lint
+        working-directory: edge/dashboard
+        run: npm run lint
+
+      - name: Build
+        working-directory: edge/dashboard
+        run: npm run build
+
+      # The example isn't shipped, but building it catches dependency bumps
+      # that break it.
+      - name: Build sticky-notes example
+        working-directory: examples/sticky-notes
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
