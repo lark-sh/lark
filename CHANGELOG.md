@@ -10,6 +10,7 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 
 - Updated klauspost/compress to 1.18.7 (GHSA-259r-337f-4rfw, an integer overflow in `s2.NewDict`). lark-edge uses only the package's zstd decoder, so it wasn't affected; the update clears the alert.
 - Refreshed the dashboard's and the sticky-notes example's npm lockfiles to pick up fixed versions of vite, source-map-js, browserslist, baseline-browser-mapping, js-yaml and brace-expansion. These are build and dev-server tools; none of them ships in the edge image, which embeds only the built dashboard.
+- Updated rustls to 0.23.46 (GHSA-h2v8-394m-p7vv, GHSA-c8m5-c952-6cm4, GHSA-w44r-93j7-qv28, GHSA-vp88-798v-h67f). lark-server uses it only for outbound HTTPS through `ureq`, without brotli certificate compression or ECH, and never Debug-formats TLS sessions; at worst, a later connection could fall back to a classical-only X25519 key exchange.
 
 ## [0.3.0] — 2026-10-11
 
