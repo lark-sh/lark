@@ -60,7 +60,7 @@ sha2 = "0.10"
 hmac = "0.12"      # edge↔server proxy-handshake authentication (HMAC over nonce)
 getrandom = "0.2"  # random per-connection handshake nonces
 hex = "0.4"
-serde_json_canonicalizer = "0.3"
+serde_json_canonicalizer = "0.4"
 
 # Hashing (for consistent database-to-core mapping)
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
