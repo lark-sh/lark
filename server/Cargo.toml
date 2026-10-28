@@ -58,7 +58,7 @@ zstd = "0.13"
 sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"      # edge↔server proxy-handshake authentication (HMAC over nonce)
-getrandom = "0.2"  # random per-connection handshake nonces
+getrandom = "0.4"  # random per-connection handshake nonces
 hex = "0.4"
 serde_json_canonicalizer = "0.3"
 
