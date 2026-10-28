@@ -74,7 +74,7 @@ jobs:
             dockerfile: edge/Dockerfile
         platform: ${{ fromJSON(needs.prepare.outputs.platforms) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Resolve the version baked into the binaries. Tag pushes use the tag
       # (v0.2.0 → 0.2.0) and must match [workspace.package] in Cargo.toml —
@@ -201,7 +201,7 @@ jobs:
     # Only when a version tag was pushed — manual runs just publish images.
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # This job only runs on tag pushes, so the version is the tag minus its
       # leading `v` — the same tag the images carry.

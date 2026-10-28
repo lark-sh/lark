@@ -18,7 +18,7 @@ jobs:
     name: Rust — fmt, clippy, build, test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # GitHub's Linux runners have io_uring, so the Rust workspace builds
       # natively (no dev container needed). These mirror Dockerfile.dev's deps.
@@ -59,7 +59,7 @@ jobs:
     name: Go edge — fmt, vet, test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v5
         with:
@@ -96,7 +96,7 @@ jobs:
     name: Dashboard — lint, build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Matches the node:22 image edge/Dockerfile builds the SPA with.
       - uses: actions/setup-node@v4
