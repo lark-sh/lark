@@ -18,7 +18,7 @@ COPY edge/dashboard/ ./
 RUN npm run build
 
 # --- Stage 2: Go binary ------------------------------------------------------
-FROM golang:1.25-alpine AS gobuild
+FROM golang:1.27-alpine AS gobuild
 RUN apk add --no-cache git
 WORKDIR /src/edge
 
@@ -34,7 +34,7 @@ RUN go mod download
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/lark-edge .
 
 # --- Stage 3: runtime --------------------------------------------------------
-FROM alpine:3.20
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates
 WORKDIR /app
 
