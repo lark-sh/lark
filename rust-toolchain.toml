@@ -5,6 +5,7 @@
 # Bump deliberately, and keep these in sync when you do:
 #   - CI:            .github/workflows/ci.yml  (dtolnay/rust-toolchain@<version>)
 #   - Dev container: Dockerfile.dev            (--default-toolchain <version>)
+# server/Dockerfile reads this file directly, so it needs no change.
 [toolchain]
 channel = "1.95.0"
 components = ["rustfmt", "clippy"]
