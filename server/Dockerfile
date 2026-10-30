@@ -24,11 +24,18 @@ RUN apt-get update && apt-get install -y \
     clang \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# The toolchain comes from rust-toolchain.toml rather than rustup's default, and
+# the build below is --locked, so an image contains the same compiler and crates
+# that CI tested.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain none --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /src
-COPY Cargo.toml /src/Cargo.toml
+COPY rust-toolchain.toml /src/rust-toolchain.toml
+RUN rustup toolchain install
+
+COPY Cargo.toml Cargo.lock /src/
 COPY blob /src/blob
 COPY server /src/server
 # Cargo loads every workspace member's manifest even when we ask it to
@@ -40,7 +47,7 @@ COPY tools /src/tools
 # CARGO_PKG_VERSION, so the value is unused here.
 ARG VERSION=dev
 
-RUN cargo build --release -p lark-server
+RUN cargo build --release --locked -p lark-server
 
 # --- Stage 2: runtime --------------------------------------------------------
 FROM ubuntu:22.04
