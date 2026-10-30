@@ -157,7 +157,7 @@ impl Database {
                 let child_path_obj = Path::parse(path);
                 tree.set_arc_uncleaned_lazy(&child_path_obj, ArcValue::empty_sentinel());
                 // Clear stale descendant entries before inserting the new one
-                let prefix = format!("{}/", &path);
+                let prefix = format!("{}/", path);
                 let stale: Vec<String> = sentinel_paths
                     .range::<String, _>(&prefix..)
                     .take_while(|p| p.starts_with(&prefix))

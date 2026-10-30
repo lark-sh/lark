@@ -46,13 +46,8 @@ clap = { version = "4", features = ["derive", "env"] }
 # HTTP client (blocking, for coordinator registration)
 ureq = { version = "2", features = ["json"] }
 
-# Auth
-# v10 needs an explicit crypto backend (no default provider). rust_crypto is
-# pure-Rust (no C build deps); `use_pem` (default) stays on for Firebase PEM keys.
-jsonwebtoken = { version = "10.3", default-features = true, features = ["rust_crypto"] }
-
 # Compression
-zstd = "0.13"
+zstd = "0.14"
 
 # Crypto
 sha1 = "0.10"

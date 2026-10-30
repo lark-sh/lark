@@ -40,9 +40,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// Test secret used for JWT signing in auth tests.
-pub const TEST_SECRET: &str = "test-secret-key-for-integration-tests";
-
 /// Default timeout for waiting for responses.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -1225,32 +1222,6 @@ pub struct QueryOptions {
 // Helper Functions
 // =============================================================================
 
-/// Generate a test JWT token (for tests that need real token validation).
-pub fn generate_test_token(uid: &str, claims: Option<HashMap<String, Value>>) -> String {
-    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-
-    let mut payload = json!({
-        "uid": uid,
-        "iat": chrono::Utc::now().timestamp(),
-        "exp": chrono::Utc::now().timestamp() + 3600,
-    });
-
-    if let Some(extra_claims) = claims
-        && let Value::Object(ref mut map) = payload
-    {
-        for (k, v) in extra_claims {
-            map.insert(k, v);
-        }
-    }
-
-    let header = Header::new(Algorithm::HS256);
-    encode(
-        &header,
-        &payload,
-        &EncodingKey::from_secret(TEST_SECRET.as_bytes()),
-    )
-    .unwrap()
-}
 /// Compute JCS (RFC 8785) hash of a JSON value.
 pub fn compute_jcs_hash(value: &Value) -> String {
     use sha2::{Digest, Sha256};
