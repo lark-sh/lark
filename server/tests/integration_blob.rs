@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::{TestServer, TransactionOp, run_test};
+use common::{QueryOptions, TestServer, TransactionOp, compute_jcs_hash, run_test};
 use lark_blob::{ArcValue, StdBlobIO, write_blob};
 use serde_json::json;
 use std::time::Duration;
@@ -2937,5 +2937,175 @@ fn test_blob_rules_admin_only_update_at_root_works() {
         // promotion).
         let bob_name = client.once("/users/bob/name").await.unwrap();
         assert_eq!(bob_name, json!("Bob"));
+    });
+}
+
+/// Connects a client to a blob-backed database holding `data`.
+async fn connect_to_blob(
+    data_dir: &str,
+    db_name: &str,
+    data: serde_json::Value,
+    rules: serde_json::Value,
+) -> (TestServer, common::TestClient) {
+    write_test_blob(
+        data_dir,
+        "test-project",
+        db_name,
+        &ArcValue::from_value(data),
+    );
+    let server = TestServer::with_persistence(data_dir);
+    server
+        .set_rules_with_ephemeral("test-project", rules, false)
+        .unwrap();
+    let mut client = server.client();
+    client.connect(&format!("test-project/{db_name}")).await;
+    (server, client)
+}
+
+fn open_rules() -> serde_json::Value {
+    json!({"rules": {".read": true, ".write": true}})
+}
+
+/// Reading a key that doesn't exist must not add it to its loaded parent.
+#[test]
+fn test_blob_read_of_missing_key_leaves_parent_unchanged() {
+    run_test(|| async {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+        let data = json!({"root": {"100": {"x": 1}}});
+        let (_server, client) = connect_to_blob(data_dir, "missing-key", data, open_rules()).await;
+
+        assert_eq!(
+            client.once("/root").await.unwrap(),
+            json!({"100": {"x": 1}})
+        );
+        assert_eq!(client.once("/root/999").await.unwrap(), json!(null));
+        assert_eq!(
+            client.once("/root").await.unwrap(),
+            json!({"100": {"x": 1}})
+        );
+    });
+}
+
+/// A multi-path delete and a plain delete both remove a parent left empty, and
+/// reading that parent's path afterward doesn't bring its key back.
+#[test]
+fn test_blob_read_of_emptied_parent_leaves_grandparent_unchanged() {
+    run_test(|| async {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+        let (_server, client) =
+            connect_to_blob(data_dir, "emptied", json!({"seed": 1}), open_rules()).await;
+        let expected = json!({"100": {"a": {"x": 1}}});
+
+        for delete_with_update in [true, false] {
+            client
+                .update("/", json!({"root/100/a": {"x": 1}, "root/200/b": {"x": 2}}))
+                .await
+                .unwrap();
+            if delete_with_update {
+                client
+                    .update("/", json!({"root/200/b": null}))
+                    .await
+                    .unwrap();
+            } else {
+                client.remove("/root/200/b").await.unwrap();
+            }
+
+            assert_eq!(client.once("/root").await.unwrap(), expected);
+            assert_eq!(client.once("/root/200").await.unwrap(), json!(null));
+            assert_eq!(client.once("/root").await.unwrap(), expected);
+
+            let query = QueryOptions {
+                order_by: Some("key".to_string()),
+                end_at: Some(json!("200")),
+                ..Default::default()
+            };
+            assert_eq!(client.once_query("/root", query).await.unwrap(), expected);
+        }
+    });
+}
+
+/// A checked-but-missing key must not take a slot in a limited query.
+#[test]
+fn test_blob_missing_key_does_not_use_query_limit() {
+    run_test(|| async {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+        let data = json!({"root": {"300": "real"}});
+        let (_server, client) = connect_to_blob(data_dir, "limit", data, open_rules()).await;
+
+        client.once("/root").await.unwrap();
+        client.once("/root/100").await.unwrap();
+
+        let query = QueryOptions {
+            order_by: Some("key".to_string()),
+            limit_to_first: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            client.once_query("/root", query).await.unwrap(),
+            json!({"300": "real"})
+        );
+    });
+}
+
+/// A conditional write compares a hash of the current value, so a checked-but-
+/// missing key must not change the parent's hash.
+#[test]
+fn test_blob_missing_key_does_not_change_parent_hash() {
+    run_test(|| async {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+        let data = json!({"root": {"100": {"x": 1}}});
+        let (_server, client) = connect_to_blob(data_dir, "hash", data, open_rules()).await;
+
+        let value = client.once("/root").await.unwrap();
+        client.once("/root/999").await.unwrap();
+
+        client
+            .transaction(vec![
+                TransactionOp {
+                    op: "c".to_string(),
+                    path: "/root".to_string(),
+                    value: None,
+                    hash: Some(compute_jcs_hash(&value)),
+                },
+                TransactionOp {
+                    op: "s".to_string(),
+                    path: "/done".to_string(),
+                    value: Some(json!(true)),
+                    hash: None,
+                },
+            ])
+            .await
+            .unwrap();
+    });
+}
+
+/// Rules see a missing key as missing after it has been read, and their retry
+/// loop settles without a marker in the parent.
+#[test]
+fn test_blob_rules_treat_checked_key_as_missing() {
+    run_test(|| async {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+        let data = json!({"root": {"100": "taken"}});
+        let rules = json!({"rules": {
+            ".read": true,
+            "root": {
+                ".write": false,
+                "$key": {".write": "!data.exists()"}
+            }
+        }});
+        let (_server, client) = connect_to_blob(data_dir, "rules-missing", data, rules).await;
+
+        client.once("/root").await.unwrap();
+        assert_eq!(client.once("/root/200").await.unwrap(), json!(null));
+
+        client.set("/root/200", "first").await.unwrap();
+        assert!(client.set("/root/200", "second").await.is_err());
+        assert!(client.set("/root/100", "second").await.is_err());
+        assert_eq!(client.once("/root/200").await.unwrap(), json!("first"));
     });
 }

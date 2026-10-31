@@ -1153,6 +1153,7 @@ dependencies = [
  "lark-blob",
  "libc",
  "once_cell",
+ "proptest",
  "regex",
  "serde",
  "serde_json",

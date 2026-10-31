@@ -524,6 +524,15 @@ impl ArcValue {
         }
     }
 
+    /// True if `clean` would drop this value or anything below it.
+    fn needs_cleaning(&self) -> bool {
+        match self {
+            ArcValue::Null => true,
+            ArcValue::Object(map) => map.is_empty() || map.values().any(ArcValue::needs_cleaning),
+            _ => false,
+        }
+    }
+
     pub fn clean(self) -> Option<ArcValue> {
         match self {
             ArcValue::Null => None,
@@ -531,8 +540,7 @@ impl ArcValue {
                 if map.is_empty() {
                     return None;
                 }
-                let needs_cleaning = map.values().any(|v| v.is_null() || v.is_empty_container());
-                if !needs_cleaning {
+                if !map.values().any(ArcValue::needs_cleaning) {
                     return Some(ArcValue::Object(map));
                 }
                 let cleaned: HashMap<String, ArcValue> = map
@@ -820,6 +828,22 @@ impl<T: Into<ArcValue>> From<HashMap<String, T>> for ArcValue {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_clean_removes_nested_empty_containers() {
+        let value = ArcValue::from_value(json!({
+            "kept": {"x": 1},
+            "gone": {"inner": {}},
+            "deep": {"a": {"b": {"c": null}}, "d": 2}
+        }));
+        assert_eq!(
+            value.clean().unwrap().to_value(),
+            json!({"kept": {"x": 1}, "deep": {"d": 2}})
+        );
+
+        let empty = ArcValue::from_value(json!({"a": {"b": {}}}));
+        assert!(empty.clean().is_none());
+    }
 
     #[test]
     fn test_from_value_primitives() {

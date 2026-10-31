@@ -3617,3 +3617,45 @@ fn test_trailing_slash_read_promotes_sentinel_children() {
         );
     })
 }
+
+// A shallow promote leaves container children as Sentinels. When the data behind
+// one turns out to be deleted, promoting it removes the key and prunes parents
+// left empty, rather than leaving Null in a loaded Object.
+#[test]
+fn test_promoting_deleted_sentinel_child_removes_it() {
+    block_on(async {
+        let (mut db, _dir) = make_blob_backed_db(json!({
+            "root": {
+                "branch": {"leaf": {"x": 1}},
+                "other": {"y": 2}
+            },
+            "seed": 1
+        }))
+        .await;
+        let (conn, _messages) = MockConnection::new();
+        db.add_client_internal("client1", None, "conn1", conn);
+
+        db.promote_path("/root").await.unwrap();
+        assert!(
+            db.tree
+                .read()
+                .unwrap()
+                .is_sentinel(&Path::parse("/root/branch"))
+        );
+
+        let delete = ClientMessage {
+            op: "u".to_string(),
+            path: Some("/".to_string()),
+            value: Some(json!({"root/branch/leaf": null})),
+            request_id: Some("w1".to_string()),
+            ..Default::default()
+        };
+        db.handle_update("client1", &delete, false).await;
+
+        db.promote_path_deep("/root/branch").await.unwrap();
+        let tree = db.tree.read().unwrap();
+        assert_eq!(tree.get(&Path::parse("/root/branch")), None);
+        assert!(tree.get(&Path::parse("/root/other")).is_some());
+        assert_eq!(tree.find_empty_child(), None);
+    })
+}

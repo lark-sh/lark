@@ -925,3 +925,57 @@ fn test_external_full_compaction_blob_rotation() {
         server.shutdown().await;
     });
 }
+
+/// Deleting every child leaves an empty collection in the blob. It holds no
+/// data, so reads must not return it at any depth.
+#[test]
+#[ignore] // Slow test — writes 5MB+ to trigger rotation
+fn test_storage_worker_emptied_collections_are_not_read_back() {
+    run_test(|| async {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+        let db_name = "emptied-collections-db";
+
+        let tree = ArcValue::from_value(json!({
+            "root": {
+                "keep": {"x": 1},
+                "gone": {"inner": {"a": 1, "b": 2}},
+                "shallow": {"a": 1}
+            }
+        }));
+        write_test_blob(data_dir, "test-project", db_name, &tree);
+
+        let server = TestServer::with_persistence(data_dir);
+        server
+            .set_rules_with_ephemeral(
+                "test-project",
+                json!({"rules": {".read": true, ".write": true}}),
+                false,
+            )
+            .unwrap();
+        let mut client = server.client();
+        client.connect(&format!("test-project/{db_name}")).await;
+
+        client
+            .update(
+                "/",
+                json!({
+                    "root/gone/inner/a": null,
+                    "root/gone/inner/b": null,
+                    "root/shallow/a": null
+                }),
+            )
+            .await
+            .unwrap();
+
+        trigger_rotation_and_wait(&client).await;
+        assert!(read_sequence(data_dir, "test-project", db_name) > 0);
+        client.force_evict_all().await;
+
+        let expected = json!({"keep": {"x": 1}});
+        assert_eq!(client.once("/root").await.unwrap(), expected);
+        assert_eq!(client.once("/root/gone").await.unwrap(), json!(null));
+        assert_eq!(client.once("/root/gone/inner").await.unwrap(), json!(null));
+        assert_eq!(client.once("/root").await.unwrap(), expected);
+    });
+}
