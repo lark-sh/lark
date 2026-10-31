@@ -3784,3 +3784,69 @@ fn test_path_holds_stored_data_finds_data_missing_from_tree() {
         assert!(db.path_holds_stored_data("/root/new/leaf").await);
     })
 }
+
+// A shallow read works out whether pending deletes emptied a container without
+// loading anything: only what it reads along the deleted paths, and no promotion.
+#[test]
+fn test_shallow_once_checks_pending_deletes_without_promoting() {
+    block_on(async {
+        let (mut db, _dir) = make_blob_backed_db(json!({
+            "root": {
+                "emptied": {"a": {"b": 1}},
+                "partly": {"x": 1, "y": {"z": 2}},
+                "untouched": {"big": {"deep": 3}}
+            }
+        }))
+        .await;
+        let (conn, _messages) = MockConnection::new();
+        db.add_client_internal("client1", None, "conn1", conn);
+
+        let update = root_update_msg(json!({
+            "root/emptied/a/b": null,
+            "root/partly/x": null
+        }));
+        db.handle_update("client1", &update, false).await;
+        let promoted_before = db.promoted_paths.len();
+
+        let resp = db
+            .handle_once("client1", &shallow_once_msg("/root", "r1"))
+            .await
+            .unwrap();
+        let val = extract_once_value(&resp).unwrap();
+        let obj = val.as_object().unwrap();
+        assert_eq!(obj.len(), 2);
+        assert_is_size_marker(&obj["partly"], "partly");
+        assert_is_size_marker(&obj["untouched"], "untouched");
+
+        assert_eq!(db.promoted_paths.len(), promoted_before);
+        let tree = db.tree.read().unwrap();
+        assert!(tree.get(&Path::parse("/root/partly/y")).is_none());
+        assert!(tree.get(&Path::parse("/root/untouched")).is_none());
+    })
+}
+
+// Eviction can leave a primitive child as a Sentinel, so a shallow read can't
+// assume an unloaded child is a container.
+#[test]
+fn test_shallow_once_unloaded_primitive_child_keeps_its_value() {
+    block_on(async {
+        let (mut db, _dir) =
+            make_blob_backed_db(json!({"root": {"leaf": 0, "box": {"x": 1}}})).await;
+        let (conn, _messages) = MockConnection::new();
+        db.add_client_internal("client1", None, "conn1", conn);
+
+        db.promote_path("/root").await.unwrap();
+        db.tree
+            .write()
+            .unwrap()
+            .set_arc_uncleaned_lazy(&Path::parse("/root/leaf"), ArcValue::empty_sentinel());
+
+        let resp = db
+            .handle_once("client1", &shallow_once_msg("/root", "r1"))
+            .await
+            .unwrap();
+        let val = extract_once_value(&resp).unwrap();
+        assert_eq!(val["leaf"], json!(0));
+        assert_is_size_marker(&val["box"], "box");
+    })
+}
