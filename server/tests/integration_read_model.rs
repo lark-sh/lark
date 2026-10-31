@@ -565,7 +565,6 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "known issue: shallow reads fail on unloaded children and miss ancestor writes"]
     fn test_model_shallow_reads(script in script(Mode { shallow: true, ..BLOB_BACKED })) {
         run(script, Mode { shallow: true, ..BLOB_BACKED });
     }

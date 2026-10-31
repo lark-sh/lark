@@ -3659,3 +3659,101 @@ fn test_promoting_deleted_sentinel_child_removes_it() {
         assert_eq!(tree.find_empty_child(), None);
     })
 }
+
+fn root_update_msg(value: Value) -> ClientMessage {
+    ClientMessage {
+        op: "u".to_string(),
+        path: Some("/".to_string()),
+        value: Some(value),
+        request_id: Some("w1".to_string()),
+        ..Default::default()
+    }
+}
+
+// A loaded parent holds its container children as Sentinels after a shallow
+// promote, and they go out as size markers.
+#[test]
+fn test_shallow_once_unloaded_child_of_loaded_parent() {
+    block_on(async {
+        let (mut db, _dir) = make_blob_backed_db(json!({
+            "root": {"container": {"x": 1}, "leaf": 2}
+        }))
+        .await;
+        let (conn, _messages) = MockConnection::new();
+        db.add_client_internal("client1", None, "conn1", conn);
+        db.promote_path("/root").await.unwrap();
+
+        let resp = db
+            .handle_once("client1", &shallow_once_msg("/root", "r1"))
+            .await
+            .unwrap();
+        assert!(resp.nack.is_none());
+        assert!(resp.encode().is_ok());
+
+        let val = extract_once_value(&resp).unwrap();
+        assert_eq!(val["leaf"], json!(2));
+        assert_is_size_marker(&val["container"], "container");
+    })
+}
+
+// An update sent from above the path still counts, and replaces a primitive
+// in the blob.
+#[test]
+fn test_shallow_once_sees_pending_update_from_ancestor() {
+    block_on(async {
+        let (mut db, _dir) = make_blob_backed_db(json!({"m": 0, "seed": 1})).await;
+        let (conn, _messages) = MockConnection::new();
+        db.add_client_internal("client1", None, "conn1", conn);
+
+        let update = root_update_msg(json!({"m/alpha": 1}));
+        db.handle_update("client1", &update, false).await;
+
+        let resp = db
+            .handle_once("client1", &shallow_once_msg("/m", "r1"))
+            .await
+            .unwrap();
+        assert_eq!(extract_once_value(&resp), Some(json!({"alpha": 1})));
+    })
+}
+
+// A pending delete of a container's last child removes the container's key.
+#[test]
+fn test_shallow_once_skips_container_emptied_by_pending_delete() {
+    block_on(async {
+        let (mut db, _dir) = make_blob_backed_db(json!({
+            "root": {"emptied": {"x": 1}, "kept": {"y": 2}}
+        }))
+        .await;
+        let (conn, _messages) = MockConnection::new();
+        db.add_client_internal("client1", None, "conn1", conn);
+
+        let update = root_update_msg(json!({"root/emptied/x": null}));
+        db.handle_update("client1", &update, false).await;
+
+        let resp = db
+            .handle_once("client1", &shallow_once_msg("/root", "r1"))
+            .await
+            .unwrap();
+        let val = extract_once_value(&resp).unwrap();
+        let obj = val.as_object().unwrap();
+        assert_eq!(obj.len(), 1);
+        assert_is_size_marker(&obj["kept"], "kept");
+    })
+}
+
+// A path missing at any depth below a loaded node doesn't exist, so reading it
+// needs no blob read and leaves the node as it was.
+#[test]
+fn test_read_below_missing_child_leaves_loaded_parent_unchanged() {
+    block_on(async {
+        let (mut db, _dir) = make_blob_backed_db(json!({"root": {"a": 1}})).await;
+        db.promote_path("/root").await.unwrap();
+
+        db.promote_path("/root/missing/deep").await.unwrap();
+        db.promote_path_deep("/root/missing/deep").await.unwrap();
+
+        let tree = db.tree.read().unwrap();
+        assert_eq!(tree.get(&Path::parse("/root/missing")), None);
+        assert!(tree.node_is_loaded("/root/missing/deep"));
+    })
+}

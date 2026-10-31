@@ -33,34 +33,21 @@ impl Database {
                     }
                     return Ok(false);
                 }
-                None => {
-                    // Node is absent (not even a Sentinel). Check if the parent is
-                    // a loaded container (Object). If so, the parent has complete
-                    // knowledge of its children — an absent child definitively does
-                    // not exist. No blob read needed.
-                    //
-                    // Why this is safe:
-                    // - A non-Sentinel parent was either promoted (all children loaded
-                    //   from blob + WAL) or written via SET (full replacement).
-                    // - If a child were evicted, it would be a Sentinel, not absent.
-                    // - If a child were deleted, it is correctly absent.
-                    //
-                    // No marker is written here: the absent key is the record that
-                    // the child doesn't exist, and the next read repeats this same
-                    // check. A Null stored in an Object would be read back as a
-                    // child of that Object.
-                    //
-                    // A primitive parent means the child can't exist either.
-                    if let Some(parent) = path_obj.parent()
-                        && let Some(parent_node) = tree.get(&parent)
-                        && !parent_node.is_sentinel()
-                    {
-                        return Ok(false);
-                    }
-                    // Parent is Sentinel or absent — need to load from blob
-                }
+                // Node is absent (not even a Sentinel). Below a loaded node, it
+                // definitively does not exist, and no blob read is needed.
+                //
+                // Why this is safe:
+                // - A non-Sentinel node was either promoted (all children loaded
+                //   from blob + WAL) or written via SET (full replacement).
+                // - If a child were evicted, it would be a Sentinel, not absent.
+                // - If a child were deleted, it is correctly absent.
+                //
+                // No marker is written here: the absent key is the record that the
+                // child doesn't exist, and the next read repeats this same check.
+                // A Null stored in an Object would be read back as its child.
+                None if tree.has_loaded_ancestor(&path_obj) => return Ok(false),
                 _ => {
-                    // Sentinel — need to load from blob
+                    // Sentinel, or absent below one — need to load from blob
                 }
             }
         }
@@ -147,12 +134,9 @@ impl Database {
                     true
                 }
                 None => {
-                    // Same check as in promote_path: an absent child of a loaded
-                    // parent doesn't exist, and nothing needs to be recorded.
-                    if let Some(parent) = path_obj.parent()
-                        && let Some(parent_node) = tree.get(&parent)
-                        && !parent_node.is_sentinel()
-                    {
+                    // Same check as in promote_path: a path absent below a loaded
+                    // node doesn't exist, and nothing needs to be recorded.
+                    if tree.has_loaded_ancestor(&path_obj) {
                         return Ok(false);
                     }
                     // Parent is Sentinel or absent — need to load
@@ -171,6 +155,40 @@ impl Database {
         // Force a full promotion: read from blob + replay WAL, replacing the subtree.
         // This is the same logic as promote_path but without the early bail-out.
         self.promote_path_unchecked(path).await
+    }
+
+    /// Applies the pending WAL entries that affect `path` on top of `base`, a value
+    /// read from the blob whose container children may be Sentinels, and returns
+    /// the result without touching the tree.
+    pub(super) fn replay_wal_lazy(&self, path: &str, base: ArcValue) -> ArcValue {
+        let path_obj = Path::parse(path);
+        let mut temp_tree = Tree::new();
+        temp_tree.set_arc_uncleaned(&path_obj, base);
+
+        let matching_indices = self.wal_index.find_affecting(path);
+        for &idx in &matching_indices {
+            let entry = &self.pending_wal_entries[idx];
+            let entry_path = Path::parse(&entry.path);
+            match entry.op {
+                WalOp::Set => {
+                    // See note in `promote_path_unchecked`: SET with None
+                    // is the historical SET-to-null form. `set_lazy` cleans
+                    // Null to a delete via `from_value_cleaned`.
+                    let value = entry.value.clone().unwrap_or(Value::Null);
+                    temp_tree.set_lazy(&entry_path, value);
+                }
+                WalOp::Update => {
+                    if let Some(Value::Object(ref updates)) = entry.value {
+                        temp_tree.update_lazy(&entry_path, updates);
+                    }
+                }
+                WalOp::Delete => {
+                    temp_tree.remove(&entry_path);
+                }
+            }
+        }
+
+        temp_tree.get_arc(&path_obj).unwrap_or(ArcValue::Null)
     }
 
     /// Puts a promoted value into the tree at `path`.
@@ -431,35 +449,9 @@ impl Database {
         // Regression test: tests/integration_blob.rs
         // `test_blob_root_multipath_update_replay_preserves_sentinel_intermediates`.
         let path_obj = Path::parse(path);
-        let mut temp_tree = Tree::new();
-        temp_tree.set_arc_uncleaned(&path_obj, blob_value);
+        let promoted_value = self.replay_wal_lazy(path, blob_value);
 
-        let matching_indices = self.wal_index.find_affecting(path);
-        for &idx in &matching_indices {
-            let entry = &self.pending_wal_entries[idx];
-            let entry_path = Path::parse(&entry.path);
-            match entry.op {
-                WalOp::Set => {
-                    // See note in `promote_path_unchecked`: SET with None
-                    // is the historical SET-to-null form. `set_lazy` cleans
-                    // Null to a delete via `from_value_cleaned`.
-                    let value = entry.value.clone().unwrap_or(Value::Null);
-                    temp_tree.set_lazy(&entry_path, value);
-                }
-                WalOp::Update => {
-                    if let Some(Value::Object(ref updates)) = entry.value {
-                        temp_tree.update_lazy(&entry_path, updates);
-                    }
-                }
-                WalOp::Delete => {
-                    temp_tree.remove(&entry_path);
-                }
-            }
-        }
-
-        // Step 4: Extract the promoted value and set it in the real tree
-        let promoted_value = temp_tree.get_arc(&path_obj).unwrap_or(ArcValue::Null);
-
+        // Step 4: Set the promoted value in the real tree
         self.install_promoted(&path_obj, promoted_value.clone());
 
         // Track Sentinel ancestors above `path` (promotion only replaces the
