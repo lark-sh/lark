@@ -54,7 +54,7 @@ jobs:
           PROPTEST_CASES: "20"
 
   rest-conformance:
-    name: REST conformance
+    name: REST conformance, high case counts
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
