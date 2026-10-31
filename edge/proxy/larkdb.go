@@ -255,12 +255,33 @@ func (s *Server) handleLarkDB(w http.ResponseWriter, r *http.Request) {
 		s.handleFirebaseWebSocket(w, r)
 	case path == "/.lp":
 		s.handleLongPoll(w, r)
+	case path == "/.local/evict" && s.config.LocalMode:
+		s.handleLocalEvict(w, r)
 	case strings.HasSuffix(path, ".json"):
 		s.handleRESTProxy(w, r)
 	default:
 		logger.Debug("LarkDB 404 for path", "path", path)
 		http.NotFound(w, r)
 	}
+}
+
+// handleLocalEvict unloads the request's database from the server without
+// purging it, so the next read loads from disk. Only routed in LOCAL_MODE, for
+// test tools.
+func (s *Server) handleLocalEvict(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	projectID, databaseID := s.extractProjectAndDatabase(r.Host)
+	if databaseID == "" {
+		databaseID = "default"
+	}
+	s.pool.EvictDatabaseOnAllBackends(projectID, databaseID, false)
+	// The server's own unload notice arrives with its next heartbeat. Pooled REST
+	// clients hang until then, so close them now.
+	(&clientNotifier{server: s}).OnDatabaseUnloaded("local-server", projectID, databaseID)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleRESTProxy handles REST API requests using virtual Lark clients.
@@ -714,10 +735,12 @@ func truncateShallow(value interface{}) interface{} {
 		}
 		return result
 	case []interface{}:
-		// Array: replace each element with true
+		// Array: the holes in a sparse array aren't keys, so keep them
 		result := make([]interface{}, len(v))
-		for i := range v {
-			result[i] = true
+		for i, element := range v {
+			if element != nil {
+				result[i] = true
+			}
 		}
 		return result
 	default:

@@ -50,6 +50,21 @@ To be precise about the crash model: what the harness kills is the process, at a
 
 Under the chaos-monkey layer, the storage engine has conventional coverage of its own: the `lark-blob` crate carries roughly 200 unit tests over the on-disk format, sessions, free list, dictionary, and incremental compaction, and the `integration_persistence` suite covers WAL replay, graceful-shutdown flushing, deletion persistence, and write coalescing. A slow `#[ignore]`d suite (`integration_storage_worker`) exercises real compaction timing; it runs as part of `make test-all`.
 
+## REST Conformance
+
+The SDK suite only sees what the SDK leaves after normalizing a response, so it can't tell `{"a": null}` from `{}`. [`tools/rest-conformance`](tools/rest-conformance) checks what a strict client sees instead, by talking to a real `lark-edge` and `lark-server` over plain HTTP:
+
+```bash
+./tools/rest-conformance/run.sh                     # fixed checks, 100 random scripts
+./tools/rest-conformance/run.sh --slow --cases 20   # with restarts and compaction
+./tools/rest-conformance/run.sh --seed 42           # replay a failure
+```
+
+- Fixed checks cover the behavior in Firebase's public REST docs, each citing its page. Where the docs don't commit to something, the check doesn't either. Behavior we know differs is listed in `KNOWN_DIFFERENCES` in `src/spec.rs`.
+- Random scripts run writes, reads, shallow reads, queries and conditional writes, and compare every response with a JSON model. Databases are evicted, restarted and compacted between requests, none of which a client should be able to see. Failures shrink to a minimal script.
+
+The expected answers come from us reading the docs, not from Firebase itself, so this can't catch a rule we've misread in both the code and the model.
+
 ## Correctness for Edge Cases
 
 The Firebase data model has corners that bite people: the array-to-object coercion rule (a node reads back as a JSON array only when every key is a canonical non-negative integer and `maxKey < 2 * numKeys`), mixed-type sort ordering, priorities, server values, and tainted writes (a rejected write silently invalidates later writes that depended on it). Each of these has a dedicated integration suite in `server/tests/`, 22 suites in all, covering queries and query views, incremental sort, transactions, subscriptions, onDisconnect, eviction and re-promotion of idle data, and volatile paths.
@@ -77,6 +92,7 @@ cd edge && go test ./...
 | Rust integration suites | `make test-all` | yes, except the `#[ignore]`d slow suite |
 | Go edge tests | `cd edge && go test ./...` | yes |
 | Firebase SDK suite | `./test/run-firebase-sdk.sh` | no; run for client-observable changes |
+| REST conformance | `./tools/rest-conformance/run.sh` | yes, with more cases nightly |
 | Chaos monkey | `./tools/chaos-monkey/run.sh` | no; run for write-path changes |
 | Randomized model tests, high case counts | `PROPTEST_CASES=1000 cargo test -p lark-server --test integration_read_model` | nightly |
 

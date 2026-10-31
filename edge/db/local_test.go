@@ -8,7 +8,7 @@ import (
 // EnsureRoutingData must validate the database ID even in local mode, since it
 // flows into the server's on-disk data-dir path (mirrors SQLite/Postgres).
 func TestLocalDB_EnsureRoutingData_RejectsUnsafeDatabaseID(t *testing.T) {
-	db := NewLocalDB("p1", "127.0.0.1:2727", false)
+	db := NewLocalDB("p1", "127.0.0.1:2727", false, `{"rules":{".read":true,".write":true}}`)
 	ctx := context.Background()
 
 	for _, bad := range []string{"../../etc", "..", "a/b", "UPPER", "trailing-", ""} {

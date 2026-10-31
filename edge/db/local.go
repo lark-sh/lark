@@ -15,16 +15,18 @@ type LocalDB struct {
 	projectID   string
 	backendAddr string
 	serverID    string
-	persistent  bool // Databases use the server's data dir, not memory.
+	persistent  bool   // Databases use the server's data dir, not memory.
+	rulesJSON   string // Security rules for the local project.
 }
 
 // NewLocalDB creates a new local mock store.
-func NewLocalDB(projectID, backendAddr string, persistent bool) *LocalDB {
+func NewLocalDB(projectID, backendAddr string, persistent bool, rulesJSON string) *LocalDB {
 	return &LocalDB{
 		projectID:   projectID,
 		backendAddr: backendAddr,
 		serverID:    "local-server",
 		persistent:  persistent,
+		rulesJSON:   rulesJSON,
 	}
 }
 
@@ -65,7 +67,7 @@ func (db *LocalDB) GetProjectByID(ctx context.Context, projectID string) (*Proje
 		Name:                  "Local Project",
 		SecretKey:             "local-secret-key",
 		AdminSecretKey:        "local-admin-secret",
-		RulesJSON:             `{"rules":{".read":true,".write":true}}`,
+		RulesJSON:             db.rulesJSON,
 		Ephemeral:             !db.persistent,
 		AutoCreate:            true,
 		FirebaseCompatEnabled: true,

@@ -51,6 +51,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -496,7 +497,7 @@ func (vc *RESTVirtualClient) SendOperation(op string, path string, value interfa
 
 		// Ordering - use orderBy for special values, orderByChild for child paths
 		if opts.OrderBy != "" {
-			msg["orderBy"] = opts.OrderBy
+			msg["orderBy"] = strings.TrimPrefix(opts.OrderBy, "$")
 		}
 		if opts.OrderByChild != "" {
 			msg["orderByChild"] = opts.OrderByChild

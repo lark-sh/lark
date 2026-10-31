@@ -5,6 +5,7 @@ members = [
     "server",
     "tools/chaos-monkey",
     "tools/lark-compact",
+    "tools/rest-conformance",
 ]
 
 [workspace.package]
