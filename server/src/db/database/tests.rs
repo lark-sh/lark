@@ -3760,3 +3760,27 @@ fn test_read_below_missing_child_leaves_loaded_parent_unchanged() {
         assert!(tree.node_is_loaded("/root/missing/deep"));
     })
 }
+
+// The check behind the rule that a path missing below a loaded node doesn't
+// exist. It must report data the tree has lost track of, or it proves nothing.
+#[test]
+fn test_path_holds_stored_data_finds_data_missing_from_tree() {
+    block_on(async {
+        let (mut db, _dir) = make_blob_backed_db(json!({
+            "root": {"lost": {"deep": 1}, "kept": 2}
+        }))
+        .await;
+        let (conn, _messages) = MockConnection::new();
+        db.add_client_internal("client1", None, "conn1", conn);
+
+        assert!(db.path_holds_stored_data("/root/lost/deep").await);
+        assert!(!db.path_holds_stored_data("/root/never").await);
+        assert!(!db.path_holds_stored_data("/root/kept/below").await);
+
+        // A pending delete counts, and a pending write counts.
+        let update = root_update_msg(json!({"root/lost/deep": null, "root/new/leaf": 3}));
+        db.handle_update("client1", &update, false).await;
+        assert!(!db.path_holds_stored_data("/root/lost/deep").await);
+        assert!(db.path_holds_stored_data("/root/new/leaf").await);
+    })
+}
