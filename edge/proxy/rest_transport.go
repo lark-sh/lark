@@ -37,7 +37,7 @@
 // # Error Mapping
 //
 // Lark protocol errors are mapped to HTTP status codes:
-//   - permission_denied → 403 Forbidden
+//   - permission_denied → 401 Unauthorized
 //   - not_found → 404 Not Found
 //   - invalid_data → 400 Bad Request
 //   - unavailable → 503 Service Unavailable

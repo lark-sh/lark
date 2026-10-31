@@ -13,7 +13,7 @@ use glommio::channels::local_channel::LocalSender;
 /// Prevents a single database from monopolizing all server connections.
 pub const MAX_CLIENTS_PER_DATABASE: usize = 200_000;
 use crate::executor::core_for_database;
-use crate::protocol::{ClientMessage, ServerMessage, error, op};
+use crate::protocol::{ClientMessage, MessageError, ServerMessage, error, op};
 use crate::rules::{Evaluator, parse_rules};
 use crate::transport::firebase_adapter::FIREBASE_MAX_FRAME_SIZE;
 use crate::transport::protocol::ProjectConfig;
@@ -1032,6 +1032,7 @@ impl CoreHandler {
                 Ok(msg) => msg,
                 Err(e) => {
                     warn!("Failed to parse replayed message from {}: {}", client.id, e);
+                    refuse_unparsed(&client, &data, &e);
                     return;
                 }
             };
@@ -1069,6 +1070,17 @@ impl CoreHandler {
             .values()
             .filter(|(db_id, _)| db_id == database_id)
             .count()
+    }
+}
+
+/// NACKs a message that couldn't be parsed, so a client waiting on it finds out.
+fn refuse_unparsed(client: &VirtualClient, data: &[u8], reason: &MessageError) {
+    let Some(request_id) = ClientMessage::request_id_in(data) else {
+        return;
+    };
+    let nack = ServerMessage::nack(&request_id, error::INVALID_DATA, &reason.to_string());
+    if let Ok(data) = nack.encode() {
+        let _ = client.try_send(data.into(), false);
     }
 }
 
@@ -1206,6 +1218,7 @@ impl ProxyHandler for CoreHandler {
                 Ok(msg) => msg,
                 Err(e) => {
                     trace!("Failed to parse message from {}: {}", client.id, e);
+                    refuse_unparsed(&client, &data, &e);
                     return;
                 }
             };

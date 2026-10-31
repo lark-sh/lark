@@ -20,18 +20,12 @@ const LIMITS: &str = "https://firebase.google.com/docs/database/usage/limits";
 /// Checks that fail today. Remove a line when its check starts passing: the run
 /// fails until you do, so this list can't go stale.
 const KNOWN_DIFFERENCES: &[&str] = &[
-    // Empty writes succeed, and an empty PUT deletes the location.
-    "Missing PUT data is a 400 and doesn't write",
-    "Missing POST data is a 400",
     // `.priority` and `.value` are stored as plain children.
     "A plain GET leaves priorities out",
     "Write a primitive with .value and .priority",
     "orderBy $priority",
     // Patch events use absolute keys at path `/`, not keys relative to `path`.
     "Streaming sends put and patch events",
-    // Lark answers 403.
-    "A rules violation is a 401",
-    "A write that violates rules is a 401",
     // ETags are only returned by GET, and if-match isn't refused where it doesn't apply.
     "GET with if-match is rejected",
     "PUT with X-Firebase-ETag returns its ETag",
@@ -41,14 +35,6 @@ const KNOWN_DIFFERENCES: &[&str] = &[
     "PATCH with if-match is rejected",
     "DELETE with X-Firebase-ETag returns null's ETag",
     "null_etag writes to an empty location",
-    // Parameters that are ignored instead of applied or refused.
-    "print=silent on GET is an empty 204",
-    "Method override query parameter",
-    "callback is rejected on writes",
-    "download is rejected on writes",
-    "orderBy twice is rejected",
-    // The write closes the pooled REST client, so the response is a 502.
-    "Data past 32 levels is rejected",
 ];
 
 type Outcome = Result<(), String>;
@@ -630,6 +616,26 @@ fn errors(s: &Spec) {
             data = json!({"d": data});
         }
         status(&n.send("PUT", ".json", &data.to_string())?, 400)
+    });
+    s.check("Data past 32 levels counts the path", LIMITS, |n| {
+        let mut data = json!(1);
+        for _ in 0..31 {
+            data = json!({"d": data});
+        }
+        status(&n.send("PUT", ".json", &data.to_string())?, 400)
+    });
+    s.check("Data past 200 levels is rejected", LIMITS, |n| {
+        let data = format!("{}1{}", r#"{"d":"#.repeat(200), "}".repeat(200));
+        status(&n.send("PUT", ".json", &data)?, 400)
+    });
+    s.check("A string over 10 MB is rejected", LIMITS, |n| {
+        let data = json!("x".repeat(10 * 1024 * 1024 + 1)).to_string();
+        status(&n.send("PUT", ".json", &data)?, 400)
+    });
+    s.check("A literal null deletes", SAVE, |n| {
+        n.put("1")?;
+        status(&n.send("PUT", ".json", "null")?, 200)?;
+        body(&n.get(".json")?, &Value::Null)
     });
     s.check("A rules violation is a 401", REF, |n| {
         status(&n.stack.request("GET", "/private/x.json", &[], None)?, 401)

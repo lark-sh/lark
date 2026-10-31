@@ -384,6 +384,33 @@ func TestParseRESTQueryOptions(t *testing.T) {
 }
 
 // TestTruncateShallow tests the shallow truncation logic
+func TestJSONDepth(t *testing.T) {
+	var deep interface{} = "leaf"
+	for i := 0; i < 40; i++ {
+		deep = map[string]interface{}{"child": deep}
+	}
+	tests := []struct {
+		name  string
+		input interface{}
+		want  int
+	}{
+		{"primitive", "a", 0},
+		{"null", nil, 0},
+		{"empty object", map[string]interface{}{}, 1},
+		{"object", map[string]interface{}{"a": 1.0}, 1},
+		{"array of objects", []interface{}{map[string]interface{}{"a": 1.0}}, 2},
+		{"deepest branch counts", map[string]interface{}{"a": 1.0, "b": map[string]interface{}{"c": 1.0}}, 2},
+		{"deep", deep, 40},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := jsonDepth(tt.input); got != tt.want {
+				t.Errorf("jsonDepth() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestTruncateShallow(t *testing.T) {
 	tests := []struct {
 		name  string

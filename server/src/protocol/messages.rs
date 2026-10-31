@@ -459,6 +459,16 @@ impl ClientMessage {
     /// For SDK clients (is_rest=false): rejects payloads larger than MAX_WRITE_SIZE (16MB).
     /// For REST clients (is_rest=true): rejects payloads larger than MAX_REST_WRITE_SIZE (256MB).
     /// Also validates that no individual string exceeds MAX_STRING_SIZE (10MB).
+    /// The request ID in a message that failed `parse`, so it can be refused
+    /// instead of leaving the client waiting. `None` if that can't be read either.
+    pub fn request_id_in(data: &[u8]) -> Option<String> {
+        #[derive(Deserialize)]
+        struct RequestId {
+            r: Option<String>,
+        }
+        serde_json::from_slice::<RequestId>(data).ok()?.r
+    }
+
     pub fn parse(data: &[u8], is_rest: bool) -> Result<Self, MessageError> {
         let max_size = if is_rest {
             MAX_REST_WRITE_SIZE
@@ -870,6 +880,21 @@ impl ServerMessage {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_request_id_in_reads_a_message_that_fails_validation() {
+        let mut value = json!(1);
+        for _ in 0..40 {
+            value = json!({"d": value});
+        }
+        let data = json!({"o": "s", "p": "/a", "v": value, "r": "7"}).to_string();
+        assert!(ClientMessage::parse(data.as_bytes(), true).is_err());
+        assert_eq!(
+            ClientMessage::request_id_in(data.as_bytes()),
+            Some("7".to_string())
+        );
+        assert_eq!(ClientMessage::request_id_in(b"{not json"), None);
+    }
 
     #[test]
     fn test_parse_join_message() {
