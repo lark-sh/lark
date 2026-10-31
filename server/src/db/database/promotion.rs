@@ -193,8 +193,8 @@ impl Database {
 
     /// Puts a promoted value into the tree at `path`.
     ///
-    /// When there's no data at `path` and its parent is a loaded Object, the key
-    /// is removed and any parents left empty are pruned, so the Object lists only
+    /// When there's no data at `path` and it's below a loaded node, the key is
+    /// removed and any parents left empty are pruned, so an Object lists only
     /// children that hold data. Below a Sentinel, an empty result stays in the
     /// tree as a Null marker: the parent can't vouch for a missing key, so the
     /// marker is what tells `node_is_loaded` this path has been checked. Sentinels
@@ -202,11 +202,7 @@ impl Database {
     /// returned to a client.
     fn install_promoted(&self, path: &Path, value: ArcValue) {
         let mut tree = self.tree.write().unwrap();
-        let parent_is_loaded = path
-            .parent()
-            .and_then(|parent| tree.get(&parent).map(ArcValue::is_object))
-            .unwrap_or(false);
-        if parent_is_loaded && value.is_empty_container() {
+        if value.is_empty_container() && tree.has_loaded_ancestor(path) {
             tree.remove(path);
         } else {
             tree.set_arc_uncleaned_lazy(path, value);
@@ -450,6 +446,14 @@ impl Database {
         // `test_blob_root_multipath_update_replay_preserves_sentinel_intermediates`.
         let path_obj = Path::parse(path);
         let promoted_value = self.replay_wal_lazy(path, blob_value);
+
+        // Replay can leave `path` itself a Sentinel, such as a write below a
+        // primitive in the blob, or a delete and rewrite. Promoting shallowly again
+        // would repeat the same result, so a rule waiting on this path would retry
+        // until it ran out. The full read always settles it.
+        if promoted_value.is_sentinel() {
+            return self.promote_path_unchecked(path).await;
+        }
 
         // Step 4: Set the promoted value in the real tree
         self.install_promoted(&path_obj, promoted_value.clone());
