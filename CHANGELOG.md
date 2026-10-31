@@ -21,6 +21,7 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 
 - Reading a key that didn't exist, when its parent was already in memory, added that key to the parent with a null value. Any later read of the parent returned the null child, a limited query could return it in place of a real row, and a conditional write on the parent could fail because its hash had changed. This also happened to a parent emptied by a delete, once its path was read. A missing key is now simply absent from its parent.
 - Deleting every child of a node left an empty collection in the blob, which reads returned as `{}` after compaction. Reads now skip empty collections at any depth.
+- A multi-path update above a subscribed path could tell that subscriber real data was gone. The view is sent again as a full value, and children not yet loaded into memory went out as null, which happened after a write created a new nested path inside the view or replaced a primitive. Clients saw the data disappear until their next load. These views are now loaded before they're sent.
 
 ### Changed
 

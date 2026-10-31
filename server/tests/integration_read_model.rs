@@ -61,8 +61,9 @@ fn update_value() -> BoxedStrategy<Value> {
 #[derive(Debug, Clone)]
 enum Step {
     /// Multi-path update: base path, then relative paths where no key is a
-    /// prefix of another, matching what clients send.
-    Update(Vec<String>, Vec<(Vec<String>, Value)>),
+    /// prefix of another, matching what clients send. A base of `None` sends it
+    /// from the database root, above the model.
+    Update(Option<Vec<String>>, Vec<(Vec<String>, Value)>),
     Set(Vec<String>, Value),
     Delete(Vec<String>),
     /// A transaction that deletes one path and sets another.
@@ -86,7 +87,7 @@ fn no_prefix_overlap(rels: &[(Vec<String>, Value)]) -> bool {
 
 fn step(mode: Mode) -> BoxedStrategy<Step> {
     let update = (
-        prop::collection::vec(key(), 0..=1),
+        prop::option::weighted(0.7, prop::collection::vec(key(), 0..=1)),
         prop::collection::vec((path(), update_value()), 1..4),
     )
         .prop_filter("no overlapping update keys", |(_, rels)| {
@@ -379,16 +380,20 @@ async fn check_step(client: &TestClient, model: &Value, step: &Step) {
 async fn apply_write(client: &TestClient, model: &mut Value, step: &Step) {
     match step {
         Step::Update(base, rels) => {
+            let model_base = base.clone().unwrap_or_default();
             let mut updates = Map::new();
             for (rel, value) in rels {
-                updates.insert(rel.join("/"), value.clone());
-                let full = [base.as_slice(), rel].concat();
+                let key = rel.join("/");
+                let key = match base {
+                    Some(_) => key,
+                    None => format!("{ROOT}/{key}"),
+                };
+                updates.insert(key, value.clone());
+                let full = [model_base.as_slice(), rel].concat();
                 model_write(model, &full, &clean(value));
             }
-            client
-                .update(&wire_path(base), Value::Object(updates))
-                .await
-                .unwrap();
+            let path = base.as_ref().map_or("/".to_string(), |b| wire_path(b));
+            client.update(&path, Value::Object(updates)).await.unwrap();
         }
         Step::Set(segments, value) => {
             client
@@ -555,7 +560,6 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "known issue: a multi-path update above a view sends unloaded children as null"]
     fn test_model_live_subscriber(script in script(BLOB_BACKED)) {
         run(script, Mode { subscriber: true, ..BLOB_BACKED });
     }

@@ -3109,3 +3109,71 @@ fn test_blob_rules_treat_checked_key_as_missing() {
         assert_eq!(client.once("/root/200").await.unwrap(), json!("first"));
     });
 }
+
+/// A multi-path update above a subscribed path sends the view as a full put.
+/// Children that are unloaded in memory must go out with their data, not as null.
+#[test]
+fn test_blob_update_above_view_sends_unloaded_children() {
+    run_test(|| async {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+        let data = json!({"m": {"kept": 1}, "other": 2});
+        let (server, client) = connect_to_blob(data_dir, "view-put", data, open_rules()).await;
+
+        let mut subscriber = server.client();
+        subscriber.connect("test-project/view-put").await;
+        subscriber.subscribe("/m", &["value"]).await.unwrap();
+        subscriber
+            .wait_for_event(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        // Leaves a chain of intermediates for /m/new inside the loaded view.
+        client.set("/m/new/deep/leaf", 3).await.unwrap();
+        subscriber
+            .wait_for_event(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        client
+            .update("/", json!({"m/kept": 4, "other": 5}))
+            .await
+            .unwrap();
+        let event = subscriber
+            .wait_for_event(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(event.path.as_deref(), Some("/"));
+        assert_eq!(
+            event.value.unwrap().to_value(),
+            json!({"kept": 4, "new": {"deep": {"leaf": 3}}})
+        );
+    });
+}
+
+/// A write below a primitive replaces it, and a view of that path receives the
+/// new object rather than null.
+#[test]
+fn test_blob_update_above_view_replaces_primitive() {
+    run_test(|| async {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+        let data = json!({"m": 0, "other": 2});
+        let (server, client) = connect_to_blob(data_dir, "view-prim", data, open_rules()).await;
+
+        let mut subscriber = server.client();
+        subscriber.connect("test-project/view-prim").await;
+        subscriber.subscribe("/m", &["value"]).await.unwrap();
+        subscriber
+            .wait_for_event(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        client.update("/", json!({"m/alpha": 1})).await.unwrap();
+        let event = subscriber
+            .wait_for_event(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(event.value.unwrap().to_value(), json!({"alpha": 1}));
+    });
+}

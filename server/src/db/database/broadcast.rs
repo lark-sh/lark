@@ -198,12 +198,17 @@ impl Database {
         // 1. Collect affected views (quick, needs tree briefly)
         let view_infos = self.view_manager.collect_affected_view_infos(&event);
 
-        // 2. Deep promote view paths for query views that may need to recompute.
-        //    recompute_query_view reads all children from the tree, so the entire
-        //    subtree must be Sentinel-free.
+        // 2. Deep promote the views that read their whole value from the tree, which
+        //    must be Sentinel-free for it. A query view recomputes from all its
+        //    children. A view below the mutation path is sent as a full put.
         for info in &view_infos {
-            if info.has_query {
-                let _ = self.promote_path_deep(&info.path).await;
+            if (info.has_query || is_below(&info.path, &event.path))
+                && let Err(e) = self.promote_path_deep(&info.path).await
+            {
+                warn!(
+                    "{}: failed to load view {} for broadcast: {}",
+                    self.id, info.path, e
+                );
             }
         }
 
@@ -357,5 +362,15 @@ impl Database {
         if bytes_sent > 0 {
             self.metrics.record_volatile_outbound_bytes(bytes_sent);
         }
+    }
+}
+
+/// True if `path` is a strict descendant of `ancestor`. Both must be normalized.
+fn is_below(path: &str, ancestor: &str) -> bool {
+    match ancestor {
+        "/" => path != "/",
+        _ => path
+            .strip_prefix(ancestor)
+            .is_some_and(|rest| rest.starts_with('/')),
     }
 }
