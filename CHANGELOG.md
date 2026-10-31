@@ -6,6 +6,20 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-10-31
+
+### Upgrading
+
+The on-disk format hasn't changed. REST clients may need updating, because several responses now follow Firebase's documented behavior:
+
+- A rules denial is a 401, not a 403.
+- An empty PUT or POST is a 400. An empty PUT used to delete the location, so a client that relied on that has to send `null`.
+- Plain reads no longer include `.priority`. Add `format=export` to get priorities.
+- SSE patch events have keys relative to `path`, and a patch across parents arrives as several events.
+- The ETag of an empty location is `null_etag`, and `if-match` and `X-Firebase-ETag` are a 400 where they don't apply.
+
+If you back up with the `.compacting` marker, add the `flock` step in [BACKUP.md](docs/BACKUP.md).
+
 ### Security
 
 - Updated klauspost/compress to 1.18.7 (GHSA-259r-337f-4rfw, an integer overflow in `s2.NewDict`). lark-edge uses only the package's zstd decoder, so it wasn't affected; the update clears the alert.
@@ -21,7 +35,7 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 
 - `lark-compact` is now safe to run against a live server. It waits for a running batch through a new `.storage.lock` file instead of risking losing that batch or copying a blob as it changes. A batch that followed a compaction could also use offsets from the old blob. Both needed a server running while `lark-compact` ran.
 - `lark-compact` syncs the new blob before swapping it in and replaces `blob.lark` atomically, so a crash or power loss can't leave a damaged blob or none at all. It no longer uses `blob.old.lark`.
-- A `.compacting` marker left behind now logs a warning after an hour. If you back up with the marker, add the new `flock` step in [BACKUP.md](docs/BACKUP.md).
+- A `.compacting` marker left behind now logs a warning after an hour.
 - REST ETags now follow the documented table. PUT, POST and DELETE return an ETag when asked, an empty location's ETag is `null_etag`, and it works in `if-match`. PATCH refuses both headers, and GET and POST refuse `if-match`.
 - REST reads no longer return `.priority`, and `{".value": v, ".priority": p}` reads as `v`. `format=export` returns priorities.
 - SSE patch events now use keys that are children of the event's `path`, instead of full paths at `/`. A patch across several parents arrives as one event per parent.
@@ -33,7 +47,6 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 - Clients of an evicted database no longer hang for up to 10 seconds. The server tells the edge about an unload as it happens instead of at the next heartbeat.
 - REST queries with `orderBy="$value"` or `orderBy="$priority"` now use that order. They used to fall back to key order, so `limitToFirst`, `startAt` and the like selected the wrong children.
 - A REST shallow read of a sparse array no longer reports `true` for missing indexes.
-
 - Reading a key that didn't exist, when its parent was already in memory, added that key to the parent with a null value. Any later read of the parent returned the null child, a limited query could return it in place of a real row, and a conditional write on the parent could fail because its hash had changed. This also happened to a parent emptied by a delete, once its path was read. A missing key is now simply absent from its parent.
 - Deleting every child of a node left an empty collection in the blob, which reads returned as `{}` after compaction. Reads now skip empty collections at any depth.
 - Shallow reads could list a key after compaction even though everything under it had been deleted. Compaction now removes a collection from its parent once its last child is deleted, and full compaction removes any left from before this change.

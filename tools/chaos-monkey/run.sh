@@ -105,6 +105,16 @@ run_chaos_monkey() {
     local duration="${DURATION:-1h}"
     local extra_args=""
 
+    # --duration can come from the command line too, and can only be passed once.
+    local passthrough=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --duration) duration="$2"; shift 2 ;;
+            *) passthrough+=("$1"); shift ;;
+        esac
+    done
+    set -- "${passthrough[@]}"
+
     if [ -n "$SEED" ]; then
         extra_args="$extra_args --seed $SEED"
     fi

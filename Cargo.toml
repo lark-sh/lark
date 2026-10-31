@@ -12,7 +12,7 @@ members = [
 # The Lark release version. All workspace crates inherit it (version.workspace =
 # true) — the crates version in lockstep with the product, and release tags
 # (vX.Y.Z) must match this value (CI enforces it).
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 repository = "https://github.com/lark-sh/lark"
