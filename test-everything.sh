@@ -51,5 +51,8 @@ run "Randomized model: restart" \
 run "Randomized model: compaction" \
     cargo test -p lark-server --test integration_read_model -j 2 test_model_compaction -- --ignored
 
+run "Randomized model: shallow reads after compaction" \
+    cargo test -p lark-server --test integration_read_model -j 2 test_model_shallow_after_compaction -- --ignored
+
 echo ""
 echo -e "${GREEN}All test suites passed.${NC}"

@@ -367,6 +367,33 @@ impl<IO: BlobIO> BlobSession<IO> {
             .await
     }
 
+    /// True if `path` is a collection with no live children: everything in it has
+    /// been deleted. Stops at the first live child and reads no child values.
+    pub(crate) async fn is_empty_collection(&self, path: &[&str]) -> Result<bool> {
+        let location = match navigate_raw(&self.io, &self.header, &self.dict, path).await {
+            Ok(location) => location,
+            Err(BlobError::PathNotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let hint = Some(location.subtree_size);
+        let container = match read_container(&self.io, location.offset, hint).await {
+            Ok(container) => container,
+            Err(BlobError::NotAContainer(_, _)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        if container.tag != TYPE_COLLECTION {
+            return Ok(false);
+        }
+        let has_live_child = (0..container.child_count as usize).any(|i| {
+            let eo = i * COLLECTION_INDEX_ENTRY_SIZE;
+            let tag = extract_type_tag(container.child_index[eo + 8]);
+            let size =
+                u64::from_le_bytes(container.child_index[eo + 17..eo + 25].try_into().unwrap());
+            !(tag == TYPE_NULL && size == 0)
+        });
+        Ok(!has_live_child)
+    }
+
     /// Shallow-read at a resolved offset.
     async fn read_shallow_at_offset(
         &self,

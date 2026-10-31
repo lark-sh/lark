@@ -585,4 +585,12 @@ proptest! {
     fn test_model_compaction(script in script(Mode { compaction: true, ..BLOB_BACKED })) {
         run(script, Mode { compaction: true, ..BLOB_BACKED });
     }
+
+    #[test]
+    #[ignore] // Slow test — writes 5MB+ per compaction
+    fn test_model_shallow_after_compaction(
+        script in script(Mode { compaction: true, shallow: true, ..BLOB_BACKED })
+    ) {
+        run(script, Mode { compaction: true, shallow: true, ..BLOB_BACKED });
+    }
 }
