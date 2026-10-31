@@ -19,6 +19,8 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 
 ### Fixed
 
+- REST reads no longer return `.priority`, and `{".value": v, ".priority": p}` reads as `v`. `format=export` returns priorities.
+- SSE patch events now use keys that are children of the event's `path`, instead of full paths at `/`. A patch across several parents arrives as one event per parent.
 - A shallow read could list a key whose data was deleted by a write that stored nothing, such as `{"a": null}`.
 - An empty REST PUT no longer deletes the location: an empty PUT or POST is a 400. Send `null` to delete.
 - A message the server can't parse now gets an error reply instead of being dropped, so a client waiting on it finds out. REST writes that nest too deeply are a 400 rather than a 502.
