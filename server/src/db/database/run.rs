@@ -365,6 +365,13 @@ impl Database {
     }
 
     async fn handle_message_internal(&mut self, msg: &mut InboxMessage) {
+        self.dispatch_message(msg).await;
+
+        // Walks the whole tree, so it only runs in debug builds.
+        debug_assert_eq!(self.tree.read().unwrap().find_empty_child(), None);
+    }
+
+    async fn dispatch_message(&mut self, msg: &mut InboxMessage) {
         self.last_activity = Instant::now();
 
         // Handle compaction complete from StorageWorker

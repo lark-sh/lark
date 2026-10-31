@@ -68,6 +68,7 @@ libc = "0.2"
 
 [dev-dependencies]
 criterion = "0.5"
+proptest = "1"
 tempfile = "3"
 serde_urlencoded = "0.7"
 

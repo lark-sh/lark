@@ -45,5 +45,11 @@ run "Integration tests (all, non-ignored)" \
 run "Storage worker tests (ignored, slow)" \
     cargo test -p lark-server --test integration_storage_worker -j 2 -- --ignored --test-threads=1
 
+run "Randomized model: restart" \
+    cargo test -p lark-server --test integration_read_model -j 2 test_model_restart -- --ignored
+
+run "Randomized model: compaction" \
+    cargo test -p lark-server --test integration_read_model -j 2 test_model_compaction -- --ignored
+
 echo ""
 echo -e "${GREEN}All test suites passed.${NC}"

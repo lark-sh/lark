@@ -260,6 +260,33 @@ impl Tree {
         }
     }
 
+    /// Finds a child of a loaded Object that holds no data: a Null or an empty
+    /// Object. There should never be one, because every read of an Object returns
+    /// its children as they are, and a client would see the key. Null is only
+    /// allowed below a Sentinel, where it marks a path as checked.
+    pub fn find_empty_child(&self) -> Option<String> {
+        fn walk(node: &ArcValue, path: &mut String) -> Option<String> {
+            let (ArcValue::Object(map) | ArcValue::Sentinel(map)) = node else {
+                return None;
+            };
+            for (key, child) in map.iter() {
+                let len = path.len();
+                path.push('/');
+                path.push_str(key);
+                let empty = child.is_empty_container() && !child.is_sentinel();
+                if node.is_object() && empty {
+                    return Some(path.clone());
+                }
+                if let Some(found) = walk(child, path) {
+                    return Some(found);
+                }
+                path.truncate(len);
+            }
+            None
+        }
+        walk(&self.root, &mut String::new())
+    }
+
     /// Returns true if a value exists at the given path.
     pub fn exists(&self, path: &Path) -> bool {
         self.get(path).map(|v| v.exists()).unwrap_or(false)

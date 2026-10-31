@@ -45,28 +45,17 @@ impl Database {
                     // - If a child were evicted, it would be a Sentinel, not absent.
                     // - If a child were deleted, it is correctly absent.
                     //
-                    // IMPORTANT: only write the Null marker if the parent is an Object.
-                    // If the parent is a primitive (Null/Bool/Number/String),
-                    // the child definitively doesn't exist, but `set_arc_uncleaned_lazy`
-                    // would clobber the primitive into a Sentinel container (see
-                    // ArcValue::set_path_mut_sentinel's primitive branch), corrupting
-                    // the tree. Skip the marker write in that case — the next read
-                    // will do the same cheap check and arrive at the same answer.
+                    // No marker is written here: the absent key is the record that
+                    // the child doesn't exist, and the next read repeats this same
+                    // check. A Null stored in an Object would be read back as a
+                    // child of that Object.
+                    //
+                    // A primitive parent means the child can't exist either.
                     if let Some(parent) = path_obj.parent()
                         && let Some(parent_node) = tree.get(&parent)
+                        && !parent_node.is_sentinel()
                     {
-                        if parent_node.is_object() {
-                            // Drop read lock, insert Null to mark "we checked"
-                            drop(tree);
-                            let mut tree = self.tree.write().unwrap();
-                            tree.set_arc_uncleaned_lazy(&path_obj, ArcValue::Null);
-                            return Ok(false);
-                        }
-                        if !parent_node.is_sentinel() {
-                            // Parent is a primitive — child can't exist.
-                            // No marker write (would corrupt parent). No blob read.
-                            return Ok(false);
-                        }
+                        return Ok(false);
                     }
                     // Parent is Sentinel or absent — need to load from blob
                 }
@@ -158,25 +147,13 @@ impl Database {
                     true
                 }
                 None => {
-                    // Same parent-container check as in promote_path: only write the
-                    // Null marker when the parent is an Object. A primitive
-                    // parent means the child definitively doesn't exist, but writing
-                    // Null through `set_path_mut_sentinel` would clobber the parent
-                    // into a Sentinel — see comment in promote_path for the full
-                    // story.
+                    // Same check as in promote_path: an absent child of a loaded
+                    // parent doesn't exist, and nothing needs to be recorded.
                     if let Some(parent) = path_obj.parent()
                         && let Some(parent_node) = tree.get(&parent)
+                        && !parent_node.is_sentinel()
                     {
-                        if parent_node.is_object() {
-                            drop(tree);
-                            let mut tree = self.tree.write().unwrap();
-                            tree.set_arc_uncleaned_lazy(&path_obj, ArcValue::Null);
-                            return Ok(false);
-                        }
-                        if !parent_node.is_sentinel() {
-                            // Primitive/Array parent — child can't exist. Skip.
-                            return Ok(false);
-                        }
+                        return Ok(false);
                     }
                     // Parent is Sentinel or absent — need to load
                     true
@@ -196,6 +173,28 @@ impl Database {
         self.promote_path_unchecked(path).await
     }
 
+    /// Puts a promoted value into the tree at `path`.
+    ///
+    /// When there's no data at `path` and its parent is a loaded Object, the key
+    /// is removed and any parents left empty are pruned, so the Object lists only
+    /// children that hold data. Below a Sentinel, an empty result stays in the
+    /// tree as a Null marker: the parent can't vouch for a missing key, so the
+    /// marker is what tells `node_is_loaded` this path has been checked. Sentinels
+    /// are replaced by promotion before they're read, so the marker is never
+    /// returned to a client.
+    fn install_promoted(&self, path: &Path, value: ArcValue) {
+        let mut tree = self.tree.write().unwrap();
+        let parent_is_loaded = path
+            .parent()
+            .and_then(|parent| tree.get(&parent).map(ArcValue::is_object))
+            .unwrap_or(false);
+        if parent_is_loaded && value.is_empty_container() {
+            tree.remove(path);
+        } else {
+            tree.set_arc_uncleaned_lazy(path, value);
+        }
+    }
+
     /// Unconditional promotion: always reads from blob + replays WAL at the given path.
     /// Used by `promote_path_deep` when Sentinels are detected, and by `promote_path`
     /// when the top-level node is Sentinel.
@@ -212,7 +211,15 @@ impl Database {
         let _ = session.io().take_read_stats(); // reset counters
         let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         let blob_value = match session.read_subtree(&segments).await {
-            Ok(value) => value,
+            // A container whose children were all deleted stays in the blob as
+            // an empty collection. It holds no data, so it isn't loaded as a child.
+            Ok(value) => value.clean().unwrap_or_else(|| {
+                if segments.is_empty() {
+                    ArcValue::empty_object()
+                } else {
+                    ArcValue::Null
+                }
+            }),
             Err(BlobError::PathNotFound(_)) => {
                 // Path doesn't exist in blob — start with Null
                 ArcValue::Null
@@ -256,10 +263,7 @@ impl Database {
         // Step 3: Extract the promoted value and set it in the real tree.
         let promoted_value = temp_tree.get_arc(&path_obj).unwrap_or(ArcValue::Null);
 
-        {
-            let mut tree = self.tree.write().unwrap();
-            tree.set_arc_uncleaned_lazy(&path_obj, promoted_value);
-        }
+        self.install_promoted(&path_obj, promoted_value);
 
         // set_arc_uncleaned_lazy may have created Sentinel intermediates along the
         // path (via set_path_mut_sentinel). Track those in sentinel_paths.
@@ -456,10 +460,7 @@ impl Database {
         // Step 4: Extract the promoted value and set it in the real tree
         let promoted_value = temp_tree.get_arc(&path_obj).unwrap_or(ArcValue::Null);
 
-        {
-            let mut tree = self.tree.write().unwrap();
-            tree.set_arc_uncleaned_lazy(&path_obj, promoted_value.clone());
-        }
+        self.install_promoted(&path_obj, promoted_value.clone());
 
         // Track Sentinel ancestors above `path` (promotion only replaces the
         // subtree AT path; ancestors keep whatever Sentinel state they had).
