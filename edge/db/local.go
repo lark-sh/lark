@@ -15,14 +15,16 @@ type LocalDB struct {
 	projectID   string
 	backendAddr string
 	serverID    string
+	persistent  bool // Databases use the server's data dir, not memory.
 }
 
 // NewLocalDB creates a new local mock store.
-func NewLocalDB(projectID, backendAddr string) *LocalDB {
+func NewLocalDB(projectID, backendAddr string, persistent bool) *LocalDB {
 	return &LocalDB{
 		projectID:   projectID,
 		backendAddr: backendAddr,
 		serverID:    "local-server",
+		persistent:  persistent,
 	}
 }
 
@@ -64,7 +66,7 @@ func (db *LocalDB) GetProjectByID(ctx context.Context, projectID string) (*Proje
 		SecretKey:             "local-secret-key",
 		AdminSecretKey:        "local-admin-secret",
 		RulesJSON:             `{"rules":{".read":true,".write":true}}`,
-		Ephemeral:             true,
+		Ephemeral:             !db.persistent,
 		AutoCreate:            true,
 		FirebaseCompatEnabled: true,
 		Enabled:               true,
@@ -87,8 +89,8 @@ func (db *LocalDB) RegenerateProjectSecret(ctx context.Context, projectID, newSe
 }
 
 // ---------------------------------------------------------------------------
-// Databases — local mode treats every database as ephemeral and routed to
-// the single fake server.
+// Databases — local mode routes every database to the single fake server, and
+// treats them all as ephemeral unless it was started as persistent.
 // ---------------------------------------------------------------------------
 
 func (db *LocalDB) GetDatabase(ctx context.Context, projectID, id string) (*Database, error) {
