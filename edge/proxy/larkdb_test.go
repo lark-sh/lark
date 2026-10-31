@@ -438,6 +438,11 @@ func TestTruncateShallow(t *testing.T) {
 			want: []interface{}{true, true, true},
 		},
 		{
+			name:  "sparse array keeps its holes",
+			input: []interface{}{nil, "a", nil, "b"},
+			want:  []interface{}{nil, true, nil, true},
+		},
+		{
 			name:  "empty array",
 			input: []interface{}{},
 			want:  []interface{}{},

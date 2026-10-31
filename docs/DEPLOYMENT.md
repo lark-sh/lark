@@ -483,5 +483,6 @@ Because the interval is in-memory buffering (not batching for throughput on a si
 | `LOCAL_BACKEND_ADDR` | `localhost:7779` | **Dev only**: backend address in `LOCAL_MODE`. |
 | `LOCAL_PROJECT_ID` | `test-project` | **Dev only**: project ID used in `LOCAL_MODE`. |
 | `LOCAL_PERSISTENT` | `false` | **Dev only**: in `LOCAL_MODE`, databases use the server's data dir instead of staying in memory. |
+| `LOCAL_RULES` | open rules | **Dev only**: in `LOCAL_MODE`, the security rules JSON for the local project. |
 
 > `BACKEND_ADDRS`, `COORDINATOR_ADDR`, and `IS_COORDINATOR` exist for advanced or non-self-coordinator topologies and are left at their defaults in the standard Tier 1–2 deployments described above.
