@@ -19,6 +19,7 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 
 ### Fixed
 
+- A shallow read could list a key whose data was deleted by a write that stored nothing, such as `{"a": null}`.
 - A client that connected while its database was being evicted could start a second instance on the same files and then lose every message it sent. It now waits for the old instance to stop.
 - Clients of an evicted database no longer hang for up to 10 seconds. The server tells the edge about an unload as it happens instead of at the next heartbeat.
 - REST queries with `orderBy="$value"` or `orderBy="$priority"` now use that order. They used to fall back to key order, so `limitToFirst`, `startAt` and the like selected the wrong children.
