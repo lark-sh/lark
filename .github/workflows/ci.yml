@@ -28,7 +28,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             pkg-config libssl-dev liburing-dev clang mold
 
-      # Pinned to match rust-toolchain.toml + Dockerfile.dev (bump all three together).
+      # Pinned to match rust-toolchain.toml + Dockerfile.dev + nightly.yml (bump all together).
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy

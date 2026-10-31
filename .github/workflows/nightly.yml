@@ -1,0 +1,54 @@
+name: Nightly
+
+# Runs the randomized model tests with far more cases than PR CI. Debug builds
+# on purpose: they keep the checks that only exist in debug builds.
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/nightly.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  model-tests:
+    name: Randomized model tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev liburing-dev clang mold
+
+      # Pinned to match rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@1.99.1
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compaction model
+        run: cargo test -p lark-blob --test compaction_model
+        env:
+          PROPTEST_CASES: "10000"
+
+      - name: Server model
+        run: cargo test -p lark-server --test integration_read_model
+        env:
+          PROPTEST_CASES: "1000"
+
+      # Each case waits on real WAL syncs and compaction, so these get far fewer.
+      - name: Server model, restarts and compaction
+        run: cargo test -p lark-server --test integration_read_model -- --ignored
+        env:
+          PROPTEST_CASES: "20"
