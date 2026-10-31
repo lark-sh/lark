@@ -19,17 +19,7 @@ const LIMITS: &str = "https://firebase.google.com/docs/database/usage/limits";
 
 /// Checks that fail today. Remove a line when its check starts passing: the run
 /// fails until you do, so this list can't go stale.
-const KNOWN_DIFFERENCES: &[&str] = &[
-    // ETags are only returned by GET, and if-match isn't refused where it doesn't apply.
-    "GET with if-match is rejected",
-    "PUT with X-Firebase-ETag returns its ETag",
-    "POST with X-Firebase-ETag returns an ETag",
-    "POST with if-match is rejected",
-    "PATCH with X-Firebase-ETag is rejected",
-    "PATCH with if-match is rejected",
-    "DELETE with X-Firebase-ETag returns null's ETag",
-    "null_etag writes to an empty location",
-];
+const KNOWN_DIFFERENCES: &[&str] = &[];
 
 type Outcome = Result<(), String>;
 
@@ -316,6 +306,16 @@ fn conditional(s: &Spec) {
             200,
         )?;
         body(&n.get(".json")?, &json!(1))
+    });
+    s.check("An empty location's ETag is null_etag", REF, |n| {
+        let etag = n.etag(".json")?;
+        ensure(etag == "null_etag", || format!("ETag {etag}"))
+    });
+    s.check("A write's ETag covers what was stored", REF, |n| {
+        let want_etag = [("X-Firebase-ETag", "true")];
+        let response = n.send_with("PUT", ".json", &want_etag, r#"{"a":1,"b":null}"#)?;
+        let etag = response.header("etag").ok_or_else(|| show(&response))?;
+        ensure(etag == n.etag(".json")?, || format!("ETag {etag}"))
     });
     s.check("null_etag fails on a location with data", REF, |n| {
         n.put("1")?;

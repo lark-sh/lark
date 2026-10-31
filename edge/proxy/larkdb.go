@@ -69,6 +69,9 @@ import (
 // REST request timeout (default, can be overridden by ?timeout query param)
 const restRequestTimeout = 30 * time.Second
 
+// nullETag is the ETag of a location with no data.
+const nullETag = "null_etag"
+
 // maxJSONDepth is how deeply a written value can nest. lark-server enforces the
 // same limit, but only when it can parse the message, and it can't parse much
 // deeper than this.
@@ -465,9 +468,25 @@ func (s *Server) handleRESTProxy(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("X-Firebase-ETag") == "true" {
 		queryOpts.WantETag = true
 	}
-	// if-match → conditional write (CAS)
-	if ifMatch := r.Header.Get("If-Match"); ifMatch != "" && method != http.MethodGet {
-		queryOpts.ETag = ifMatch
+	// if-match → conditional write (CAS), for PUT and DELETE only
+	ifMatch := r.Header.Get("If-Match")
+	if ifMatch != "" && (method == http.MethodGet || method == http.MethodPost || method == http.MethodPatch) {
+		s.jsonError(w, http.StatusBadRequest, "bad_request", "if-match is not supported on "+method)
+		return
+	}
+	if queryOpts.WantETag && method == http.MethodPatch {
+		s.jsonError(w, http.StatusBadRequest, "bad_request", "X-Firebase-ETag is not supported on PATCH")
+		return
+	}
+	queryOpts.ETag = ifMatch
+	if ifMatch == nullETag {
+		// The server compares hashes, and null has one like any other value.
+		hash, err := computeJCSHash(nil)
+		if err != nil {
+			s.jsonError(w, http.StatusInternalServerError, "internal", "Failed to compute ETag")
+			return
+		}
+		queryOpts.ETag = hash
 	}
 
 	uid := "anonymous"
@@ -554,6 +573,16 @@ func (s *Server) handleRESTProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// A write reports the ETag of what's now stored, which only the server knows:
+	// it drops nulls and resolves server values.
+	if _, acked := larkResp["a"]; acked && queryOpts.WantETag {
+		if _, etag, err := s.readWithETag(vc, dataPath, queryOpts); err == nil {
+			w.Header().Set("ETag", etag)
+		} else {
+			logger.Warn("REST ETag follow-up GET failed", "error", err)
+		}
+	}
+
 	// Translate Lark response to HTTP
 	// Pass queryOpts for print/callback/download handling
 	s.writeLarkResponseAsHTTP(w, method, dataPath, larkResp, bodyValue, queryOpts, generatedPushID)
@@ -596,7 +625,7 @@ func (s *Server) writeLarkResponseAsHTTP(w http.ResponseWriter, method string, p
 		}
 		// Compute and set ETag header if requested
 		if opts != nil && opts.WantETag {
-			if etag, err := computeJCSHash(value); err == nil {
+			if etag, err := etagOf(value); err == nil {
 				w.Header().Set("ETag", etag)
 			}
 		}
@@ -721,33 +750,39 @@ func mapLarkErrorToHTTP(status string) int {
 	}
 }
 
+// etagOf returns the ETag for a value.
+func etagOf(value interface{}) (string, error) {
+	if value == nil {
+		return nullETag, nil
+	}
+	return computeJCSHash(value)
+}
+
+// readWithETag reads the current value at a path and its ETag.
+func (s *Server) readWithETag(vc *RESTVirtualClient, path string, opts *RESTQueryOptions) (interface{}, string, error) {
+	resp, err := vc.SendOperation("o", path, nil, nil, opts.Timeout)
+	if err != nil {
+		return nil, "", err
+	}
+	var onceResp map[string]interface{}
+	if err := sonic.Unmarshal(resp, &onceResp); err != nil {
+		return nil, "", err
+	}
+	value := onceResp["ov"]
+	etag, err := etagOf(value)
+	return value, etag, err
+}
+
 // handleConditionFailed handles a 412 Precondition Failed response for conditional writes.
 // Firebase behavior: return current value + new ETag so the client can retry.
 func (s *Server) handleConditionFailed(w http.ResponseWriter, vc *RESTVirtualClient, path string, opts *RESTQueryOptions) {
-	// Follow-up GET to fetch current value
-	resp, err := vc.SendOperation("o", path, nil, nil, opts.Timeout)
+	currentValue, etag, err := s.readWithETag(vc, path, opts)
 	if err != nil {
 		logger.Warn("REST condition_failed follow-up GET failed", "error", err)
 		s.writeRESTResponse(w, http.StatusPreconditionFailed, map[string]string{"error": "condition_failed"}, opts)
 		return
 	}
-
-	// Parse the once response
-	var onceResp map[string]interface{}
-	if err := sonic.Unmarshal(resp, &onceResp); err != nil {
-		logger.Warn("REST condition_failed follow-up parse failed", "error", err)
-		s.writeRESTResponse(w, http.StatusPreconditionFailed, map[string]string{"error": "condition_failed"}, opts)
-		return
-	}
-
-	// Extract the current value
-	currentValue := onceResp["ov"]
-
-	// Compute new ETag for the current value
-	if etag, err := computeJCSHash(currentValue); err == nil {
-		w.Header().Set("ETag", etag)
-	}
-
+	w.Header().Set("ETag", etag)
 	s.writeRESTResponse(w, http.StatusPreconditionFailed, stripPriorities(currentValue), opts)
 }
 
