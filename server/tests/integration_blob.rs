@@ -3177,3 +3177,38 @@ fn test_blob_update_above_view_replaces_primitive() {
         assert_eq!(event.value.unwrap().to_value(), json!({"alpha": 1}));
     });
 }
+
+/// With a primitive in the blob, a `.validate` rule checks paths below it that
+/// can't exist. Those must settle as absent, or the rules retry loop runs out and
+/// denies a write the rules allow.
+#[test]
+fn test_blob_validate_below_primitive_allows_write() {
+    run_test(|| async {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+        let rules = json!({"rules": {
+            ".read": true,
+            ".write": true,
+            "m": {"$a": {"$b": {".validate": "true"}}}
+        }});
+        let data = json!({"m": false, "seed": 1});
+        let (_server, client) = connect_to_blob(data_dir, "validate-prim", data, rules).await;
+
+        client
+            .update("/", json!({"m/alpha/alpha": null, "m/gamma": null}))
+            .await
+            .unwrap();
+        client
+            .update(
+                "/m/first",
+                json!({"second/third/fourth": null, "second/fifth/sixth": true, "seventh/eighth": null}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            client.once("/m").await.unwrap(),
+            json!({"first": {"second": {"fifth": {"sixth": true}}}})
+        );
+    });
+}

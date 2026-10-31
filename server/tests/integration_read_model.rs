@@ -242,7 +242,8 @@ fn rules_for(mode: Mode) -> Value {
                     ".read": "data.child('never').exists() || true",
                     ".write": "data.exists() || !data.exists()",
                     "$b": {
-                        ".write": "data.parent().child('never').exists() || true"
+                        ".write": "data.parent().child('never').exists() || true",
+                        ".validate": "newData.exists() || newData.parent().exists() || true"
                     }
                 }
             }
