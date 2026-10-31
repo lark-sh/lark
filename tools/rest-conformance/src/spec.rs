@@ -20,12 +20,6 @@ const LIMITS: &str = "https://firebase.google.com/docs/database/usage/limits";
 /// Checks that fail today. Remove a line when its check starts passing: the run
 /// fails until you do, so this list can't go stale.
 const KNOWN_DIFFERENCES: &[&str] = &[
-    // `.priority` and `.value` are stored as plain children.
-    "A plain GET leaves priorities out",
-    "Write a primitive with .value and .priority",
-    "orderBy $priority",
-    // Patch events use absolute keys at path `/`, not keys relative to `path`.
-    "Streaming sends put and patch events",
     // ETags are only returned by GET, and if-match isn't refused where it doesn't apply.
     "GET with if-match is rejected",
     "PUT with X-Firebase-ETag returns its ETag",
@@ -534,6 +528,22 @@ fn priorities(s: &Spec) {
         let actual = parse(&n.get(".json?format=export")?, 200)?;
         ensure(actual[".priority"] == json!(2), || actual.to_string())
     });
+    s.check("A shallow GET leaves priorities out", REF, |n| {
+        n.put(r#"{"a":1,".priority":2}"#)?;
+        body(&n.get(".json?shallow=true")?, &json!({"a": true}))
+    });
+    s.check("Query results leave priorities out", REF, |n| {
+        n.put(r#"{"a":{"x":1,".priority":2}}"#)?;
+        let actual = parse(&n.get(r#".json?orderBy="$key"&limitToFirst=1"#)?, 200)?;
+        ensure(actual == json!({"a": {"x": 1}}), || actual.to_string())
+    });
+    s.check("format=export keeps .value and .priority", REF, |n| {
+        n.put(r#"{".value":"Tom",".priority":1}"#)?;
+        let actual = parse(&n.get(".json?format=export")?, 200)?;
+        ensure(actual == json!({".value": "Tom", ".priority": 1}), || {
+            actual.to_string()
+        })
+    });
     s.check("A plain GET leaves priorities out", REF, |n| {
         n.put(r#"{"a":1,".priority":2}"#)?;
         body(&n.get(".json")?, &json!({"a": 1}))
@@ -711,6 +721,37 @@ fn streaming(s: &Spec) {
     });
 }
 
+fn streaming_patches(s: &Spec) {
+    s.check("A patch's keys are children of its path", REF, |n| {
+        n.put(r#"{"a":{"x":1},"b":{"y":2}}"#)?;
+        let mut stream =
+            TcpStream::connect(("127.0.0.1", n.stack.edge_port())).map_err(|e| e.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|e| e.to_string())?;
+        write!(
+            stream,
+            "GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\n\r\n",
+            n.url(".json")
+        )
+        .map_err(|e| e.to_string())?;
+        let reader = stream.try_clone().map_err(|e| e.to_string())?;
+        let handle = std::thread::spawn(move || read_events(reader, 3));
+        std::thread::sleep(Duration::from_millis(200));
+        n.send("PATCH", ".json", r#"{"a/x":9,"b/y":8}"#)?;
+        let events = handle.join().map_err(|_| "reader panicked")??;
+        let wanted = vec![
+            (
+                "put".to_string(),
+                json!({"path": "/", "data": {"a": {"x": 1}, "b": {"y": 2}}}),
+            ),
+            ("patch".to_string(), json!({"path": "/a", "data": {"x": 9}})),
+            ("patch".to_string(), json!({"path": "/b", "data": {"y": 8}})),
+        ];
+        ensure(events == wanted, || format!("{events:?}"))
+    });
+}
+
 /// Runs every check and prints the failures. Returns whether all passed.
 pub fn run(stack: &Stack) -> bool {
     let spec = Spec {
@@ -728,6 +769,7 @@ pub fn run(stack: &Stack) -> bool {
     server_values(&spec);
     errors(&spec);
     streaming(&spec);
+    streaming_patches(&spec);
     let failures = spec.failures.borrow();
     println!(
         "Documented behavior: {} passed, {} known differences, {} failed",

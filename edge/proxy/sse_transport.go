@@ -57,6 +57,8 @@ package proxy
 import (
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -351,6 +353,40 @@ type SSEEvent struct {
 	Data interface{} // The data value
 }
 
+// split returns the events to send for this one. The server's patch keys are full
+// paths below the event's path. A client treats a patch's keys as children of its
+// path, so each group of keys with the same parent becomes its own patch.
+func (e *SSEEvent) split() []*SSEEvent {
+	data, ok := e.Data.(map[string]interface{})
+	if e.Type != "patch" || !ok {
+		return []*SSEEvent{e}
+	}
+	keys := make([]string, 0, len(data))
+	for key := range data {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	var events []*SSEEvent
+	byParent := make(map[string]map[string]interface{})
+	for _, key := range keys {
+		full := strings.TrimSuffix(e.Path, "/") + "/" + strings.Trim(key, "/")
+		slash := strings.LastIndex(full, "/")
+		parent, child := full[:slash], full[slash+1:]
+		if parent == "" {
+			parent = "/"
+		}
+		children, seen := byParent[parent]
+		if !seen {
+			children = make(map[string]interface{})
+			byParent[parent] = children
+			events = append(events, &SSEEvent{Type: "patch", Path: parent, Data: children})
+		}
+		children[child] = data[key]
+	}
+	return events
+}
+
 // ParseSSEEvent parses a Lark protocol message into an SSE event
 // Returns nil if the message is not a relevant event (e.g., ack, nack, join confirm)
 func ParseSSEEvent(data []byte) *SSEEvent {
@@ -388,7 +424,7 @@ func ParseSSEEvent(data []byte) *SSEEvent {
 	}
 
 	// Get value
-	value := msg["v"]
+	value := stripPriorities(msg["v"])
 
 	// Map event type
 	switch evType {

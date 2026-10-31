@@ -92,6 +92,7 @@ type RESTQueryOptions struct {
 
 	// Response formatting (handled by proxy)
 	Print    string // print=pretty|silent
+	Format   string // format=export - include priorities
 	Callback string // callback=funcName (JSONP)
 	Download string // download=filename
 	Timeout  time.Duration
@@ -189,6 +190,9 @@ func parseRESTQueryOptions(query map[string][]string) (*RESTQueryOptions, error)
 		}
 		opts.Print = v
 	}
+
+	// format
+	opts.Format = getQueryParam(query, "format")
 
 	// callback (JSONP)
 	opts.Callback = getQueryParam(query, "callback")
@@ -588,7 +592,7 @@ func (s *Server) writeLarkResponseAsHTTP(w http.ResponseWriter, method string, p
 		// v2 clients: backend returns primitives as-is and containers as {".sz": N} — pass through
 		// v1 clients: truncate all children to true (Firebase behavior)
 		if opts != nil && opts.Shallow && !opts.IsV2 {
-			value = truncateShallow(value)
+			value = truncateShallow(stripPriorities(value))
 		}
 		// Compute and set ETag header if requested
 		if opts != nil && opts.WantETag {
@@ -599,6 +603,9 @@ func (s *Server) writeLarkResponseAsHTTP(w http.ResponseWriter, method string, p
 		if opts != nil && opts.Print == "silent" {
 			w.WriteHeader(http.StatusNoContent)
 			return
+		}
+		if opts == nil || opts.Format != "export" {
+			value = stripPriorities(value)
 		}
 		s.writeRESTResponse(w, http.StatusOK, value, opts)
 		return
@@ -741,7 +748,31 @@ func (s *Server) handleConditionFailed(w http.ResponseWriter, vc *RESTVirtualCli
 		w.Header().Set("ETag", etag)
 	}
 
-	s.writeRESTResponse(w, http.StatusPreconditionFailed, currentValue, opts)
+	s.writeRESTResponse(w, http.StatusPreconditionFailed, stripPriorities(currentValue), opts)
+}
+
+// stripPriorities removes priorities from a value, in place, for responses that
+// don't ask for them: `.priority` children go, and a `{".value": v, ".priority": p}`
+// node reads as v.
+func stripPriorities(value interface{}) interface{} {
+	switch v := value.(type) {
+	case map[string]interface{}:
+		if inner, ok := v[".value"]; ok {
+			return stripPriorities(inner)
+		}
+		delete(v, ".priority")
+		if len(v) == 0 {
+			return nil
+		}
+		for key, child := range v {
+			v[key] = stripPriorities(child)
+		}
+	case []interface{}:
+		for i, child := range v {
+			v[i] = stripPriorities(child)
+		}
+	}
+	return value
 }
 
 // jsonDepth returns how many levels of objects and arrays a value nests. A
@@ -1021,18 +1052,14 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 				Path string      `json:"path"`
 				Data interface{} `json:"data"`
 			}
-			sseData := ssePayload{
-				Path: event.Path,
-				Data: event.Data,
+			for _, part := range event.split() {
+				jsonData, err := sonic.Marshal(ssePayload{Path: part.Path, Data: part.Data})
+				if err != nil {
+					logger.Warn("SSE failed to marshal event", "error", err)
+					continue
+				}
+				fmt.Fprintf(w, "event: %s\ndata: %s\n\n", part.Type, string(jsonData))
 			}
-
-			jsonData, err := sonic.Marshal(sseData)
-			if err != nil {
-				logger.Warn("SSE failed to marshal event", "error", err)
-				continue
-			}
-
-			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Type, string(jsonData))
 			flusher.Flush()
 		}
 	}

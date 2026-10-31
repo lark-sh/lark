@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"net/http"
+	"reflect"
 	"testing"
 	"time"
 
@@ -384,6 +385,86 @@ func TestParseRESTQueryOptions(t *testing.T) {
 }
 
 // TestTruncateShallow tests the shallow truncation logic
+func TestStripPriorities(t *testing.T) {
+	tests := []struct {
+		name  string
+		input interface{}
+		want  interface{}
+	}{
+		{"primitive", "a", "a"},
+		{"null", nil, nil},
+		{"priority child", map[string]interface{}{"a": 1.0, ".priority": 2.0}, map[string]interface{}{"a": 1.0}},
+		{"value and priority", map[string]interface{}{".value": "Tom", ".priority": 1.0}, "Tom"},
+		{"only a priority", map[string]interface{}{".priority": 1.0}, nil},
+		{
+			"nested",
+			map[string]interface{}{"a": map[string]interface{}{".value": 1.0, ".priority": 2.0}},
+			map[string]interface{}{"a": 1.0},
+		},
+		{
+			"in an array, keeping holes",
+			[]interface{}{nil, map[string]interface{}{"a": 1.0, ".priority": 2.0}},
+			[]interface{}{nil, map[string]interface{}{"a": 1.0}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := stripPriorities(tt.input); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("stripPriorities() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSSEEventSplit(t *testing.T) {
+	type obj = map[string]interface{}
+	tests := []struct {
+		name  string
+		event SSEEvent
+		want  []SSEEvent
+	}{
+		{
+			"put is left alone",
+			SSEEvent{Type: "put", Path: "/c", Data: obj{"a/b": 1.0}},
+			[]SSEEvent{{Type: "put", Path: "/c", Data: obj{"a/b": 1.0}}},
+		},
+		{
+			"keys below one parent",
+			SSEEvent{Type: "patch", Path: "/", Data: obj{"/c/foo": 3.0, "/c/baz": 4.0}},
+			[]SSEEvent{{Type: "patch", Path: "/c", Data: obj{"foo": 3.0, "baz": 4.0}}},
+		},
+		{
+			"keys below two parents",
+			SSEEvent{Type: "patch", Path: "/", Data: obj{"/a/x": 1.0, "/b/y": nil}},
+			[]SSEEvent{
+				{Type: "patch", Path: "/a", Data: obj{"x": 1.0}},
+				{Type: "patch", Path: "/b", Data: obj{"y": nil}},
+			},
+		},
+		{
+			"keys already children of the path",
+			SSEEvent{Type: "patch", Path: "/c", Data: obj{"foo": 3.0}},
+			[]SSEEvent{{Type: "patch", Path: "/c", Data: obj{"foo": 3.0}}},
+		},
+		{
+			"top-level key",
+			SSEEvent{Type: "patch", Path: "/", Data: obj{"/a": 1.0}},
+			[]SSEEvent{{Type: "patch", Path: "/", Data: obj{"a": 1.0}}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got []SSEEvent
+			for _, part := range tt.event.split() {
+				got = append(got, *part)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("split() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestJSONDepth(t *testing.T) {
 	var deep interface{} = "leaf"
 	for i := 0; i < 40; i++ {
