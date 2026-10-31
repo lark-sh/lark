@@ -1,6 +1,17 @@
 use super::broadcast::is_below;
 use super::*;
 
+/// True if writing `value` stores nothing and so deletes what was there: null, or
+/// containers that hold only such values.
+fn stores_nothing(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Object(map) => map.values().all(stores_nothing),
+        Value::Array(items) => items.iter().all(stores_nothing),
+        _ => false,
+    }
+}
+
 impl Database {
     // =========================================================================
     // Subscribe/Unsubscribe
@@ -610,14 +621,14 @@ impl Database {
             match (&entry.op, &entry.value) {
                 (WalOp::Delete, _) => within(&entry_path),
                 (WalOp::Set, value) => {
-                    let deletes = value.as_ref().is_none_or(Value::is_null);
+                    let deletes = value.as_ref().is_none_or(stores_nothing);
                     deletes && within(&entry_path)
                 }
                 (WalOp::Update, Some(Value::Object(updates))) => {
                     let base = entry_path.trim_end_matches('/');
                     updates.iter().any(|(key, value)| {
                         let target = normalize_path_key(&format!("{base}/{key}"));
-                        value.is_null() && within(&target)
+                        stores_nothing(value) && within(&target)
                     })
                 }
                 (WalOp::Update, _) => false,
