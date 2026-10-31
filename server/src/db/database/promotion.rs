@@ -22,7 +22,7 @@ impl Database {
         // Check if this node already has real (non-Sentinel) data in the tree.
         // If so, no promotion needed. (This is a shallow check — only the top node.
         // For full-subtree guarantees, use promote_path_deep.)
-        {
+        let known_absent = {
             let tree = self.tree.read().unwrap();
             let path_obj = Path::parse(path);
             match tree.get(&path_obj) {
@@ -45,11 +45,15 @@ impl Database {
                 // No marker is written here: the absent key is the record that the
                 // child doesn't exist, and the next read repeats this same check.
                 // A Null stored in an Object would be read back as its child.
-                None if tree.has_loaded_ancestor(&path_obj) => return Ok(false),
-                _ => {
-                    // Sentinel, or absent below one — need to load from blob
-                }
+                None if tree.has_loaded_ancestor(&path_obj) => true,
+                // Sentinel, or absent below one — need to load from blob
+                _ => false,
             }
+        };
+
+        if known_absent {
+            self.debug_check_absent(path).await;
+            return Ok(false);
         }
 
         self.promote_path_shallow(path).await
@@ -104,6 +108,7 @@ impl Database {
 
         // Check if any Sentinel exists at or below this path — O(log n) BTreeSet
         // range query instead of the old O(tree_size) recursive contains_sentinel() walk.
+        let mut known_absent = false;
         let needs_promotion = if self.has_sentinel_at_or_below(path) {
             true
         } else {
@@ -136,14 +141,16 @@ impl Database {
                 None => {
                     // Same check as in promote_path: a path absent below a loaded
                     // node doesn't exist, and nothing needs to be recorded.
-                    if tree.has_loaded_ancestor(&path_obj) {
-                        return Ok(false);
-                    }
-                    // Parent is Sentinel or absent — need to load
-                    true
+                    known_absent = tree.has_loaded_ancestor(&path_obj);
+                    // Otherwise the parent is Sentinel or absent — need to load
+                    !known_absent
                 }
             }
         };
+
+        if known_absent {
+            self.debug_check_absent(path).await;
+        }
 
         if !needs_promotion {
             if let Some(ts) = self.promoted_paths.get_mut(&normalize_path_key(path)) {
@@ -155,6 +162,40 @@ impl Database {
         // Force a full promotion: read from blob + replay WAL, replacing the subtree.
         // This is the same logic as promote_path but without the early bail-out.
         self.promote_path_unchecked(path).await
+    }
+
+    /// In debug builds, fails if `path` was treated as absent but the blob or WAL
+    /// has data there. Does nothing in release builds.
+    async fn debug_check_absent(&self, path: &str) {
+        if cfg!(debug_assertions) {
+            assert!(
+                !self.path_holds_stored_data(path).await,
+                "{path} was treated as absent below a loaded node, but it has data"
+            );
+        }
+    }
+
+    /// True if the blob and pending WAL hold data at `path`. Reads the whole
+    /// subtree, so it's only for debug checks.
+    pub(super) async fn path_holds_stored_data(&self, path: &str) -> bool {
+        fn holds_data(value: &ArcValue) -> bool {
+            match value {
+                ArcValue::Null => false,
+                ArcValue::Object(map) | ArcValue::Sentinel(map) => map.values().any(holds_data),
+                _ => true,
+            }
+        }
+
+        let Some(session) = &self.blob_session else {
+            return false;
+        };
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let stored = match session.read_subtree(&segments).await {
+            Ok(value) => value,
+            Err(BlobError::PathNotFound(_)) => ArcValue::Null,
+            Err(e) => panic!("blob read failed at {path}: {e}"),
+        };
+        holds_data(&self.replay_wal_lazy(path, stored))
     }
 
     /// Applies the pending WAL entries that affect `path` on top of `base`, a value
