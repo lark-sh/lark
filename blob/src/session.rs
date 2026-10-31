@@ -193,6 +193,18 @@ impl<IO: BlobIO> BlobSession<IO> {
                 let mut path_buf = Vec::new();
                 self.apply_tree(&src, &tree, &mut path_buf, &mut stats)
                     .await?;
+
+                // Deleting a collection's last child leaves it empty, and a
+                // collection holding no data shouldn't stay listed in its parent.
+                // This runs after the whole batch because updates apply in no
+                // particular order, so only now is a collection known to be empty.
+                for path in crate::incremental::UpdateNode::ancestors_of_deletes(&tree) {
+                    let refs: Vec<&str> = path.iter().map(String::as_str).collect();
+                    if self.is_empty_collection(&refs).await? {
+                        self.apply_single_update(&src, &refs, None, &mut stats)
+                            .await?;
+                    }
+                }
             }
             Ok(())
         }

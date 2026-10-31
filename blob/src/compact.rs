@@ -785,6 +785,8 @@ struct SmartCopyFrame {
     total_key_data_reserved: u32,
     /// For collections: live child count (after filtering TYPE_NULL).
     live_child_count: usize,
+    /// True once a value has been copied at any depth below this container.
+    holds_data: bool,
     /// Stats accumulated for this container.
     stats: CopyStats,
     /// Bytes of this frame's output already flushed to dst (chunked flushing for >1GB).
@@ -895,9 +897,19 @@ pub(crate) async fn structural_copy<IO: BlobIO>(
                 return Ok(total_stats);
             }
 
+            let parent = stack.last_mut().unwrap();
+
+            // A container with no value anywhere below it holds no data, so its
+            // key isn't copied to the parent, which can empty the parent in turn.
+            // An array keeps its elements, because their positions are their keys.
+            if !frame.holds_data && parent.tag == TYPE_COLLECTION {
+                skip_key_string(parent);
+                continue;
+            }
+            parent.holds_data |= frame.holds_data;
+
             // Child frame: finalize header, then append buffer to parent's buffer
             let subtree_size = finalize_frame_buf(&mut frame);
-            let parent = stack.last_mut().unwrap();
             let child_rel =
                 parent.bytes_flushed + parent.buf.len() as u64 - parent.header_region_size as u64;
             match parent.tag {
@@ -1013,6 +1025,7 @@ pub(crate) async fn structural_copy<IO: BlobIO>(
             copy_key_string_at_pos(frame, dict);
         }
         frame.live_child_count += 1;
+        frame.holds_data |= child_type != TYPE_NULL;
 
         // Read child data from src into buffer
         let start = frame.buf.len();
@@ -1095,6 +1108,7 @@ fn push_frame(info: CopyContainerInfo, stack: &mut Vec<SmartCopyFrame>) {
             total_index_slots: total_slots,
             total_key_data_reserved: new_key_data_reserved,
             live_child_count: 0,
+            holds_data: false,
             stats: CopyStats::default(),
             bytes_flushed: 0,
         });
@@ -1120,6 +1134,7 @@ fn push_frame(info: CopyContainerInfo, stack: &mut Vec<SmartCopyFrame>) {
             total_index_slots: 0,
             total_key_data_reserved: 0,
             live_child_count: 0,
+            holds_data: false,
             stats: CopyStats::default(),
             bytes_flushed: 0,
         });

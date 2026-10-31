@@ -310,8 +310,7 @@ fn check(
         }
 
         // Shallow read: every child the model has must be listed, primitives
-        // must match, and a listed container the model lacks may only be a
-        // stored empty object (no data).
+        // must match, and nothing the model lacks may be listed.
         let shallow = match block_on(session.read_shallow(&p)) {
             Ok(s) => s,
             Err(BlobError::PathNotFound(_)) => {
@@ -362,14 +361,10 @@ fn check(
                         }
                         None => {
                             if norm(&model_child).is_none() {
-                                let mut cp = p.clone();
-                                cp.push(&c.key);
-                                if norm(&blob_read(session, &cp)?).is_some() {
-                                    return Err(TestCaseError::fail(format!(
-                                        "{at}: shallow {shown} lists {} with data the model doesn't have",
-                                        c.key
-                                    )));
-                                }
+                                return Err(TestCaseError::fail(format!(
+                                    "{at}: shallow {shown} lists {}, which the model doesn't have",
+                                    c.key
+                                )));
                             }
                         }
                     }

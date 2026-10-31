@@ -8,7 +8,7 @@
 use crate::arc_value::ArcValue;
 use crate::error::Result;
 use crate::io::BlobIO;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// A tree of pending updates built from a flat (path, value) list.
 /// Later entries override earlier ones at the same path.
@@ -158,6 +158,47 @@ impl UpdateNode {
         }
     }
 
+    /// Every non-root ancestor of a path this batch deletes, deepest first. These
+    /// are the collections a batch can leave with no children.
+    pub(crate) fn ancestors_of_deletes(tree: &HashMap<String, UpdateNode>) -> Vec<Vec<String>> {
+        fn add_with_ancestors(path: &[String], found: &mut BTreeSet<Vec<String>>) {
+            for depth in 1..=path.len() {
+                found.insert(path[..depth].to_vec());
+            }
+        }
+
+        fn walk(
+            tree: &HashMap<String, UpdateNode>,
+            path: &mut Vec<String>,
+            found: &mut BTreeSet<Vec<String>>,
+        ) {
+            for (key, node) in tree {
+                match node {
+                    UpdateNode::Merge { children, .. } => {
+                        path.push(key.clone());
+                        walk(children, path, found);
+                        path.pop();
+                    }
+                    UpdateNode::Set(v) if !v.is_empty_container() => {}
+                    // A value whose contents this batch deleted writes an empty
+                    // collection, so it's a candidate along with its ancestors.
+                    UpdateNode::Set(_) => {
+                        path.push(key.clone());
+                        add_with_ancestors(path, found);
+                        path.pop();
+                    }
+                    UpdateNode::Delete => add_with_ancestors(path, found),
+                }
+            }
+        }
+
+        let mut found = BTreeSet::new();
+        walk(tree, &mut Vec::new(), &mut found);
+        let mut ancestors: Vec<Vec<String>> = found.into_iter().collect();
+        ancestors.sort_by_key(|path| std::cmp::Reverse(path.len()));
+        ancestors
+    }
+
     /// The value a node holds when only this batch's writes below it survive:
     /// Sets become values, Deletes drop out, and nested Merges are built the
     /// same way. `None` when nothing is left.
@@ -281,6 +322,10 @@ mod tests {
             .await
             .unwrap();
         session.read_subtree(path).await.unwrap()
+    }
+
+    fn segments(path: &[&str]) -> Vec<String> {
+        path.iter().map(|s| s.to_string()).collect()
     }
 
     async fn read_root<IO: BlobIO>(io: &IO) -> ArcValue {
@@ -1293,20 +1338,83 @@ mod tests {
                 assert!(s.read_subtree(&["items", "-Maaa002"]).await.is_err());
             }
 
-            // Compact: collection should now have zero children
+            // The emptied collection is gone from its parent, here and after a
+            // full compaction.
+            assert!(read_root(&io).await.get("items").is_none());
+            let dst = CachedIO::new(crate::io::MemBlobIO::new());
+            crate::compact::full_compact(&io, &dst).await.unwrap();
+            assert!(read_root(&dst).await.get("items").is_none());
+        });
+    }
+
+    #[test]
+    fn test_emptied_collections_prune_up_to_a_parent_with_data() {
+        block_on(async {
+            let io = setup_blob(json!({
+                "a": {"b": {"c": {"d": 1}}},
+                "keep": {"x": 1, "gone": {"y": 2}}
+            }))
+            .await;
+
+            let updates = vec![
+                (segments(&["a", "b", "c", "d"]), None),
+                (segments(&["keep", "gone", "y"]), None),
+            ];
+            apply_updates(&io, &updates).await.unwrap();
+
+            assert_eq!(read_root(&io).await.to_value(), json!({"keep": {"x": 1}}));
+        });
+    }
+
+    #[test]
+    fn test_collection_rewritten_in_the_same_batch_is_not_pruned() {
+        block_on(async {
+            let io = setup_blob(json!({"a": {"b": 1}, "c": {"d": 2}})).await;
+
+            // Applied in no particular order, and both orders must keep the data.
+            let updates = vec![
+                (segments(&["a", "b"]), None),
+                (segments(&["a", "new"]), Some(ArcValue::from(3i64))),
+                (segments(&["c", "d"]), None),
+                (segments(&["c", "e"]), Some(ArcValue::from(4i64))),
+            ];
+            apply_updates(&io, &updates).await.unwrap();
+
+            assert_eq!(
+                read_root(&io).await.to_value(),
+                json!({"a": {"new": 3}, "c": {"e": 4}})
+            );
+        });
+    }
+
+    #[test]
+    fn test_deleting_below_a_collection_with_other_children_keeps_it() {
+        block_on(async {
+            let io = setup_blob(json!({"a": {"b": {"c": 1}, "d": 2}})).await;
+
+            apply_updates(&io, &[(segments(&["a", "b", "c"]), None)])
+                .await
+                .unwrap();
+
+            assert_eq!(read_root(&io).await.to_value(), json!({"a": {"d": 2}}));
+        });
+    }
+
+    #[test]
+    fn test_full_compact_drops_collections_already_empty_in_the_blob() {
+        block_on(async {
+            // Blobs written before pruning hold empty collections like these.
+            let io = setup_blob(json!({
+                "gone": {"inner": {}},
+                "empty": {},
+                "keep": {"x": 1, "gone": {}}
+            }))
+            .await;
+
             let dst = CachedIO::new(crate::io::MemBlobIO::new());
             crate::compact::full_compact(&io, &dst).await.unwrap();
 
-            // After compaction, the items collection should be empty.
-            // Reading a deleted key from the compacted blob should fail (key
-            // no longer exists in the index).
-            let root = read_root(&dst).await;
-            let items = root.get("items").unwrap();
-            // Empty collection serializes as an object with no children
-            match items {
-                ArcValue::Object(map) => assert!(map.is_empty()),
-                _ => panic!("expected empty object/collection, got {:?}", items),
-            }
+            assert_eq!(read_root(&dst).await.to_value(), json!({"keep": {"x": 1}}));
         });
     }
 
