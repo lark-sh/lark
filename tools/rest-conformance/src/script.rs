@@ -164,6 +164,7 @@ pub enum Step {
     Evict,
     Restart,
     FullCompact,
+    LiveCompact,
     BulkCompact,
 }
 
@@ -223,6 +224,7 @@ fn step(slow: bool) -> BoxedStrategy<Step> {
     if slow {
         steps.push((1, Just(Step::Restart).boxed()));
         steps.push((1, Just(Step::FullCompact).boxed()));
+        steps.push((1, Just(Step::LiveCompact).boxed()));
         steps.push((1, Just(Step::BulkCompact).boxed()));
     }
     Union::new_weighted(steps).boxed()
@@ -263,6 +265,20 @@ pub fn parse(response: &Response, status: u16) -> Result<Value, String> {
         return Err(format!("content type {content_type:?}"));
     }
     response.json()
+}
+
+/// Writes past the WAL rotation size, then waits for the storage worker's batch.
+pub fn bulk_compact(stack: &Stack) -> Result<(), String> {
+    let chunk = json!("x".repeat(BULK_ITEM_BYTES)).to_string();
+    for i in 0..BULK_ITEMS {
+        let url = format!("/bulk/item_{i}.json?print=silent");
+        let response = stack.request("PUT", &url, &[], Some(chunk.as_bytes()))?;
+        if response.status != 204 {
+            return Err(format!("PUT {url}: {}", describe(&response)));
+        }
+    }
+    sleep(BULK_SETTLE);
+    Ok(())
 }
 
 pub struct Run<'a> {
@@ -506,18 +522,7 @@ impl<'a> Run<'a> {
     }
 
     fn bulk_compact(&self) -> Result<(), String> {
-        let chunk = json!("x".repeat(BULK_ITEM_BYTES)).to_string();
-        for i in 0..BULK_ITEMS {
-            let url = format!("/bulk/item_{i}.json?print=silent");
-            let response = self
-                .stack
-                .request("PUT", &url, &[], Some(chunk.as_bytes()))?;
-            if response.status != 204 {
-                return Err(format!("PUT {url}: {}", describe(&response)));
-            }
-        }
-        sleep(BULK_SETTLE);
-        Ok(())
+        bulk_compact(self.stack)
     }
 
     pub fn apply(&mut self, step: &Step) -> Result<(), String> {
@@ -553,6 +558,7 @@ impl<'a> Run<'a> {
             Step::Evict => self.stack.evict(),
             Step::Restart => self.stack.restart(),
             Step::FullCompact => self.stack.full_compact(),
+            Step::LiveCompact => self.stack.live_compact(),
             Step::BulkCompact => self.bulk_compact(),
         }
     }

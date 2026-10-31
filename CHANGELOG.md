@@ -19,6 +19,9 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 
 ### Fixed
 
+- `lark-compact` is now safe to run against a live server. It waits for a running batch through a new `.storage.lock` file instead of risking losing that batch or copying a blob as it changes. A batch that followed a compaction could also use offsets from the old blob. Both needed a server running while `lark-compact` ran.
+- `lark-compact` syncs the new blob before swapping it in and replaces `blob.lark` atomically, so a crash or power loss can't leave a damaged blob or none at all. It no longer uses `blob.old.lark`.
+- A `.compacting` marker left behind now logs a warning after an hour. If you back up with the marker, add the new `flock` step in [BACKUP.md](docs/BACKUP.md).
 - REST ETags now follow the documented table. PUT, POST and DELETE return an ETag when asked, an empty location's ETag is `null_etag`, and it works in `if-match`. PATCH refuses both headers, and GET and POST refuse `if-match`.
 - REST reads no longer return `.priority`, and `{".value": v, ".priority": p}` reads as `v`. `format=export` returns priorities.
 - SSE patch events now use keys that are children of the event's `path`, instead of full paths at `/`. A patch across several parents arrives as one event per parent.

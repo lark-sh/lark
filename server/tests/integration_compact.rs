@@ -276,6 +276,87 @@ fn test_compact_with_deletes() {
     );
 }
 
+fn test_tree() -> ArcValue {
+    ArcValue::from_value(json!({"users": {"alice": {"age": 30}, "bob": {"age": 25}}}))
+}
+
+fn generation(db_dir: &Path) -> u64 {
+    std::fs::read_to_string(db_dir.join("blob.generation"))
+        .map(|s| s.trim().parse().unwrap())
+        .unwrap_or(0)
+}
+
+/// A storage worker batch holds the lock. Compaction can't start until it's done,
+/// or the batch would miss the copy and be lost.
+#[test]
+fn test_compact_waits_for_a_running_batch() {
+    let temp_dir = TempDir::new().unwrap();
+    write_test_blob(temp_dir.path(), "p", "db", &test_tree());
+    let db_dir = temp_dir.path().join("p").join("db");
+
+    let batch = lark_blob::try_lock_storage(&db_dir).unwrap().unwrap();
+    let mut compact = Command::new(compact_binary())
+        .arg(&db_dir)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        compact.try_wait().unwrap().is_none(),
+        "compaction started while a batch held the lock"
+    );
+    assert!(db_dir.join(".compacting").exists());
+    assert_eq!(generation(&db_dir), 0);
+
+    drop(batch);
+    assert!(compact.wait().unwrap().success());
+    assert_eq!(generation(&db_dir), 1);
+    assert!(!db_dir.join(".compacting").exists());
+}
+
+/// The lock goes with the process, so the next batch can run.
+#[test]
+fn test_compact_releases_the_lock_when_done() {
+    let temp_dir = TempDir::new().unwrap();
+    write_test_blob(temp_dir.path(), "p", "db", &test_tree());
+    let db_dir = temp_dir.path().join("p").join("db");
+
+    assert!(run_compact(&db_dir).status.success());
+    assert!(lark_blob::try_lock_storage(&db_dir).unwrap().is_some());
+}
+
+/// The swap leaves one blob behind, with no window where `blob.lark` is missing.
+#[test]
+fn test_compact_leaves_no_other_blob_files() {
+    let temp_dir = TempDir::new().unwrap();
+    write_test_blob(temp_dir.path(), "p", "db", &test_tree());
+    let db_dir = temp_dir.path().join("p").join("db");
+
+    assert!(run_compact(&db_dir).status.success());
+
+    for leftover in ["blob.lark.tmp", "blob.old.lark", "blob.generation.tmp"] {
+        assert!(!db_dir.join(leftover).exists(), "{leftover} left behind");
+    }
+    let tree = read_full_tree(&db_dir.join("blob.lark"));
+    assert_eq!(tree.to_value(), test_tree().to_value());
+}
+
+/// An earlier run that died mid-swap left the marker. Running again finishes the
+/// job and clears it.
+#[test]
+fn test_compact_recovers_from_a_leftover_marker() {
+    let temp_dir = TempDir::new().unwrap();
+    write_test_blob(temp_dir.path(), "p", "db", &test_tree());
+    let db_dir = temp_dir.path().join("p").join("db");
+    std::fs::write(db_dir.join(".compacting"), b"").unwrap();
+
+    assert!(run_compact(&db_dir).status.success());
+
+    assert!(!db_dir.join(".compacting").exists());
+    assert_eq!(generation(&db_dir), 1);
+}
+
 #[test]
 fn test_no_args_shows_usage() {
     let output = Command::new(compact_binary())

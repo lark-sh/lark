@@ -264,6 +264,30 @@ impl Stack {
         self.wait_ready()
     }
 
+    /// Runs a full compaction with the server still running.
+    pub fn live_compact(&self) -> Result<(), String> {
+        let output = Command::new(&self.binaries.compact)
+            .arg(self.database_dir())
+            .output()
+            .map_err(|e| format!("run lark-compact: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "lark-compact: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    /// How many storage worker batches have failed. A failed batch is retried, so
+    /// clients can't see it.
+    pub fn compaction_failures(&self) -> usize {
+        let log = std::fs::read(self.work_dir.join("server.log")).unwrap_or_default();
+        String::from_utf8_lossy(&log)
+            .matches("Compaction failed")
+            .count()
+    }
+
     /// Forces a server back up after a crash, ignoring how it died.
     pub fn recover(&mut self) -> Result<(), String> {
         if let Some(mut child) = self.server.take() {

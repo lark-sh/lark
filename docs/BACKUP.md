@@ -39,8 +39,10 @@ For each database directory you're copying, drop a `.compacting` marker file in 
 ```bash
 DB_DIR="$LARK_DATA_DIR/my-project/my-database"
 
-# 1. Freeze incremental compaction for this database.
+# 1. Freeze incremental compaction for this database, and wait for any batch
+#    already running to finish.
 touch "$DB_DIR/.compacting"
+flock "$DB_DIR/.storage.lock" true
 
 # 2. Copy the database files. Order doesn't matter — they're now static
 #    (the WAL keeps appending, but appends are always safe to copy).
@@ -50,7 +52,7 @@ cp -a "$DB_DIR" /path/to/backup/my-project/
 rm "$DB_DIR/.compacting"
 ```
 
-While `.compacting` is present, lark-server's storage worker skips its incremental compaction pass entirely (`server/src/storage/worker.rs`), so `blob.lark`, `sidecar.lark`, `blob.generation`, and `sequence` do not change during the copy. Live writes continue uninterrupted: they land in the WAL, which is append-only and safe to copy at any time. **Remember to remove the marker afterward**; if it's left behind, compaction never resumes and the WAL grows unbounded. (This is the same mechanism `lark-compact` uses while it holds the blob for a full re-compaction.)
+While `.compacting` is present, lark-server's storage worker skips its incremental compaction pass entirely (`server/src/storage/worker.rs`), and a batch that started before the marker holds `.storage.lock` until it finishes, so once `flock` returns, `blob.lark`, `sidecar.lark`, `blob.generation`, and `sequence` do not change during the copy. Live writes continue uninterrupted: they land in the WAL, which is append-only and safe to copy at any time. **Remember to remove the marker afterward**; if it's left behind, compaction never resumes and the WAL grows unbounded. After an hour, lark-server logs a warning for a marker it's still skipping. (This is the same mechanism `lark-compact` uses while it holds the blob for a full re-compaction.)
 
 To snapshot the whole deployment when there are many databases, place a `.compacting` marker in each database directory before copying, then remove it after copying that database's folder.
 

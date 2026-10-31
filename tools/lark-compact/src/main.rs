@@ -13,11 +13,19 @@
 //! incremental compaction in-process inside `lark-server`; this binary
 //! is for the cases where you want to force a full root-level rewrite
 //! without restarting the server.
+//!
+//! The swap is safe against a running server and against a crash at any point.
+//! If this dies between replacing `blob.lark` and bumping the generation, the
+//! `.compacting` marker stays, which keeps the server's storage worker off the
+//! replaced file. Running `lark-compact` again finishes the job.
 
 use lark_blob::BlobSession;
 use lark_blob::io::StdBlobIO;
+use lark_blob::lock_storage;
 use lark_blob::segment::Sidecar;
 
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -67,9 +75,23 @@ fn read_blob_generation(dir: &Path) -> u64 {
     }
 }
 
+/// Replaces `blob.generation` in one step, so a reader never sees it empty.
 fn write_blob_generation(dir: &Path, generation: u64) -> Result<(), String> {
-    std::fs::write(dir.join("blob.generation"), generation.to_string())
-        .map_err(|e| format!("failed to write blob.generation: {}", e))
+    let path = dir.join("blob.generation");
+    let tmp = dir.join("blob.generation.tmp");
+    let fail = |e: std::io::Error| format!("failed to write blob.generation: {}", e);
+    let mut file = File::create(&tmp).map_err(fail)?;
+    file.write_all(generation.to_string().as_bytes())
+        .map_err(fail)?;
+    file.sync_all().map_err(fail)?;
+    std::fs::rename(&tmp, &path).map_err(fail)
+}
+
+/// Makes renames inside a directory survive a power loss.
+fn sync_dir(dir: &Path) -> Result<(), String> {
+    File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| format!("failed to sync {}: {}", dir.display(), e))
 }
 
 // ---------------------------------------------------------------------------
@@ -80,6 +102,22 @@ struct CompactResult {
     elapsed: Duration,
 }
 
+struct CompactError {
+    message: String,
+    /// `blob.lark` was replaced but a running server hasn't been told, so the
+    /// marker has to stay.
+    generation_pending: bool,
+}
+
+impl From<String> for CompactError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            generation_pending: false,
+        }
+    }
+}
+
 fn compact_database(db_dir: &Path) -> Result<Option<CompactResult>, String> {
     let compacting_marker = db_dir.join(".compacting");
 
@@ -88,14 +126,24 @@ fn compact_database(db_dir: &Path) -> Result<Option<CompactResult>, String> {
     std::fs::write(&compacting_marker, b"")
         .map_err(|e| format!("failed to create .compacting: {}", e))?;
 
+    // A batch that began before the marker existed may still be running. This
+    // returns as soon as it has finished, and at once if there isn't one.
+    let storage_lock = lock_storage(db_dir).map_err(|e| {
+        let _ = std::fs::remove_file(&compacting_marker);
+        format!("failed to lock {}: {}", db_dir.display(), e)
+    })?;
+
     let result = compact_database_inner(db_dir);
 
-    let _ = std::fs::remove_file(&compacting_marker);
+    if !result.as_ref().is_err_and(|error| error.generation_pending) {
+        let _ = std::fs::remove_file(&compacting_marker);
+    }
+    drop(storage_lock);
 
-    result
+    result.map_err(|error| error.message)
 }
 
-fn compact_database_inner(db_dir: &Path) -> Result<Option<CompactResult>, String> {
+fn compact_database_inner(db_dir: &Path) -> Result<Option<CompactResult>, CompactError> {
     let bp = blob_path(db_dir);
     if !bp.exists() {
         return Ok(None);
@@ -138,22 +186,26 @@ fn compact_database_inner(db_dir: &Path) -> Result<Option<CompactResult>, String
     block_on(session.apply_updates_with_sidecar(&[], Some(&sidecar_write_io)))
         .map_err(|e| format!("failed to write sidecar: {}", e))?;
 
-    // Rename dance: blob.lark.tmp → blob.lark, keeping blob.old.lark as a
-    // recovery point until the swap completes successfully.
-    let blob_old = db_dir.join("blob.old.lark");
-    std::fs::rename(&bp, &blob_old).map_err(|e| {
-        let _ = std::fs::remove_file(&blob_tmp);
-        format!("rename blob.lark -> blob.old.lark failed: {}", e)
-    })?;
+    // The new blob has to be on disk before it replaces the old one, or a power
+    // loss could leave neither.
+    block_on(lark_blob::BlobIO::sync(session.io()))
+        .map_err(|e| format!("failed to sync {}: {}", blob_tmp.display(), e))?;
+
+    // A rename over the old blob is atomic, so `blob.lark` is never missing and is
+    // always one complete blob or the other.
     std::fs::rename(&blob_tmp, &bp).map_err(|e| {
-        let _ = std::fs::rename(&blob_old, &bp);
+        let _ = std::fs::remove_file(&blob_tmp);
         format!("rename blob.lark.tmp -> blob.lark failed: {}", e)
     })?;
-    let _ = std::fs::remove_file(&blob_old);
 
     // Bump generation. Any running server's StorageWorker checks this
     // value and reopens the BlobSession when it advances.
-    write_blob_generation(db_dir, current_gen + 1)?;
+    write_blob_generation(db_dir, current_gen + 1).map_err(|message| CompactError {
+        message,
+        generation_pending: true,
+    })?;
+
+    sync_dir(db_dir)?;
 
     Ok(Some(CompactResult {
         elapsed: start.elapsed(),

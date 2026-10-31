@@ -15,11 +15,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use glommio::channels::local_channel::{LocalReceiver, LocalSender};
 use lark_blob::wal::coalesce_wal_entries;
-use lark_blob::{BlobIO, BlobSession, CachedIO};
+use lark_blob::{BlobIO, BlobSession, CachedIO, try_lock_storage};
 use tracing::{debug, error, info, warn};
 
 use crate::db::{CompactionComplete, InboxMessage};
@@ -27,6 +27,10 @@ use crate::db::{blob_path, read_blob_generation, sidecar_path};
 use crate::storage::fsync;
 use crate::storage::glommio_blob_io::GlommioBlobIO;
 use crate::storage::wal::WalReader;
+
+/// A `.compacting` marker older than this is probably left over from a crash:
+/// nothing clears it, and compaction stays stopped until something does.
+const STALE_MARKER_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Messages sent from Database to StorageWorker.
 #[allow(clippy::large_enum_variant)] // Compact dominates; boxing would churn all call sites
@@ -48,7 +52,11 @@ pub struct CompactionRequest {
     /// Shared CachedIO from the Database's BlobSession.
     /// Cloned via clone_for_reading() — shares the Rc-backed byte cache so
     /// StorageWorker writes are immediately visible to the Database's reads.
+    /// Only usable if `blob_generation` is current: the cache is keyed by offsets
+    /// in the blob the Database has open.
     pub cached_io: CachedIO<GlommioBlobIO>,
+    /// The blob generation the Database has open.
+    pub blob_generation: u64,
 }
 
 /// Persistent per-database state held by the StorageWorker.
@@ -154,6 +162,15 @@ impl StorageWorker {
         let db_id = request.database_id;
         let inbox_sender = request.inbox_sender;
 
+        // Held until this batch has written the sequence file, so lark-compact can't
+        // copy the blob while it changes. The WAL keeps a skipped batch for next time.
+        let Some(_storage_lock) =
+            try_lock_storage(&data_dir).map_err(|e| format!("locking {:?}: {}", data_dir, e))?
+        else {
+            debug!("[StorageWorker] {}: storage lock held, skipping", db_id);
+            return Ok(());
+        };
+
         // 1. Single directory scan: check for .compacting marker and find highest blob.
         let (is_compacting, highest_blob) = scan_db_dir(&data_dir);
 
@@ -162,6 +179,7 @@ impl StorageWorker {
                 "[StorageWorker] {}: .compacting marker present, skipping",
                 db_id
             );
+            warn_if_marker_is_stale(&data_dir, &db_id);
             return Ok(());
         }
 
@@ -169,8 +187,9 @@ impl StorageWorker {
             highest_blob.ok_or_else(|| format!("no blob file found in {:?}", data_dir))?;
 
         // 2. If blob generation changed (lark-compact replaced blob.lark and bumped blob.generation),
-        //    drop cached state so get_or_init_state re-opens on the new blob.
-        let mut gen_changed = false;
+        //    drop cached state so get_or_init_state re-opens on the new blob. The Database
+        //    can be behind even if this worker has no state for it yet.
+        let mut gen_changed = request.blob_generation != blob_gen;
         if let Some(state) = self.db_states.get(&db_id)
             && blob_gen != state.blob_generation
         {
@@ -226,8 +245,8 @@ impl StorageWorker {
         );
 
         // 6. Get or initialize persistent state for this database.
-        //    On generation change, the request's CachedIO may point to the old blob
-        //    (Database hasn't switched yet), so open a fresh independent CachedIO.
+        //    On generation change, the request's CachedIO holds offsets from the old
+        //    blob (Database hasn't switched yet), so open a fresh independent CachedIO.
         //    The Database will switch on CompactionComplete and future requests will
         //    carry the new shared CachedIO.
         let io_for_init = if gen_changed {
@@ -324,6 +343,22 @@ impl StorageWorker {
         );
 
         Ok(())
+    }
+}
+
+/// Warns if a `.compacting` marker has been there long enough to be left over.
+fn warn_if_marker_is_stale(data_dir: &Path, db_id: &str) {
+    let age = std::fs::metadata(data_dir.join(".compacting"))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok());
+    if age.is_some_and(|age| age >= STALE_MARKER_AGE) {
+        warn!(
+            "[StorageWorker] {}: .compacting marker is over {} minutes old, so compaction \
+             is stopped. If nothing is using it, run lark-compact on this database.",
+            db_id,
+            STALE_MARKER_AGE.as_secs() / 60
+        );
     }
 }
 

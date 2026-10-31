@@ -216,6 +216,50 @@ fn test_storage_worker_compacts_after_rotation() {
 }
 
 /// After compaction, restarting the server should load data from the updated blob.
+/// A batch doesn't start while lark-compact holds the storage lock, and the WAL
+/// keeps it for the next one.
+#[test]
+#[ignore] // Slow test — writes 5MB+ to trigger rotation
+fn test_storage_worker_skips_while_the_storage_lock_is_held() {
+    run_test(|| async {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+        write_test_blob(
+            data_dir,
+            "test-project",
+            "locked-db",
+            &ArcValue::from_value(json!({"seed": 1})),
+        );
+
+        let server = TestServer::with_persistence(data_dir);
+        server
+            .set_rules_with_ephemeral(
+                "test-project",
+                json!({"rules": {".read": true, ".write": true}}),
+                false,
+            )
+            .unwrap();
+        let mut client = server.client();
+        client.connect("test-project/locked-db").await;
+
+        let db_dir = std::path::Path::new(data_dir).join("test-project/locked-db");
+        let lock = lark_blob::try_lock_storage(&db_dir).unwrap().unwrap();
+
+        client.set("/held", json!("back")).await.unwrap();
+        trigger_rotation_and_wait(&client).await;
+        assert_eq!(
+            read_sequence(data_dir, "test-project", "locked-db"),
+            0,
+            "a batch ran while the lock was held"
+        );
+
+        drop(lock);
+        trigger_rotation_and_wait(&client).await;
+        assert!(read_sequence(data_dir, "test-project", "locked-db") > 0);
+        assert_eq!(client.once("/held").await.unwrap(), json!("back"));
+    });
+}
+
 #[test]
 #[ignore] // Slow test — writes 5MB+ to trigger rotation
 fn test_storage_worker_data_survives_restart() {

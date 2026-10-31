@@ -373,9 +373,9 @@ Rewrites the entire blob clean (no dead space, freshly sorted child indexes, dic
    children transparently)
 2. Write new blob depth-first into blob.lark.tmp (sequential writes)
 3. Rebuild dictionary (compact, only fields actually referenced)
-4. Rename dance: blob.lark -> blob.old.lark, blob.lark.tmp -> blob.lark
-5. Bump blob.generation; remove blob.old.lark
-6. Reset the sidecar (free list + bytes_wasted go to 0)
+4. Reset the sidecar (free list + bytes_wasted go to 0)
+5. Sync blob.lark.tmp, then rename it over blob.lark in one atomic step
+6. Bump blob.generation, then sync the directory
 ```
 
 **Triggered when:** `bytes_wasted >= 500 MB` AND `bytes_wasted / blob_size >= 20%` (see `lark-compact`'s thresholds). Until then, incremental compaction's free-list reuse keeps blob growth bounded without rewriting the whole thing.

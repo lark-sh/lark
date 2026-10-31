@@ -86,6 +86,7 @@ impl Database {
                 database_id: self.id.clone(),
                 inbox_sender: self.inbox_sender.clone(),
                 cached_io,
+                blob_generation: self.blob_generation,
             };
             match tx.try_send(StorageWorkerMessage::Compact(request)) {
                 Ok(_) => {
