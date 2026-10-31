@@ -31,6 +31,7 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 
 - The `lark-server` image now builds from `Cargo.lock` with the toolchain pinned in `rust-toolchain.toml`. It previously resolved the newest compatible crates and the current stable Rust at build time, so images could contain versions CI had never tested.
 - Updated the pinned Rust toolchain to 1.99.1.
+- `lark-server` now uses `lark-sh/glommio`, which is glommio 0.9.0 with fixes for an executor that could hang permanently, a memory leak when tasks are destroyed, and a process abort when a task panics. It also drops the unused `lockfree` and `bitmaps` crates, which clears the last `cargo audit` vulnerability.
 
 ## [0.3.0] — 2026-10-11
 

@@ -172,12 +172,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
-name = "bitmaps"
-version = "3.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1d084b0137aaa901caf9f1e8b21daa6aa24d41cd806e111335541eff9683bd6"
-
-[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -790,13 +784,11 @@ checksum = "1033caf0b349c518623b5396bfb2cf0bddf44f0306d543a250e5743297aafd10"
 [[package]]
 name = "glommio"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1f8bc1fce949d18098dc0a4e861314e40351a0144ebf61e59bdb5254a2273b2"
+source = "git+https://github.com/lark-sh/glommio?tag=v0.9.0-lark.1#dd0d993de438e38b569868bf24f28f2863b790b8"
 dependencies = [
  "ahash",
  "backtrace",
  "bitflags",
- "bitmaps",
  "buddy-alloc",
  "cc",
  "concurrent-queue",
@@ -807,7 +799,6 @@ dependencies = [
  "intrusive-collections",
  "lazy_static",
  "libc",
- "lockfree",
  "log",
  "nix",
  "pin-project-lite",
@@ -1206,15 +1197,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lockfree"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74ee94b5ad113c7cb98c5a040f783d0952ee4fe100993881d1673c2cb002dd23"
-dependencies = [
- "owned-alloc",
-]
-
-[[package]]
 name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1339,12 +1321,6 @@ name = "oorandom"
 version = "11.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
-
-[[package]]
-name = "owned-alloc"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30fceb411f9a12ff9222c5f824026be368ff15dc2f13468d850c7d3f502205d6"
 
 [[package]]
 name = "parking"

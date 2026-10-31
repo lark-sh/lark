@@ -15,7 +15,7 @@ jemalloc = ["tikv-jemallocator"]
 tikv-jemallocator = { version = "0.7", optional = true }
 
 # Async runtime (thread-per-core with io_uring)
-glommio = "0.9"
+glommio = { git = "https://github.com/lark-sh/glommio", tag = "v0.9.0-lark.1" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
