@@ -133,7 +133,7 @@ func TestMapLarkErrorToHTTP(t *testing.T) {
 		errorCode string
 		want      int
 	}{
-		{"permission_denied", http.StatusForbidden},
+		{"permission_denied", http.StatusUnauthorized},
 		{"unauthenticated", http.StatusUnauthorized},
 		{"invalid_data", http.StatusBadRequest},
 		{"invalid_token", http.StatusBadRequest},

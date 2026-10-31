@@ -50,6 +50,7 @@
 package proxy
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -67,6 +68,11 @@ import (
 
 // REST request timeout (default, can be overridden by ?timeout query param)
 const restRequestTimeout = 30 * time.Second
+
+// maxJSONDepth is how deeply a written value can nest. lark-server enforces the
+// same limit, but only when it can parse the message, and it can't parse much
+// deeper than this.
+const maxJSONDepth = 32
 
 // RESTQueryOptions holds parsed query parameters for REST requests
 // These map to Firebase REST API query parameters
@@ -113,6 +119,9 @@ func parseRESTQueryOptions(query map[string][]string) (*RESTQueryOptions, error)
 	}
 
 	// orderBy - can be "$key", "$value", "$priority", or a child path
+	if len(query["orderBy"]) > 1 {
+		return nil, fmt.Errorf("orderBy can only be specified once")
+	}
 	if v := getQueryParam(query, "orderBy"); v != "" {
 		// Firebase sends orderBy as JSON string, e.g., orderBy="$key" or orderBy="score"
 		// Need to unquote if it's a JSON string
@@ -358,7 +367,11 @@ func (s *Server) handleRESTProxy(w http.ResponseWriter, r *http.Request) {
 	// Only allow override on non-GET requests to prevent GET from modifying data
 	method := r.Method
 	if r.Method != http.MethodGet {
-		if override := r.Header.Get("X-HTTP-Method-Override"); override != "" {
+		override := r.Header.Get("X-HTTP-Method-Override")
+		if override == "" {
+			override = r.URL.Query().Get("x-http-method-override")
+		}
+		if override != "" {
 			method = override
 		}
 	}
@@ -388,6 +401,11 @@ func (s *Server) handleRESTProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if method != http.MethodGet && (queryOpts.Callback != "" || queryOpts.Download != "") {
+		s.jsonError(w, http.StatusBadRequest, "bad_request", "callback and download are only supported on GET")
+		return
+	}
+
 	// Read request body for POST/PUT/PATCH
 	// Limit to 256MB to match Firebase REST API limits
 	var body []byte
@@ -401,12 +419,22 @@ func (s *Server) handleRESTProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// An empty body isn't null: writing null deletes, so it has to be explicit.
+	if (method == http.MethodPut || method == http.MethodPost) && len(bytes.TrimSpace(body)) == 0 {
+		s.jsonError(w, http.StatusBadRequest, "bad_request", "Missing data in request body")
+		return
+	}
+
 	// Parse body as JSON value (for operations that need it)
 	var bodyValue interface{}
 	if len(body) > 0 {
 		if err := sonic.Unmarshal(body, &bodyValue); err != nil {
 			logger.Debug("REST failed to parse JSON body", "error", err)
 			s.jsonError(w, http.StatusBadRequest, "bad_request", "Invalid JSON in request body")
+			return
+		}
+		if jsonDepth(bodyValue) > maxJSONDepth {
+			s.jsonError(w, http.StatusBadRequest, "bad_request", "Data is nested too deeply")
 			return
 		}
 	}
@@ -568,6 +596,10 @@ func (s *Server) writeLarkResponseAsHTTP(w http.ResponseWriter, method string, p
 				w.Header().Set("ETag", etag)
 			}
 		}
+		if opts != nil && opts.Print == "silent" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		s.writeRESTResponse(w, http.StatusOK, value, opts)
 		return
 	}
@@ -667,9 +699,7 @@ func (s *Server) writeRESTResponse(w http.ResponseWriter, status int, data inter
 // mapLarkErrorToHTTP maps Lark error codes to HTTP status codes
 func mapLarkErrorToHTTP(status string) int {
 	switch status {
-	case "permission_denied":
-		return http.StatusForbidden
-	case "unauthenticated":
+	case "permission_denied", "unauthenticated":
 		return http.StatusUnauthorized
 	case "invalid_data", "invalid_token":
 		return http.StatusBadRequest
@@ -712,6 +742,25 @@ func (s *Server) handleConditionFailed(w http.ResponseWriter, vc *RESTVirtualCli
 	}
 
 	s.writeRESTResponse(w, http.StatusPreconditionFailed, currentValue, opts)
+}
+
+// jsonDepth returns how many levels of objects and arrays a value nests. A
+// primitive is 0.
+func jsonDepth(value interface{}) int {
+	deepest := -1
+	switch v := value.(type) {
+	case map[string]interface{}:
+		for _, child := range v {
+			deepest = max(deepest, jsonDepth(child))
+		}
+	case []interface{}:
+		for _, child := range v {
+			deepest = max(deepest, jsonDepth(child))
+		}
+	default:
+		return 0
+	}
+	return max(deepest, 0) + 1
 }
 
 // truncateShallow implements Firebase's shallow=true behavior:

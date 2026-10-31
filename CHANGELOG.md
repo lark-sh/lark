@@ -20,6 +20,9 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 ### Fixed
 
 - A shallow read could list a key whose data was deleted by a write that stored nothing, such as `{"a": null}`.
+- An empty REST PUT no longer deletes the location: an empty PUT or POST is a 400. Send `null` to delete.
+- A message the server can't parse now gets an error reply instead of being dropped, so a client waiting on it finds out. REST writes that nest too deeply are a 400 rather than a 502.
+- REST honors `print=silent` on GET and the `x-http-method-override` query parameter, and refuses a second `orderBy`, and `callback` or `download` on writes.
 - A client that connected while its database was being evicted could start a second instance on the same files and then lose every message it sent. It now waits for the old instance to stop.
 - Clients of an evicted database no longer hang for up to 10 seconds. The server tells the edge about an unload as it happens instead of at the next heartbeat.
 - REST queries with `orderBy="$value"` or `orderBy="$priority"` now use that order. They used to fall back to key order, so `limitToFirst`, `startAt` and the like selected the wrong children.
@@ -35,6 +38,7 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 
 ### Changed
 
+- REST requests denied by security rules now get a 401 instead of a 403, as Firebase documents. Clients that check for 403 need updating.
 - The `lark-server` image now builds from `Cargo.lock` with the toolchain pinned in `rust-toolchain.toml`. It previously resolved the newest compatible crates and the current stable Rust at build time, so images could contain versions CI had never tested.
 - Updated the pinned Rust toolchain to 1.99.1.
 
