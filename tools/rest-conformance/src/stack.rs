@@ -10,9 +10,6 @@ use std::time::{Duration, Instant};
 
 const SECRET: &str = "rest-conformance-test-secret-0123456789";
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
-/// EVICT_DATABASE is asynchronous: the database stops at its next loop. A client
-/// that connects before then is stranded, so give it time.
-const EVICT_SETTLE: Duration = Duration::from_millis(400);
 
 pub const PROJECT: &str = "test-project";
 pub const DATABASE: &str = "default";
@@ -219,13 +216,13 @@ impl Stack {
         String::from_utf8_lossy(&log[start..]).into_owned()
     }
 
-    /// Unloads the database, so the next read loads from blob and WAL.
+    /// Unloads the database, so the next read loads from blob and WAL. The stop
+    /// is asynchronous, and the first requests may hit it.
     pub fn evict(&self) -> Result<(), String> {
         let response = self.request("POST", "/.local/evict", &[], Some(b""))?;
         if response.status != 204 {
             return Err(format!("evict: {} {}", response.status, response.text()));
         }
-        sleep(EVICT_SETTLE);
         self.wait_ready()
     }
 

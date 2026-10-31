@@ -133,6 +133,16 @@ pub struct CoreHandler {
     /// Pending database unload notifications to send to proxy
     pending_unloads: RefCell<Vec<UnloadNotification>>,
 
+    /// Databases started for clients that waited out an eviction, as (project,
+    /// database), for DATABASE_LOADED. These follow `pending_unloads`, so the
+    /// proxy sees the old instance go before the new one arrives.
+    pending_loads: RefCell<Vec<(String, String)>>,
+
+    /// Clients that connected while their database was still stopping, by full
+    /// database ID. Connected when the old instance has exited, so it can flush
+    /// before a new one reads the same files.
+    waiting_for_stop: RefCell<HashMap<String, Vec<Rc<VirtualClient>>>>,
+
     /// Compaction channel sender for notifying the per-core storage worker
     compaction_tx: Rc<LocalSender<StorageWorkerMessage>>,
 
@@ -173,6 +183,8 @@ impl CoreHandler {
             shutting_down: RefCell::new(false),
             running_databases: Cell::new(0),
             pending_unloads: RefCell::new(Vec::new()),
+            pending_loads: RefCell::new(Vec::new()),
+            waiting_for_stop: RefCell::new(HashMap::new()),
             compaction_tx,
             metrics_tx,
         })
@@ -329,6 +341,16 @@ impl CoreHandler {
                 database_id_owned, reason_name
             );
 
+            let waiting = self_clone
+                .waiting_for_stop
+                .borrow_mut()
+                .remove(&database_id_owned);
+            for client in waiting.into_iter().flatten() {
+                if let Some(loaded) = self_clone.connect_buffered(client) {
+                    self_clone.pending_loads.borrow_mut().push(loaded);
+                }
+            }
+
             // Note: We no longer create segmentation markers on eviction.
             // On next startup, the database will lazy-load from NAS (manifest + hot.json)
             // and replay the small WAL file (< rotation limit).
@@ -474,26 +496,50 @@ impl CoreHandler {
                 project_id
             );
             for pc in pending {
-                let client_id = pc.client.id.clone();
-
-                // Connect the client
-                self.process_connect(pc.client.clone());
-
-                // Replay any buffered messages for this client
-                if let Some(buffered) = self.pending_client_messages.borrow_mut().remove(&client_id)
-                    && !buffered.is_empty()
-                {
-                    trace!(
-                        "Replaying {} buffered messages for client {}",
-                        buffered.len(),
-                        client_id
-                    );
-                    for msg in buffered {
-                        self.replay_message(pc.client.clone(), msg.data, msg.timestamps);
-                    }
-                }
+                self.connect_buffered(pc.client);
             }
         }
+    }
+
+    /// Holds a client back if its database is still stopping after an eviction,
+    /// buffering its messages. Returns whether it did.
+    fn wait_for_stop(&self, client: &Rc<VirtualClient>) -> bool {
+        let database_id = client.full_database_id();
+        if !self.evicted_databases.borrow().contains(&database_id) {
+            return false;
+        }
+        trace!("Client {} waiting for {} to stop", client.id, database_id);
+        self.pending_client_messages
+            .borrow_mut()
+            .entry(client.id.clone())
+            .or_default();
+        self.waiting_for_stop
+            .borrow_mut()
+            .entry(database_id)
+            .or_default()
+            .push(client.clone());
+        true
+    }
+
+    /// Connects a client that was held back, then replays what it sent meanwhile.
+    fn connect_buffered(self: &Rc<Self>, client: Rc<VirtualClient>) -> Option<(String, String)> {
+        if self.wait_for_stop(&client) {
+            return None;
+        }
+        let loaded = self.process_connect(client.clone());
+        if let Some(buffered) = self.pending_client_messages.borrow_mut().remove(&client.id)
+            && !buffered.is_empty()
+        {
+            trace!(
+                "Replaying {} buffered messages for client {}",
+                buffered.len(),
+                client.id
+            );
+            for msg in buffered {
+                self.replay_message(client.clone(), msg.data, msg.timestamps);
+            }
+        }
+        loaded
     }
 
     /// Handle a database eviction request from the proxy.
@@ -788,11 +834,7 @@ impl CoreHandler {
             return None;
         }
 
-        let database_id = if client.project_id.is_empty() {
-            client.database_id.clone()
-        } else {
-            format!("{}/{}", client.project_id, client.database_id)
-        };
+        let database_id = client.full_database_id();
 
         // Reject identifiers that could escape the data directory. The edge
         // validates these, but the server must not depend on that — a crafted
@@ -1049,7 +1091,11 @@ impl ProxyHandler for CoreHandler {
 
         // In emulator mode or if config is cached, process immediately
         if self.config.emulator || project_id.is_empty() || self.has_project_config(&project_id) {
-            let database_loaded = self.process_connect(client);
+            let database_loaded = if self.wait_for_stop(&client) {
+                None
+            } else {
+                self.process_connect(client)
+            };
             ConnectResult {
                 needs_config: false,
                 database_loaded,
@@ -1196,6 +1242,17 @@ impl ProxyHandler for CoreHandler {
             }
         }
 
+        // Or for its database to stop
+        let full_database_id = client.full_database_id();
+        let mut waiting = self.waiting_for_stop.borrow_mut();
+        if let Some(clients) = waiting.get_mut(&full_database_id) {
+            clients.retain(|waiting_client| waiting_client.id != client.id);
+            if clients.is_empty() {
+                waiting.remove(&full_database_id);
+            }
+        }
+        drop(waiting);
+
         // Get and remove database mapping
         let database_id = self
             .client_databases
@@ -1268,6 +1325,10 @@ impl ProxyHandler for CoreHandler {
 
     fn take_pending_unloads(&self) -> Vec<UnloadNotification> {
         std::mem::take(&mut *self.pending_unloads.borrow_mut())
+    }
+
+    fn take_pending_loads(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut *self.pending_loads.borrow_mut())
     }
 }
 
@@ -1926,6 +1987,79 @@ mod tests {
                     !handler.client_databases.borrow().contains_key(&client.id),
                     "evicted database's clients should be dropped"
                 );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// Waits for the database task that eviction left running to exit.
+    async fn wait_until_stopped(handler: &Rc<CoreHandler>, id: &str) {
+        for _ in 0..500 {
+            if !handler.evicted_databases.borrow().contains(id) {
+                return;
+            }
+            glommio::timer::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{id} never stopped");
+    }
+
+    #[test]
+    fn test_connect_during_eviction_waits_for_the_old_instance() {
+        glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+            .spawn(|| async {
+                let handler = make_test_handler();
+                let first = Rc::new(VirtualClient::new_for_test(1, "evict-project", "db"));
+                ProxyHandler::on_connect(&handler, first);
+                let id = "evict-project/db";
+
+                handler.handle_evict_database("evict-project", "db", 0);
+
+                let second = Rc::new(VirtualClient::new_for_test(2, "evict-project", "db"));
+                let result = ProxyHandler::on_connect(&handler, second.clone());
+                assert!(result.database_loaded.is_none());
+                assert!(
+                    !handler.databases.borrow().contains_key(id),
+                    "no second instance while the first is stopping"
+                );
+                assert_eq!(handler.running_databases.get(), 1);
+
+                wait_until_stopped(&handler, id).await;
+
+                assert!(handler.databases.borrow().contains_key(id));
+                assert!(handler.client_databases.borrow().contains_key(&second.id));
+                assert_eq!(handler.running_databases.get(), 1);
+                assert_eq!(handler.pending_unloads.borrow().len(), 1);
+                assert_eq!(
+                    *handler.pending_loads.borrow(),
+                    vec![("evict-project".to_string(), "db".to_string())]
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_disconnect_while_waiting_for_eviction_drops_the_client() {
+        glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+            .spawn(|| async {
+                let handler = make_test_handler();
+                let first = Rc::new(VirtualClient::new_for_test(1, "evict-project", "db"));
+                ProxyHandler::on_connect(&handler, first);
+                let id = "evict-project/db";
+
+                handler.handle_evict_database("evict-project", "db", 0);
+
+                let second = Rc::new(VirtualClient::new_for_test(2, "evict-project", "db"));
+                ProxyHandler::on_connect(&handler, second.clone());
+                handler.on_disconnect(second.clone());
+
+                wait_until_stopped(&handler, id).await;
+
+                assert!(handler.waiting_for_stop.borrow().is_empty());
+                assert!(!handler.databases.borrow().contains_key(id));
+                assert!(!handler.client_databases.borrow().contains_key(&second.id));
             })
             .unwrap()
             .join()

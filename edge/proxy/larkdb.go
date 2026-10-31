@@ -278,9 +278,6 @@ func (s *Server) handleLocalEvict(w http.ResponseWriter, r *http.Request) {
 		databaseID = "default"
 	}
 	s.pool.EvictDatabaseOnAllBackends(projectID, databaseID, false)
-	// The server's own unload notice arrives with its next heartbeat. Pooled REST
-	// clients hang until then, so close them now.
-	(&clientNotifier{server: s}).OnDatabaseUnloaded("local-server", projectID, databaseID)
 	w.WriteHeader(http.StatusNoContent)
 }
 

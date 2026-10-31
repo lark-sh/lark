@@ -134,6 +134,15 @@ pub struct VirtualClient {
 }
 
 impl VirtualClient {
+    /// The database's ID on this server: `project/database`.
+    pub fn full_database_id(&self) -> String {
+        if self.project_id.is_empty() {
+            self.database_id.clone()
+        } else {
+            format!("{}/{}", self.project_id, self.database_id)
+        }
+    }
+
     /// Compress data if above threshold, returning (data, compressed_flag)
     fn maybe_compress(data: Bytes) -> (Bytes, bool) {
         if data.len() < COMPRESSION_THRESHOLD {
@@ -358,9 +367,14 @@ pub trait ProxyHandler {
         // Default implementation: no-op.
     }
 
-    /// Get pending database unload notifications.
-    /// Called during heartbeat to send notifications to the proxy.
+    /// Get pending database unload notifications to send to the proxy.
     fn take_pending_unloads(&self) -> Vec<UnloadNotification> {
+        Vec::new() // Default implementation
+    }
+
+    /// Get databases started outside a CONNECT, as (project, database), to
+    /// report to the proxy after any pending unloads.
+    fn take_pending_loads(&self) -> Vec<(String, String)> {
         Vec::new() // Default implementation
     }
 }
@@ -502,9 +516,9 @@ impl<H: ProxyHandler + 'static> ProxyConnection<H> {
                 }
             }
 
-            // Send heartbeat every 10 seconds (only after handshake is complete)
-            if self.handshake_complete && last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-                // Send pending database unload notifications first
+            // Report unloads as they happen, so the proxy closes the clients of an
+            // unloaded database instead of sending to them.
+            if self.handshake_complete {
                 for unload in self.handler.take_pending_unloads() {
                     trace!(
                         "Sending DATABASE_UNLOADED for {}/{} (reason={}, ephemeral={})",
@@ -524,7 +538,13 @@ impl<H: ProxyHandler + 'static> ProxyConnection<H> {
                     };
                     self.encode_outgoing(&mut write_buf, &msg);
                 }
+                for (project_id, database_id) in self.handler.take_pending_loads() {
+                    self.notify_database_loaded(&project_id, &database_id);
+                }
+            }
 
+            // Send heartbeat every 10 seconds (only after handshake is complete)
+            if self.handshake_complete && last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
                 let heartbeat = HeartbeatMessage {
                     load: 0, // TODO: compute actual CPU load
                     client_count: self.clients.len() as u32,
