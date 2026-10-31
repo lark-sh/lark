@@ -22,6 +22,7 @@ lru = "0.18"
 criterion = { version = "0.5", features = ["html_reports"] }
 futures = "0.3"
 proptest = "1"
+tempfile = "3"
 
 [[bench]]
 name = "throughput"

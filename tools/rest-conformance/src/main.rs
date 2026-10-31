@@ -12,6 +12,7 @@
 //! that only exist in debug builds. See `run.sh`.
 
 mod model;
+mod scenario;
 mod script;
 mod spec;
 mod stack;
@@ -94,7 +95,14 @@ fn run_scripts(stack: Stack, args: &Args, seed: u64) -> Result<(), String> {
                     "lark-server died ({exit})\n{log}"
                 )));
             }
-            outcome.map_err(TestCaseError::fail)
+            outcome.map_err(TestCaseError::fail)?;
+            let failures = stack.compaction_failures();
+            if failures > 0 {
+                return Err(TestCaseError::fail(format!(
+                    "{failures} storage worker batches failed"
+                )));
+            }
+            Ok(())
         },
     );
     match result {
@@ -123,7 +131,7 @@ fn main() -> ExitCode {
         edge: args.edge_bin.clone(),
         compact: args.compact_bin.clone(),
     };
-    let stack = match Stack::start(
+    let mut stack = match Stack::start(
         binaries,
         args.work_dir.clone(),
         args.proxy_port,
@@ -139,6 +147,13 @@ fn main() -> ExitCode {
     let mut failed = false;
     if !args.skip_spec {
         failed |= !spec::run(&stack);
+        match scenario::live_compaction(&mut stack) {
+            Ok(()) => println!("Live compaction passed"),
+            Err(e) => {
+                println!("Live compaction FAILED: {e}");
+                failed = true;
+            }
+        }
     }
     if args.cases > 0 {
         println!("Running {} random scripts, seed {seed}", args.cases);
