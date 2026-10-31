@@ -542,6 +542,24 @@ const BLOB_BACKED: Mode = Mode {
     shallow: false,
 };
 
+/// An update whose value holds only nulls deletes, just as a literal null does.
+#[test]
+fn test_shallow_after_update_that_stores_nothing() {
+    let path = vec!["alpha".to_string(), "beta".to_string()];
+    let steps = vec![
+        Step::Update(None, vec![(path.clone(), json!({"gamma": 1}))]),
+        Step::Update(None, vec![(path, json!({"gamma": null}))]),
+        Step::Shallow(vec![]),
+    ];
+    run(
+        (json!(1), steps),
+        Mode {
+            shallow: true,
+            ..BLOB_BACKED
+        },
+    );
+}
+
 proptest! {
     #![proptest_config(config(32))]
 
