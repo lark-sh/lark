@@ -13,10 +13,14 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 - Updated rustls to 0.23.46 (GHSA-h2v8-394m-p7vv, GHSA-c8m5-c952-6cm4, GHSA-w44r-93j7-qv28, GHSA-vp88-798v-h67f). lark-server uses it only for outbound HTTPS through `ureq`, without brotli certificate compression or ECH, and never Debug-formats TLS sessions; at worst, a later connection could fall back to a classical-only X25519 key exchange.
 - lark-edge now builds with Go 1.27.3, and its image uses Alpine 3.24. Go 1.25 and Alpine 3.20 no longer receive security fixes. The move fixes standard library issues the edge could reach, including an HTTP/2 server crash (GO-2026-6617), HTTP/2 memory exhaustion (GO-2026-6603), HTTP/1 connection desynchronization (GO-2026-6613) and trust in compromised intermediate certificates (GO-2026-6809).
 - Updated the edge's Go modules, including golang.org/x/text to fix an infinite loop (GO-2026-5970) and a panic on crafted input (GO-2026-6629). quic-go and webtransport-go stay at their current versions.
+- Updated rustls-webpki to 0.103.16 and webpki-roots to 1.0.11 (RUSTSEC-2026-0382, RUSTSEC-2026-0381) so that lark-server's outbound HTTPS no longer trusts distrusted intermediate certificates.
+- Updated zstd to 0.14 (RUSTSEC-2026-0391, RUSTSEC-2026-0398, RUSTSEC-2026-0403). lark-server uses it only for one-shot compression of outbound messages, so the streaming and seekable issues didn't apply; the update clears the advisories.
+- Removed jsonwebtoken, which nothing used, and with it rsa (RUSTSEC-2023-0071) and crypto-bigint (RUSTSEC-2026-0387). Neither crate's vulnerable code was reachable.
 
 ### Changed
 
 - The `lark-server` image now builds from `Cargo.lock` with the toolchain pinned in `rust-toolchain.toml`. It previously resolved the newest compatible crates and the current stable Rust at build time, so images could contain versions CI had never tested.
+- Updated the pinned Rust toolchain to 1.99.1.
 
 ## [0.3.0] — 2026-10-11
 

@@ -193,7 +193,7 @@ impl DatabaseMetrics {
     pub fn decrement_ccu(&self) {
         // Use saturating subtraction to avoid underflow
         self.current_ccu
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(1))
             })
             .ok();

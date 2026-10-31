@@ -15,7 +15,7 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 rand = "0.8"
-zstd = "0.13"
+zstd = "0.14"
 libc = "0.2"
 anyhow = "1"
 hmac = "0.12"  # proxy-handshake authentication (HELLO_AUTH HMAC over the nonce)

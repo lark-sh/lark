@@ -26,7 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Toolchain pinned to match rust-toolchain.toml + CI (keep all three in sync).
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain 1.95.0 --profile minimal
+    | sh -s -- -y --default-toolchain 1.99.1 --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # rustfmt + clippy aren't in the minimal profile, but `make fmt` / `make lint`
