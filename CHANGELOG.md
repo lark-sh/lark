@@ -19,6 +19,7 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 
 ### Fixed
 
+- REST ETags now follow the documented table. PUT, POST and DELETE return an ETag when asked, an empty location's ETag is `null_etag`, and it works in `if-match`. PATCH refuses both headers, and GET and POST refuse `if-match`.
 - REST reads no longer return `.priority`, and `{".value": v, ".priority": p}` reads as `v`. `format=export` returns priorities.
 - SSE patch events now use keys that are children of the event's `path`, instead of full paths at `/`. A patch across several parents arrives as one event per parent.
 - A shallow read could list a key whose data was deleted by a write that stored nothing, such as `{"a": null}`.
