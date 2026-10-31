@@ -4,6 +4,7 @@
 #
 # Bump deliberately, and keep these in sync when you do:
 #   - CI:            .github/workflows/ci.yml  (dtolnay/rust-toolchain@<version>)
+#   - Nightly:       .github/workflows/nightly.yml  (same)
 #   - Dev container: Dockerfile.dev            (--default-toolchain <version>)
 # server/Dockerfile reads this file directly, so it needs no change.
 [toolchain]

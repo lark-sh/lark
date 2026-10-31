@@ -77,6 +77,7 @@ cd edge && go test ./...
 | Go edge tests | `cd edge && go test ./...` | yes |
 | Firebase SDK suite | `./test/run-firebase-sdk.sh` | no; run for client-observable changes |
 | Chaos monkey | `./tools/chaos-monkey/run.sh` | no; run for write-path changes |
+| Randomized model tests, high case counts | `PROPTEST_CASES=1000 cargo test -p lark-server --test integration_read_model` | nightly |
 
 CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) also enforces `cargo fmt`, `cargo clippy` with warnings denied, `gofmt`, and `go vet` on every pull request.
 
