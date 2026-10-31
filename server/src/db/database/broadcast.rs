@@ -366,7 +366,7 @@ impl Database {
 }
 
 /// True if `path` is a strict descendant of `ancestor`. Both must be normalized.
-fn is_below(path: &str, ancestor: &str) -> bool {
+pub(super) fn is_below(path: &str, ancestor: &str) -> bool {
     match ancestor {
         "/" => path != "/",
         _ => path

@@ -260,6 +260,20 @@ impl Tree {
         }
     }
 
+    /// True if the nearest ancestor of `path` that's in the tree is loaded. A loaded
+    /// node has complete knowledge of its children, so a path missing below it
+    /// doesn't exist, however deep.
+    pub fn has_loaded_ancestor(&self, path: &Path) -> bool {
+        let mut current = path.parent();
+        while let Some(ancestor) = current {
+            if let Some(node) = self.get(&ancestor) {
+                return !node.is_sentinel();
+            }
+            current = ancestor.parent();
+        }
+        false
+    }
+
     /// Finds a child of a loaded Object that holds no data: a Null or an empty
     /// Object. There should never be one, because every read of an Object returns
     /// its children as they are, and a client would see the key. Null is only
@@ -355,18 +369,10 @@ impl crate::rules::TreeGetter for Tree {
         // A Sentinel is "in the tree" but not "loaded" — it's a placeholder.
         match self.get(&path) {
             Some(node) => !node.is_sentinel(),
-            None => {
-                // Node is absent. If its parent is loaded (non-Sentinel), the parent
-                // has complete knowledge of its children — an absent child definitively
-                // does not exist. This avoids needless blob reads for paths like new
-                // push IDs under an already-subscribed collection.
-                if let Some(parent) = path.parent()
-                    && let Some(parent_node) = self.get(&parent)
-                {
-                    return !parent_node.is_sentinel();
-                }
-                false
-            }
+            // A path absent below a loaded node definitively does not exist. This
+            // avoids needless blob reads for paths like new push IDs under an
+            // already-subscribed collection.
+            None => self.has_loaded_ancestor(&path),
         }
     }
 }

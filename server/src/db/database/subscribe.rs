@@ -1,3 +1,4 @@
+use super::broadcast::is_below;
 use super::*;
 
 impl Database {
@@ -385,18 +386,6 @@ impl Database {
             ArcValue::Object(Arc::new(m))
         }
 
-        // Helper: convert a serde_json::Value to its shallow representation.
-        // Primitives → ArcValue of that primitive. Objects/arrays → size marker.
-        fn shallow_from_json(val: &Value) -> ArcValue {
-            match val {
-                Value::Object(_) | Value::Array(_) => {
-                    let arc = ArcValue::from_value(val.clone());
-                    size_marker(arc.estimate_size() as u64)
-                }
-                _ => ArcValue::from_value(val.clone()),
-            }
-        }
-
         let mut children: HashMap<String, ArcValue> = HashMap::new();
 
         // Check if the data is already in the tree (non-Sentinel)
@@ -414,10 +403,10 @@ impl Database {
                     // Container — build shallow map from children
                     for key in node.keys() {
                         if let Some(child) = node.get(key) {
-                            let shallow_val = if child.is_object() {
-                                size_marker(child.estimate_size() as u64)
-                            } else {
+                            let shallow_val = if child.is_primitive() {
                                 child.clone()
+                            } else {
+                                size_marker(child.estimate_size() as u64)
                             };
                             children.insert(key.to_string(), shallow_val);
                         }
@@ -441,25 +430,20 @@ impl Database {
                     session.read_shallow(&blob_path).await
                 };
 
-                match blob_result {
-                    Ok(ShallowValue::Primitive(val)) => {
-                        // Path is a primitive in the blob — return directly
-                        self.metrics.record_read();
-                        return Some(ServerMessage::once_response_arc(request_id, val));
-                    }
+                // The blob's own sizes, for containers the WAL leaves in place.
+                let mut sizes: HashMap<String, u64> = HashMap::new();
+                let base = match blob_result {
+                    Ok(ShallowValue::Primitive(val)) => val,
                     Ok(ShallowValue::Children(blob_children)) => {
+                        let mut map = HashMap::new();
                         for child in blob_children {
-                            let val = match child.value {
-                                Some(prim) => prim,              // primitive value
-                                None => size_marker(child.size), // container → {".sz": size}
-                            };
-                            children.insert(child.key, val);
+                            let val = child.value.unwrap_or_else(ArcValue::empty_sentinel);
+                            sizes.insert(child.key.clone(), child.size);
+                            map.insert(child.key, val);
                         }
+                        ArcValue::Object(Arc::new(map))
                     }
-                    Err(BlobError::PathNotFound(_)) => {
-                        // Path doesn't exist in blob — children stays empty,
-                        // WAL entries below may still add children
-                    }
+                    Err(BlobError::PathNotFound(_)) => ArcValue::Null,
                     Err(e) => {
                         warn!(
                             "NACK shallow ONCE {}: blob read_shallow failed: {}",
@@ -471,108 +455,26 @@ impl Database {
                             &format!("Failed to read shallow data: {}", e),
                         ));
                     }
-                }
-
-                // Merge with pending WAL entries: find entries that affect direct
-                // children of the target path.
-                let path_prefix = if path_str == "/" {
-                    "/".to_string()
-                } else {
-                    format!("{}/", path_str)
                 };
-                for entry in &self.pending_wal_entries {
-                    if let Some(remainder) = entry.path.strip_prefix(path_prefix.as_str()) {
-                        // Direct child: remainder has no more slashes
-                        if !remainder.contains('/') && !remainder.is_empty() {
-                            match entry.op {
-                                WalOp::Set => {
-                                    // SET with None == SET-to-null == delete.
-                                    // Modern WALs canonicalize this to
-                                    // `WalOp::Delete`; this handles old entries
-                                    // and stays defensive against the encoding.
-                                    match &entry.value {
-                                        Some(val) if !val.is_null() => {
-                                            children.insert(
-                                                remainder.to_string(),
-                                                shallow_from_json(val),
-                                            );
-                                        }
-                                        _ => {
-                                            children.remove(remainder);
-                                        }
-                                    }
-                                }
-                                WalOp::Update => {
-                                    if let Some(val) = &entry.value {
-                                        children
-                                            .insert(remainder.to_string(), shallow_from_json(val));
-                                    }
-                                }
-                                WalOp::Delete => {
-                                    children.remove(remainder);
-                                }
+
+                match self.replay_wal_lazy(path_str, base) {
+                    ArcValue::Object(map) | ArcValue::Sentinel(map) => {
+                        for (key, child) in map.iter() {
+                            if child.is_null() {
+                                continue;
                             }
-                        }
-                        // Deeper descendant (e.g. /users/alice/score): the first
-                        // segment is a container child that must exist.
-                        else if let Some(child_key) = remainder.split('/').next()
-                            && !child_key.is_empty()
-                        {
-                            match entry.op {
-                                WalOp::Set | WalOp::Update => {
-                                    // We know this child is a container, but we don't
-                                    // have the full size. Use 0 to indicate "container,
-                                    // size unknown" — only overwrites if key wasn't
-                                    // already present from the blob (which has accurate size).
-                                    children
-                                        .entry(child_key.to_string())
-                                        .or_insert_with(|| size_marker(0));
-                                }
-                                WalOp::Delete => {
-                                    // Deleting a descendant doesn't remove the child —
-                                    // it may still have other children.
-                                }
-                            }
+                            let shallow_val = if child.is_primitive() {
+                                child.clone()
+                            } else {
+                                let size = sizes.get(key).copied();
+                                size_marker(size.unwrap_or(child.estimate_size() as u64))
+                            };
+                            children.insert(key.clone(), shallow_val);
                         }
                     }
-                    // An exact-path SET replaces the node entirely.
-                    else if entry.path == path_str {
-                        match entry.op {
-                            WalOp::Set => {
-                                children.clear();
-                                if let Some(value) = &entry.value {
-                                    if let Some(obj) = value.as_object() {
-                                        for (key, val) in obj {
-                                            children.insert(key.clone(), shallow_from_json(val));
-                                        }
-                                    }
-                                    // SET to a non-object (leaf) — return it directly
-                                    if !value.is_object() && !value.is_array() {
-                                        self.metrics.record_read();
-                                        return Some(ServerMessage::once_response_arc(
-                                            request_id,
-                                            ArcValue::from_value(value.clone()),
-                                        ));
-                                    }
-                                }
-                            }
-                            WalOp::Update => {
-                                if let Some(value) = &entry.value
-                                    && let Some(obj) = value.as_object()
-                                {
-                                    for (key, val) in obj {
-                                        if val.is_null() {
-                                            children.remove(key);
-                                        } else {
-                                            children.insert(key.clone(), shallow_from_json(val));
-                                        }
-                                    }
-                                }
-                            }
-                            WalOp::Delete => {
-                                children.clear();
-                            }
-                        }
+                    primitive => {
+                        self.metrics.record_read();
+                        return Some(ServerMessage::once_response_arc(request_id, primitive));
                     }
                 }
             } else {
@@ -595,15 +497,46 @@ impl Database {
                     }
                     for key in node.keys() {
                         if let Some(child) = node.get(key) {
-                            let shallow_val = if child.is_object() {
-                                size_marker(child.estimate_size() as u64)
-                            } else {
+                            let shallow_val = if child.is_primitive() {
                                 child.clone()
+                            } else {
+                                size_marker(child.estimate_size() as u64)
                             };
                             children.insert(key.to_string(), shallow_val);
                         }
                     }
                 }
+            }
+        }
+
+        // A pending delete may have removed everything in a container child, and
+        // only that child's data can show it, so those children alone are loaded.
+        let prefix = path_str.trim_end_matches('/').to_string();
+        let containers: Vec<String> = children
+            .iter()
+            .filter(|(_, value)| value.is_object())
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in containers {
+            let child_path = normalize_path_key(&format!("{prefix}/{key}"));
+            if !self.has_pending_delete_within(&child_path) {
+                continue;
+            }
+            if let Err(e) = self.promote_path_deep(&child_path).await {
+                warn!("NACK shallow ONCE {}: promotion failed: {}", child_path, e);
+                return Some(ServerMessage::nack(
+                    request_id,
+                    error::UNAVAILABLE,
+                    &format!("Failed to load data for read: {}", e),
+                ));
+            }
+            let tree = self.tree.read().unwrap();
+            let emptied = match tree.get(&Path::parse(&child_path)) {
+                Some(node) => node.is_empty_container(),
+                None => true,
+            };
+            if emptied {
+                children.remove(&key);
             }
         }
 
@@ -616,6 +549,30 @@ impl Database {
 
         self.metrics.record_read();
         Some(ServerMessage::once_response_arc(request_id, shallow_value))
+    }
+
+    /// True if a pending WAL entry deletes something at or below `path`.
+    fn has_pending_delete_within(&self, path: &str) -> bool {
+        let within = |target: &str| target == path || is_below(target, path);
+        self.wal_index.find_affecting(path).iter().any(|&idx| {
+            let entry = &self.pending_wal_entries[idx];
+            let entry_path = normalize_path_key(&entry.path);
+            match (&entry.op, &entry.value) {
+                (WalOp::Delete, _) => within(&entry_path),
+                (WalOp::Set, value) => {
+                    let deletes = value.as_ref().is_none_or(Value::is_null);
+                    deletes && within(&entry_path)
+                }
+                (WalOp::Update, Some(Value::Object(updates))) => {
+                    let base = entry_path.trim_end_matches('/');
+                    updates.iter().any(|(key, value)| {
+                        let target = normalize_path_key(&format!("{base}/{key}"));
+                        value.is_null() && within(&target)
+                    })
+                }
+                (WalOp::Update, _) => false,
+            }
+        })
     }
 
     /// Apply a query to get filtered/sorted results and the ordered keys.
