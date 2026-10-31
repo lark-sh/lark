@@ -400,18 +400,24 @@ impl Database {
                         self.metrics.record_read();
                         return Some(ServerMessage::once_response_arc(request_id, val));
                     }
-                    // Container — build shallow map from children
-                    for key in node.keys() {
-                        if let Some(child) = node.get(key) {
-                            let shallow_val = if child.is_primitive() {
-                                child.clone()
-                            } else {
-                                size_marker(child.estimate_size() as u64)
-                            };
-                            children.insert(key.to_string(), shallow_val);
+                    // An unloaded child could be a primitive or a container, and
+                    // only the blob knows, so read this level from there instead.
+                    let all_loaded = node
+                        .keys()
+                        .all(|key| !node.get(key).is_some_and(ArcValue::is_sentinel));
+                    if all_loaded {
+                        for key in node.keys() {
+                            if let Some(child) = node.get(key) {
+                                let shallow_val = if child.is_primitive() {
+                                    child.clone()
+                                } else {
+                                    size_marker(child.estimate_size() as u64)
+                                };
+                                children.insert(key.to_string(), shallow_val);
+                            }
                         }
                     }
-                    true
+                    all_loaded
                 }
                 _ => false,
             }
@@ -509,34 +515,37 @@ impl Database {
             }
         }
 
-        // A pending delete may have removed everything in a container child, and
-        // only that child's data can show it, so those children alone are loaded.
-        let prefix = path_str.trim_end_matches('/').to_string();
-        let containers: Vec<String> = children
-            .iter()
-            .filter(|(_, value)| value.is_object())
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in containers {
-            let child_path = normalize_path_key(&format!("{prefix}/{key}"));
-            if !self.has_pending_delete_within(&child_path) {
-                continue;
-            }
-            if let Err(e) = self.promote_path_deep(&child_path).await {
-                warn!("NACK shallow ONCE {}: promotion failed: {}", child_path, e);
-                return Some(ServerMessage::nack(
-                    request_id,
-                    error::UNAVAILABLE,
-                    &format!("Failed to load data for read: {}", e),
-                ));
-            }
-            let tree = self.tree.read().unwrap();
-            let emptied = match tree.get(&Path::parse(&child_path)) {
-                Some(node) => node.is_empty_container(),
-                None => true,
-            };
-            if emptied {
-                children.remove(&key);
+        // A pending delete may have removed everything in a container child, which
+        // the child's own marker can't show.
+        if self.blob_session.is_some() {
+            let prefix = path_str.trim_end_matches('/').to_string();
+            let containers: Vec<String> = children
+                .iter()
+                .filter(|(_, value)| value.is_object())
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in containers {
+                let child_path = normalize_path_key(&format!("{prefix}/{key}"));
+                if !self.has_pending_delete_within(&child_path) {
+                    continue;
+                }
+                match self.holds_data_after_pending_deletes(&child_path).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        children.remove(&key);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "NACK shallow ONCE {}: blob read_shallow failed: {}",
+                            child_path, e
+                        );
+                        return Some(ServerMessage::nack(
+                            request_id,
+                            error::UNAVAILABLE,
+                            &format!("Failed to read shallow data: {}", e),
+                        ));
+                    }
+                }
             }
         }
 
@@ -549,6 +558,47 @@ impl Database {
 
         self.metrics.record_read();
         Some(ServerMessage::once_response_arc(request_id, shallow_value))
+    }
+
+    /// True if `path` still holds data once pending deletes are applied. Reads one
+    /// level at a time, going deeper only along paths with a pending delete, and
+    /// loads nothing into the tree.
+    async fn holds_data_after_pending_deletes(&self, path: &str) -> Result<bool, BlobError> {
+        let Some(session) = &self.blob_session else {
+            return Ok(false);
+        };
+        let mut to_check = vec![path.to_string()];
+        while let Some(current) = to_check.pop() {
+            let segments: Vec<&str> = current.split('/').filter(|s| !s.is_empty()).collect();
+            let base = match session.read_shallow(&segments).await {
+                Ok(ShallowValue::Primitive(value)) => value,
+                Ok(ShallowValue::Children(blob_children)) => {
+                    let map = blob_children
+                        .into_iter()
+                        .map(|c| (c.key, c.value.unwrap_or_else(ArcValue::empty_sentinel)))
+                        .collect();
+                    ArcValue::Object(Arc::new(map))
+                }
+                Err(BlobError::PathNotFound(_)) => ArcValue::Null,
+                Err(e) => return Err(e),
+            };
+            let children = match self.replay_wal_lazy(&current, base) {
+                ArcValue::Null => continue,
+                ArcValue::Object(map) | ArcValue::Sentinel(map) => map,
+                _ => return Ok(true),
+            };
+            for (key, child) in children.iter() {
+                if child.is_null() {
+                    continue;
+                }
+                let child_path = normalize_path_key(&format!("{current}/{key}"));
+                if child.is_primitive() || !self.has_pending_delete_within(&child_path) {
+                    return Ok(true);
+                }
+                to_check.push(child_path);
+            }
+        }
+        Ok(false)
     }
 
     /// True if a pending WAL entry deletes something at or below `path`.
