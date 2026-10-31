@@ -13,6 +13,7 @@ Lark's compatibility claim is checked with the test suite Google wrote for its o
 ```bash
 ./test/run-firebase-sdk.sh                    # full suite
 ./test/run-firebase-sdk.sh query              # one test file
+BLOB=1 ./test/run-firebase-sdk.sh             # on blob-backed storage
 ```
 
 The script clones a pinned commit of firebase-js-sdk into `.cache/`, builds the package, brings up an ephemeral Lark stack, and points the SDK's tests at it. Anywhere Lark diverges from what the SDK expects, a test fails.

@@ -93,7 +93,7 @@ func main() {
 		logger.Info("Local mode enabled", "backend", cfg.LocalBackendAddr, "project_id", cfg.LocalProjectID, "auth", "emulator")
 
 		// Use mock database
-		database = db.NewLocalDB(cfg.LocalProjectID, cfg.LocalBackendAddr)
+		database = db.NewLocalDB(cfg.LocalProjectID, cfg.LocalBackendAddr, cfg.LocalPersistent)
 
 		// Start background goroutine to connect to local backend
 		// (matches production pattern where proxy starts first, then servers connect)

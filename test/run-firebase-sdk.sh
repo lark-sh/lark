@@ -21,6 +21,9 @@
 #   LARK_NS        Project namespace (default "default" — the bootstrapped
 #                  first-boot project).
 #   SKIP_INSTALL   Set to 1 to skip yarn install + SDK build (assume cached).
+#   BLOB           Set to 1 to run on blob-backed storage instead of the
+#                  in-memory tree. The SDK ignores null children, so this
+#                  doesn't replace server/tests/integration_read_model.rs.
 #   KEEP_RUNNING   Set to 1 to leave the stack running after tests finish.
 
 set -e
@@ -41,6 +44,10 @@ SDK_COMMIT="${SDK_COMMIT:-37a2f6616d2b404f5c5c597afc50dfb75493e0db}"
 LARK_PORT="${LARK_PORT:-8090}"
 LARK_NS="${LARK_NS:-test-project}"
 COMPOSE_FILE="$REPO_DIR/docker-compose.test.yml"
+COMPOSE_ARGS=(-f "$COMPOSE_FILE")
+if [ "${BLOB:-0}" = "1" ]; then
+    COMPOSE_ARGS+=(-f "$REPO_DIR/docker-compose.test-blob.yml")
+fi
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -136,7 +143,7 @@ ensure_stack_up() {
     # No `-d` reuse logic: the test stack has no persistent state, so a
     # fresh `up` every time is the right semantics. Each test run gets
     # a clean slate.
-    docker compose -f "$COMPOSE_FILE" up -d --build
+    docker compose "${COMPOSE_ARGS[@]}" up -d --build
 
     log "Waiting for lark-edge-test to be ready..."
     # LOCAL_MODE doesn't enable /admin/, so probe a path the mock backend
@@ -151,8 +158,8 @@ ensure_stack_up() {
     done
 
     err "lark-edge-test didn't come up within 60s. Last logs:"
-    docker compose -f "$COMPOSE_FILE" logs --tail=50 lark-edge-test
-    docker compose -f "$COMPOSE_FILE" logs --tail=50 lark-server-test
+    docker compose "${COMPOSE_ARGS[@]}" logs --tail=50 lark-edge-test
+    docker compose "${COMPOSE_ARGS[@]}" logs --tail=50 lark-server-test
     exit 1
 }
 
@@ -163,7 +170,7 @@ cleanup() {
         return
     fi
     log "Tearing down the test stack..."
-    (cd "$REPO_DIR" && docker compose -f "$COMPOSE_FILE" down)
+    (cd "$REPO_DIR" && docker compose "${COMPOSE_ARGS[@]}" down)
 }
 
 run_tests() {

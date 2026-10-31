@@ -1,0 +1,15 @@
+# Overlay for ./test/run-firebase-sdk.sh with BLOB=1: runs the suite on the same
+# storage production uses instead of the in-memory tree.
+#
+# A tmpfs keeps each run a clean slate.
+
+services:
+  lark-edge-test:
+    environment:
+      LOCAL_PERSISTENT: "true"
+
+  lark-server-test:
+    environment:
+      LARK_DATA_DIR: "/data"
+    tmpfs:
+      - /data

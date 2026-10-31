@@ -147,6 +147,7 @@ type Config struct {
 	LocalMode        bool   // If true, skip database and use local backend
 	LocalBackendAddr string // Address of local backend (e.g., "localhost:7779")
 	LocalProjectID   string // Project ID to use in local mode (default: "test-project")
+	LocalPersistent  bool   // Local mode databases persist on the server instead of staying in memory
 }
 
 func Load() (*Config, error) {
@@ -194,6 +195,7 @@ func Load() (*Config, error) {
 		LocalMode:        getEnvBool("LOCAL_MODE", false),
 		LocalBackendAddr: getEnv("LOCAL_BACKEND_ADDR", "localhost:7779"),
 		LocalProjectID:   getEnv("LOCAL_PROJECT_ID", "test-project"),
+		LocalPersistent:  getEnvBool("LOCAL_PERSISTENT", false),
 	}
 
 	// Required environment variables (DATABASE_URL optional in local mode)
