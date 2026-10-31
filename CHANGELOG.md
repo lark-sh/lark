@@ -24,6 +24,7 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 - A multi-path update above a subscribed path could tell that subscriber real data was gone. The view is sent again as a full value, and children not yet loaded into memory went out as null, which happened after a write created a new nested path inside the view or replaced a primitive. Clients saw the data disappear until their next load. These views are now loaded before they're sent.
 - Shallow reads could fail with an internal error when a child wasn't loaded into memory. They could also return stale data, because they missed pending updates sent from above the path, and could list a key whose data had just been deleted. Shallow reads now apply pending writes the same way full reads do.
 - A write could be denied even though the rules allowed it, when a `.validate` rule applied below a value stored as a primitive. Lark couldn't settle whether paths below the primitive existed, so the rule evaluation ran out of retries and denied the write. Paths below a loaded value now count as absent.
+- Writes could be denied when a `.validate` rule applied below a path that had replaced a primitive, or that had been deleted and rewritten. Loading the path never finished, so rule evaluation ran out of retries. Such paths now load fully.
 
 ### Changed
 

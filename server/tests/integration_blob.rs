@@ -3212,3 +3212,74 @@ fn test_blob_validate_below_primitive_allows_write() {
         );
     });
 }
+
+/// A write below a primitive replaces it. The result must count as loaded: the
+/// blob still holds the old primitive, so reading it again can't settle anything,
+/// and a rule that checks the path would run out of retries and deny the delete.
+#[test]
+fn test_blob_delete_below_replaced_primitive_allowed() {
+    run_test(|| async {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+        let rules = json!({"rules": {
+            ".read": true,
+            ".write": true,
+            "m": {"$a": {"$b": {".validate": "true"}}}
+        }});
+        let data = json!({"m": {"beta": {"beta": 0}}, "seed": 1});
+        let (_server, client) = connect_to_blob(data_dir, "prim-delete", data, rules).await;
+
+        client
+            .update("/m/beta", json!({"beta/alpha": 0}))
+            .await
+            .unwrap();
+        client.remove("/m/beta/beta/alpha").await.unwrap();
+
+        assert_eq!(client.once("/m").await.unwrap(), json!(null));
+    });
+}
+
+/// A delete and rewrite below a path leaves it a Sentinel that a shallow read of
+/// the blob can't settle, because the blob still holds what was deleted.
+#[test]
+fn test_blob_delete_after_delete_and_rewrite_allowed() {
+    run_test(|| async {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+        let rules = json!({"rules": {
+            ".read": true,
+            ".write": true,
+            "m": {"$a": {"$b": {".validate": "true"}}}
+        }});
+        let data = json!({"m": {"beta": {"alpha": 0}}, "seed": 1});
+        let (_server, client) = connect_to_blob(data_dir, "rewrite", data, rules).await;
+
+        client.update("/", json!({"m/beta": null})).await.unwrap();
+        client
+            .update("/", json!({"m/beta/alpha/alpha": 0}))
+            .await
+            .unwrap();
+        client
+            .update("/", json!({"m/beta/alpha/alpha": null}))
+            .await
+            .unwrap();
+
+        assert_eq!(client.once("/m").await.unwrap(), json!(null));
+    });
+}
+
+/// A read below a primitive must leave the primitive in place.
+#[test]
+fn test_blob_read_below_primitive_keeps_it() {
+    run_test(|| async {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+        let data = json!({"m": 0, "seed": 1});
+        let (_server, client) = connect_to_blob(data_dir, "prim-read", data, open_rules()).await;
+
+        client.once("/m/gamma/alpha/missing").await.unwrap();
+        client.update("/", json!({"m/gamma": 7})).await.unwrap();
+        assert_eq!(client.once("/m/gamma/alpha").await.unwrap(), json!(null));
+        assert_eq!(client.once("/m").await.unwrap(), json!({"gamma": 7}));
+    });
+}

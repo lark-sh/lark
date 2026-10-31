@@ -3332,7 +3332,7 @@ fn test_promote_path_shallow_pathnotfound_preserves_primitive_parent() {
 /// `promote_path_shallow`, the leaf must be marked as Null so the
 /// retry loop can make progress.
 #[test]
-fn test_promote_path_shallow_pathnotfound_writes_marker_through_absent_ancestors() {
+fn test_promote_path_shallow_pathnotfound_settles_below_loaded_ancestor() {
     block_on(async {
         // Blob has /a (with some other key) but /a/b/c/d doesn't exist.
         let (mut db, _dir) = make_blob_backed_db(json!({
@@ -3358,13 +3358,16 @@ fn test_promote_path_shallow_pathnotfound_writes_marker_through_absent_ancestors
         // parents aren't in the tree.
         db.promote_path_shallow("/a/b/c/d").await.unwrap();
 
-        // After promotion, the leaf must carry a Null marker so the
-        // rules retry loop terminates on the next eval.
+        // The path must count as loaded so the rules retry loop terminates on
+        // the next eval, and loaded /a must not gain a child for it.
+        assert!(
+            db.tree.read().unwrap().node_is_loaded("/a/b/c/d"),
+            "path below loaded /a must settle on the first iteration"
+        );
         assert_eq!(
-            db.tree.read().unwrap().get_value(&Path::parse("/a/b/c/d")),
-            Some(Value::Null),
-            "leaf must be marked as Null so node_is_loaded returns true \
-                 on the next iteration"
+            db.tree.read().unwrap().get_value(&Path::parse("/a/b")),
+            None,
+            "loaded /a must not gain a chain for a missing path"
         );
 
         // /a/x — the unrelated existing key — must NOT have been touched.
