@@ -42,33 +42,11 @@ fn read_blob_generation(dir: &Path) -> u64 {
     }
 }
 
-/// Compute (total bytes, file count) for blob.lark + sidecar.lark + wal/*.wal
-/// in a database directory. Used for before/after stats logging.
-fn total_db_size(db_dir: &Path) -> (u64, usize) {
-    let mut total: u64 = 0;
-    let mut file_count: usize = 0;
-
-    for name in ["blob.lark", "sidecar.lark"] {
-        if let Ok(m) = std::fs::metadata(db_dir.join(name)) {
-            total += m.len();
-            file_count += 1;
-        }
-    }
-
-    if let Ok(entries) = std::fs::read_dir(db_dir.join("wal")) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if name.ends_with(".wal") {
-                if let Ok(m) = entry.metadata() {
-                    total += m.len();
-                    file_count += 1;
-                }
-            }
-        }
-    }
-
-    (total, file_count)
+/// Size of `blob.lark`, the only file full compaction shrinks.
+fn blob_size(db_dir: &Path) -> u64 {
+    std::fs::metadata(db_dir.join("blob.lark"))
+        .map(|m| m.len())
+        .unwrap_or(0)
 }
 
 /// Run full root re-compaction on the database.
@@ -107,13 +85,12 @@ pub fn run_compaction(
     }
 
     let old_gen = read_blob_generation(&db_dir);
-    let (old_total, old_segments) = total_db_size(&db_dir);
+    let old_size = blob_size(&db_dir);
 
     info!(
-        "COMPACT: Running lark-compact (gen {}, {:.1} KB total, {} file(s))...",
+        "COMPACT: Running lark-compact (gen {}, blob {:.1} KB)...",
         old_gen,
-        old_total as f64 / 1024.0,
-        old_segments,
+        old_size as f64 / 1024.0,
     );
 
     // Run `lark-compact <db-dir>` — the OSS binary takes the database dir
@@ -140,20 +117,19 @@ pub fn run_compaction(
 
             // Report before/after sizes
             let new_gen = read_blob_generation(&db_dir);
-            let (new_total, new_files) = total_db_size(&db_dir);
-            let ratio = if old_total > 0 {
-                (new_total as f64 / old_total as f64) * 100.0
+            let new_size = blob_size(&db_dir);
+            let ratio = if old_size > 0 {
+                (new_size as f64 / old_size as f64) * 100.0
             } else {
                 0.0
             };
             info!(
-                "COMPACT: OK — gen {} -> {}, {:.1} KB -> {:.1} KB ({:.0}%), {} file(s), {}ms",
+                "COMPACT: OK — gen {} -> {}, blob {:.1} KB -> {:.1} KB ({:.0}%), {}ms",
                 old_gen,
                 new_gen,
-                old_total as f64 / 1024.0,
-                new_total as f64 / 1024.0,
+                old_size as f64 / 1024.0,
+                new_size as f64 / 1024.0,
                 ratio,
-                new_files,
                 result.elapsed_ms,
             );
         }
