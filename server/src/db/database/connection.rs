@@ -246,8 +246,10 @@ impl Database {
                         ));
                     }
                 } else {
-                    // No value and no hash means expecting null/non-existent
-                    if current_value.is_some() {
+                    // No value and no hash means expecting null/non-existent.
+                    // Checking `is_some()` alone isn't enough: a path loaded as
+                    // missing sits in the tree as a Null marker.
+                    if current_value.as_ref().is_some_and(|v| !v.is_null()) {
                         return Some(ServerMessage::nack(
                             request_id,
                             error::CONDITION_FAILED,
@@ -311,47 +313,33 @@ impl Database {
             let path = Path::parse(&op.path);
             match op.op.as_str() {
                 "s" | "set" => {
-                    if let Some(ref value) = op.value {
-                        let processed =
-                            match process_server_values(value.clone(), &op.path, &self.tree) {
-                                Ok((v, _)) => v,
-                                Err(e) => {
-                                    return Some(ServerMessage::nack(
-                                        request_id,
-                                        error::INVALID_DATA,
-                                        &e,
-                                    ));
-                                }
-                            };
-                        // For blob-backed DBs, use set_lazy so intermediate nodes
-                        // are Sentinels (not empty Objects). Empty Object intermediates
-                        // would lie about being "fully loaded" and cause subsequent
-                        // reads to short-circuit promotion, returning partial data.
-                        let changed = if blob_backed {
-                            self.remove_sentinel_paths_below(&op.path);
-                            let changed = self
-                                .tree
-                                .write()
-                                .unwrap()
-                                .set_lazy(&path, processed.clone());
-                            self.track_sentinels_after_write(&op.path);
-                            changed
-                        } else {
-                            self.tree.write().unwrap().set(&path, processed.clone())
-                        };
-                        wal_entries.push((
-                            op.path.clone(),
-                            "set".to_string(),
-                            Some(processed.clone()),
-                        ));
-                        if self.needs_broadcast(&op.path, changed, false) {
-                            changes.push((
-                                op.path.clone(),
-                                "set".to_string(),
-                                Some(processed),
-                                None,
-                            ));
+                    // A JSON null arrives as no value, and means delete.
+                    let value = op.value.clone().unwrap_or(Value::Null);
+                    let processed = match process_server_values(value, &op.path, &self.tree) {
+                        Ok((v, _)) => v,
+                        Err(e) => {
+                            return Some(ServerMessage::nack(request_id, error::INVALID_DATA, &e));
                         }
+                    };
+                    // For blob-backed DBs, use set_lazy so intermediate nodes
+                    // are Sentinels (not empty Objects). Empty Object intermediates
+                    // would lie about being "fully loaded" and cause subsequent
+                    // reads to short-circuit promotion, returning partial data.
+                    let changed = if blob_backed {
+                        self.remove_sentinel_paths_below(&op.path);
+                        let changed = self
+                            .tree
+                            .write()
+                            .unwrap()
+                            .set_lazy(&path, processed.clone());
+                        self.track_sentinels_after_write(&op.path);
+                        changed
+                    } else {
+                        self.tree.write().unwrap().set(&path, processed.clone())
+                    };
+                    wal_entries.push((op.path.clone(), "set".to_string(), Some(processed.clone())));
+                    if self.needs_broadcast(&op.path, changed, false) {
+                        changes.push((op.path.clone(), "set".to_string(), Some(processed), None));
                     }
                 }
                 "u" | "update" => {
