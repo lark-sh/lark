@@ -59,7 +59,6 @@ jobs:
       - name: Clippy (io-trace)
         run: cargo clippy -p lark-server --all-targets --features io-trace -- -D warnings
 
-
   go:
     name: Go edge — fmt, vet, test
     runs-on: ubuntu-latest
