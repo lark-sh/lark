@@ -6,6 +6,24 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 
 ## [Unreleased]
 
+### Upgrading
+
+`sidecar.lark` moves to a new format. An older sidecar is ignored on first use, so its free space goes unused until the next full compaction. The blob and WAL formats haven't changed, and an older server ignores a new sidecar the same way.
+
+`lark-blob` callers pass the WAL sequence to `open_with_sidecar` and `apply_updates_with_sidecar`, and should call `finish_interrupted_flush` before reading a blob that may have crashed.
+
+### Changed
+
+- Compaction batches change existing blob bytes only during their flush, and the sidecar records those writes first, so a crash during a flush is finished on the next load.
+- The sidecar is stamped with its WAL sequence and checksummed. A crash mid-batch can no longer lead to live regions being reused.
+- A database with a damaged WAL file refuses to load, naming the file and line, and leaves the file as it is. That now includes a line cut short at the end of the newest file, which used to be skipped and then stall compaction. To recover, remove the damaged line.
+- The storage worker syncs each finished WAL file before compacting it, so WAL rotation doesn't wait for one, and a clean shutdown always syncs the current WAL file.
+- With `LARK_FSYNC_ON_WAL_FLUSH` on, a new WAL file's directory is synced before anything is acknowledged from it. Creating a sidecar or blob always syncs its directory. Directory syncs no longer block other databases on the core.
+
+### Added
+
+- Crash-image tests in `server/tests/integration_crash.rs`, covering process kills and power loss. See [TESTING.md](TESTING.md#crash-images).
+
 ## [0.4.0] — 2026-10-31
 
 ### Upgrading

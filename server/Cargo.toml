@@ -9,6 +9,8 @@ description = "The Lark database engine: realtime database server."
 [features]
 default = ["jemalloc"]
 jemalloc = ["tikv-jemallocator"]
+# Records durable file operations for server/tests/integration_crash.rs.
+io-trace = []
 
 [dependencies]
 # Memory allocator (better multi-threaded performance than glibc)
@@ -75,6 +77,10 @@ serde_urlencoded = "0.7"
 [[bin]]
 name = "lark-server"
 path = "src/main.rs"
+
+[[test]]
+name = "integration_crash"
+required-features = ["io-trace"]
 
 [[bench]]
 name = "throughput"

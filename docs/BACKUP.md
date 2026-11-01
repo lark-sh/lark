@@ -80,11 +80,11 @@ On startup, lark-server opens each `blob.lark`, reads its `blob.generation` and 
 
 ## Data correctness guarantee
 
-Copying `blob.lark` while the server is running cannot produce a corrupt file, because of how the blob is written:
+Use the marker-bracketed copy above. It stops a batch from changing `blob.lark` during the copy, which a copy taken without it can't rule out: a batch's in-place writes span many pages. The rest of the design keeps recovery simple:
 
-1. **Data is durable before it's referenced.** When the blob is updated, newly appended data is fsynced to disk *before* the header that points to it is written, and the header is fsynced after (`flush_write_back` in `blob/src/cached_io.rs`). So a copy taken at any instant sees one of two valid states: the old header (in which case freshly-appended bytes are simply unreferenced waste) or the new header (whose data is already on disk). It never sees a header pointing at data that isn't there.
+1. **Data is durable before it's referenced.** When the blob is updated, newly appended data is fsynced to disk *before* the header that points to it is written, and the header is fsynced after (`flush_write_back` in `blob/src/cached_io.rs`). So freshly-appended bytes are unreferenced waste until a header points at them, and a header never points at data that isn't there.
 
-2. **A stale sidecar costs only space, never correctness.** `sidecar.lark` holds the free list and pending dictionary keys. Reads never depend on it: key bytes live inline in the blob itself, and the sidecar only drives free-space reuse and dictionary deduplication during the next compaction. A sidecar that's slightly out of sync with the blob just means some reclaimable space goes untracked and some keys miss deduplication until the next full compaction.
+2. **A stale sidecar costs only space.** `sidecar.lark` holds the free list and pending dictionary keys. Key bytes live inline in the blob itself, and a sidecar that doesn't match `sequence` is ignored, so some reclaimable space goes untracked until the next full compaction. The exception is a database that crashed part way through a batch's flush: its sidecar holds what finishes that batch, so always copy it with the blob.
 
 3. **The WAL is append-only.** WAL files are only ever appended to and rotated, so copying them live is always safe. Anything in the WAL but not yet in the blob is replayed on the next open.
 

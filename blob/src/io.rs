@@ -163,6 +163,13 @@ pub trait BlobIO {
         Ok(())
     }
 
+    /// Syncs everything written so far and returns the deferred writes that
+    /// `flush_write_back` is about to make, as (offset, bytes), so a caller can
+    /// record them first. Empty for backends without write-back support.
+    async fn prepare_write_back(&self) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        Ok(Vec::new())
+    }
+
     /// Discard all write-back state without flushing to disk.
     ///
     /// Clears all cached regions (including dirty ones) and disables

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use tracing::debug;
 
 use super::fsync::AppendFile;
+use super::io_trace;
 
 /// Maximum size of a single WAL file before rotation (5MB).
 pub const WAL_MAX_FILE_SIZE: u64 = 5 * 1024 * 1024;
@@ -47,6 +48,9 @@ impl WalWriter {
     pub async fn with_min_sequence(dir: &Path, min_sequence: i64) -> io::Result<Self> {
         // Create directory if it doesn't exist
         super::fsync::create_dir_all_async(dir).await?;
+        if let Some(parent) = dir.parent() {
+            super::fsync::sync_dir_async(parent).await?;
+        }
 
         // Find the highest existing sequence number from files (async)
         let file_sequence = find_highest_wal_sequence(dir).await?;
@@ -63,7 +67,7 @@ impl WalWriter {
         };
 
         // Open the file for writing
-        writer.open_file().await?;
+        writer.open_file(true).await?;
 
         debug!(
             "[WAL Writer] Initialized at {:?} (sequence={})",
@@ -73,12 +77,17 @@ impl WalWriter {
         Ok(writer)
     }
 
-    /// Open a new WAL file with the current sequence number.
-    async fn open_file(&mut self) -> io::Result<()> {
+    /// Open a new WAL file with the current sequence number. `sync_dir` makes its
+    /// name durable before anything is written to it, which a write that's
+    /// acknowledged from this file relies on.
+    async fn open_file(&mut self, sync_dir: bool) -> io::Result<()> {
         let filename = format!("{:06}.wal", self.sequence);
         let path = self.dir.join(&filename);
 
         let file = AppendFile::open(&path).await?;
+        if sync_dir {
+            super::fsync::sync_dir_async(&self.dir).await?;
+        }
         let size = file.size();
 
         debug!("[WAL Writer] Opened {:?} (size={})", path, size);
@@ -136,8 +145,9 @@ impl WalWriter {
             self.buffer.clear();
 
             // Rotate if file is too large
-            if file.size() > WAL_MAX_FILE_SIZE {
-                self.rotate().await?;
+            let max_size = io_trace::wal_rotation_size().unwrap_or(WAL_MAX_FILE_SIZE);
+            if file.size() > max_size {
+                self.rotate(fsync).await?;
                 return Ok(true);
             }
         }
@@ -150,11 +160,11 @@ impl WalWriter {
         if let Some(mut file) = self.current_file.take() {
             if !self.buffer.is_empty() {
                 file.write(&self.buffer).await?;
-                // Always fdatasync on close — clean shutdown must be durable
-                // regardless of the steady-state FSYNC_ON_WAL_FLUSH setting.
-                file.sync(true).await?;
                 self.buffer.clear();
             }
+            // Always fdatasync on close — clean shutdown must be durable
+            // regardless of the steady-state FSYNC_ON_WAL_FLUSH setting.
+            file.sync(true).await?;
             file.close().await?;
         }
         Ok(())
@@ -162,14 +172,19 @@ impl WalWriter {
 
     /// Rotate to a new WAL file.
     /// Assumes buffer has already been flushed (called from sync()).
-    async fn rotate(&mut self) -> io::Result<()> {
+    ///
+    /// Rotation doesn't wait for the finished file to reach the device: the
+    /// StorageWorker syncs it before compacting it. `sync_dir` is the flush's
+    /// `fsync`; without it, a new file's name reaches the device with the
+    /// filesystem's next commit.
+    async fn rotate(&mut self, sync_dir: bool) -> io::Result<()> {
         if let Some(file) = self.current_file.take() {
             file.close().await?;
         }
 
         self.sequence += 1;
 
-        self.open_file().await
+        self.open_file(sync_dir).await
     }
 
     /// Returns the current WAL sequence number.
@@ -215,15 +230,13 @@ impl WalReader {
 
     /// Read all WAL entries from all files in sequence order.
     ///
-    /// Uses strict parsing: only the last line of the last file may be truncated.
+    /// Any malformed line is an error, including in the newest file.
     pub async fn read_all(&self) -> io::Result<Vec<WalEntry>> {
         let files = self.list_files().await?;
-        let total = files.len();
         let mut all_entries = Vec::new();
 
-        for (i, filename) in files.iter().enumerate() {
-            let is_last = i == total - 1;
-            let entries = self.read_file(filename, is_last).await?;
+        for filename in &files {
+            let entries = self.read_file(filename).await?;
             all_entries.extend(entries);
         }
 
@@ -232,8 +245,8 @@ impl WalReader {
 
     /// Read all WAL entries from files with sequence >= min_sequence.
     ///
-    /// Uses strict parsing: only the last line of the last file may be truncated.
-    /// Also validates WAL continuity — files must form a contiguous sequence
+    /// Any malformed line is an error, including in the newest file. Also validates
+    /// WAL continuity — files must form a contiguous sequence
     /// starting from min_sequence with no gaps.
     pub async fn read_since(&self, min_sequence: i64) -> io::Result<Vec<WalEntry>> {
         let files = self.list_files().await?;
@@ -248,12 +261,10 @@ impl WalReader {
         // Validate continuity
         Self::check_continuity(&filtered, min_sequence, &self.dir)?;
 
-        let total = filtered.len();
         let mut all_entries = Vec::new();
 
-        for (i, (seq, filename)) in filtered.iter().enumerate() {
-            let is_last = i == total - 1;
-            let mut entries = self.read_file(filename, is_last).await?;
+        for (seq, filename) in &filtered {
+            let mut entries = self.read_file(filename).await?;
             tracing::debug!(
                 "WAL read {}: {} ({} entries)",
                 filename,
@@ -271,7 +282,7 @@ impl WalReader {
 
     /// Read WAL entries from files with min_sequence <= sequence <= max_sequence.
     ///
-    /// Uses strict parsing: only the last line of the last file may be truncated.
+    /// Any malformed line is an error, including in the newest file.
     pub async fn read_between(
         &self,
         min_sequence: i64,
@@ -285,12 +296,10 @@ impl WalReader {
             .filter(|(seq, _)| *seq >= min_sequence && *seq <= max_sequence)
             .collect();
 
-        let total = filtered.len();
         let mut all_entries = Vec::new();
 
-        for (i, (seq, filename)) in filtered.iter().enumerate() {
-            let is_last = i == total - 1;
-            let mut entries = self.read_file(filename, is_last).await?;
+        for (seq, filename) in &filtered {
+            let mut entries = self.read_file(filename).await?;
             for entry in &mut entries {
                 entry.sequence = *seq;
             }
@@ -324,10 +333,9 @@ impl WalReader {
 
     /// Read all entries from a single WAL file by filename.
     ///
-    /// Strict parsing: no trailing truncation allowed. Use this for completed
-    /// WAL files (e.g., during compaction where files are fully written).
+    /// Any malformed line is an error.
     pub async fn read_wal_file(&self, filename: &str) -> io::Result<Vec<WalEntry>> {
-        self.read_file(filename, false).await
+        self.read_file(filename).await
     }
 
     /// Returns the highest WAL sequence number in the directory.
@@ -373,20 +381,22 @@ impl WalReader {
         Ok(files)
     }
 
-    /// Read all entries from a single WAL file.
-    ///
-    /// `allow_trailing_truncation`: if true, a malformed last line is tolerated.
-    /// Only pass true for the LAST file during replay (crash may have truncated it).
-    async fn read_file(
-        &self,
-        filename: &str,
-        allow_trailing_truncation: bool,
-    ) -> io::Result<Vec<WalEntry>> {
+    /// Read all entries from a single WAL file. A file that's damaged in any way
+    /// is an error and is left exactly as it is, for someone to inspect.
+    async fn read_file(&self, filename: &str) -> io::Result<Vec<WalEntry>> {
         let path = self.dir.join(filename);
         let bytes = super::fsync::read_file_async(&path).await?;
-        let content =
-            String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        parse_wal_lines(&content, &path, allow_trailing_truncation)
+        let content = String::from_utf8(bytes).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "WAL corruption in {:?}: invalid UTF-8: {}. \
+                     Refusing to load. Manual inspection required.",
+                    path, e
+                ),
+            )
+        })?;
+        parse_wal_lines(&content, &path, false)
     }
 
     /// Validate that WAL files form a contiguous sequence starting from min_sequence.
@@ -955,31 +965,42 @@ mod tests {
     }
 
     #[test]
-    fn test_wal_trailing_truncation_tolerated_on_last_file() {
-        // A truncated last line on the LAST WAL file should be tolerated
-        // (this is the normal crash scenario).
+    fn test_wal_truncated_last_file_is_refused_and_left_alone() {
+        // A damaged WAL needs someone to look at it, even if the damage is a line
+        // cut short at the very end.
         block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let wal_dir = temp_dir.path().join("wal");
             std::fs::create_dir_all(&wal_dir).unwrap();
 
-            // Last file has truncated last line
-            std::fs::write(
-                wal_dir.join("000001.wal"),
-                "{\"o\":\"s\",\"p\":\"/a\",\"v\":1}\n\
-                 {\"o\":\"s\",\"p\":\"/b\",\"v\":2}\n\
-                 {\"o\":\"s\",\"p\":\"/c\",\"v\":3", // truncated — missing closing }
-            )
-            .unwrap();
+            let torn = "{\"o\":\"s\",\"p\":\"/a\",\"v\":1}\n\
+                 {\"o\":\"s\",\"p\":\"/b\",\"v\":2";
+            std::fs::write(wal_dir.join("000001.wal"), torn).unwrap();
 
-            let reader = WalReader::new(&wal_dir);
-            let result = reader.read_all().await;
-            assert!(
-                result.is_ok(),
-                "Trailing truncation on last file should be tolerated"
+            let err = WalReader::new(&wal_dir).read_since(1).await.unwrap_err();
+            assert!(err.to_string().contains("000001.wal"), "{err}");
+            assert!(err.to_string().contains("Refusing to load"), "{err}");
+            assert_eq!(
+                std::fs::read_to_string(wal_dir.join("000001.wal")).unwrap(),
+                torn
             );
-            // Should have 2 entries (the truncated 3rd is skipped)
-            assert_eq!(result.unwrap().len(), 2);
+        })
+    }
+
+    #[test]
+    fn test_wal_invalid_utf8_names_the_file() {
+        block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let wal_dir = temp_dir.path().join("wal");
+            std::fs::create_dir_all(&wal_dir).unwrap();
+
+            let mut torn = "{\"o\":\"s\",\"p\":\"/日".as_bytes().to_vec();
+            torn.pop();
+            std::fs::write(wal_dir.join("000001.wal"), &torn).unwrap();
+
+            let err = WalReader::new(&wal_dir).read_since(1).await.unwrap_err();
+            assert!(err.to_string().contains("000001.wal"), "{err}");
+            assert!(err.to_string().contains("Refusing to load"), "{err}");
         })
     }
 

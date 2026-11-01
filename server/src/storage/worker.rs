@@ -6,7 +6,7 @@
 //!
 //! 1. Reads the sequence file to find the current blob sequence
 //! 2. Lists WAL files and finds completed ones (not the active one)
-//! 3. Opens a BlobSession and applies WAL entries to the blob
+//! 3. Syncs those WAL files, then applies their entries to the blob
 //! 4. Writes the new sequence file
 //!
 //! The worker maintains persistent per-database state (BlobSession + IO handle)
@@ -126,6 +126,7 @@ impl StorageWorker {
         &mut self,
         db_id: &str,
         blob_gen: u64,
+        blob_sequence: i64,
         cached_io: CachedIO<GlommioBlobIO>,
         blob_path: &std::path::Path,
     ) -> Result<&mut WorkerDbState, String> {
@@ -135,10 +136,16 @@ impl StorageWorker {
             let sidecar_io = GlommioBlobIO::open_or_create(&sp)
                 .await
                 .map_err(|e| format!("opening sidecar {:?}: {}", sp, e))?;
+            if let Some(dir) = sp.parent() {
+                fsync::sync_dir_async(dir)
+                    .await
+                    .map_err(|e| format!("syncing {:?}: {}", dir, e))?;
+            }
 
-            let session = BlobSession::open_with_sidecar(cached_io, Some(&sidecar_io))
-                .await
-                .map_err(|e| format!("opening blob session {:?}: {}", blob_path, e))?;
+            let session =
+                BlobSession::open_with_sidecar(cached_io, Some(&sidecar_io), blob_sequence)
+                    .await
+                    .map_err(|e| format!("opening blob session {:?}: {}", blob_path, e))?;
 
             let state = WorkerDbState {
                 session,
@@ -258,7 +265,7 @@ impl StorageWorker {
             request.cached_io
         };
         let state = self
-            .get_or_init_state(&db_id, blob_gen, io_for_init, &blob_path)
+            .get_or_init_state(&db_id, blob_gen, blob_sequence, io_for_init, &blob_path)
             .await?;
 
         // 7. Read all completed WAL files and collect updates
@@ -266,6 +273,11 @@ impl StorageWorker {
         let mut all_entries = Vec::new();
 
         for (_seq, filename) in &completed_files {
+            // Rotation doesn't wait for this, so it doesn't stall the database.
+            let path = wal_dir.join(filename);
+            fsync::sync_file_async(&path)
+                .await
+                .map_err(|e| format!("syncing WAL file {}: {}", filename, e))?;
             let entries = reader
                 .read_wal_file(filename)
                 .await
@@ -278,15 +290,15 @@ impl StorageWorker {
         let total_updates = updates.len();
 
         // 8. Apply all updates in one call (with sidecar for free list persistence)
+        let new_sequence = max_completed;
         state
             .session
-            .apply_updates_with_sidecar(&updates, Some(&state.sidecar_io))
+            .apply_updates_with_sidecar(&updates, Some(&state.sidecar_io), new_sequence)
             .await
             .map_err(|e| format!("applying updates: {}", e))?;
 
         // 9. Write new sequence file (durable)
         //    (Blob is already synced by apply_updates_with_sidecar → flush_write_back.)
-        let new_sequence = max_completed;
         fsync::write_file_durable_async(&sequence_path, new_sequence.to_string().as_bytes())
             .await
             .map_err(|e| format!("writing sequence file: {}", e))?;

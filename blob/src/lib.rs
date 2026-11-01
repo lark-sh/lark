@@ -29,7 +29,7 @@ pub use format::{BlobHeader, FieldIdSize};
 pub use free_list::FreeList;
 pub use incremental::IncrementalStats;
 pub use io::{BlobIO, MemBlobIO, ReadStats, StdBlobIO};
-pub use session::{ApplyResult, BlobSession, ShallowChild, ShallowValue};
+pub use session::{ApplyResult, BlobSession, ShallowChild, ShallowValue, finish_interrupted_flush};
 pub use session_reader::BlobLocation;
 pub use storage_lock::{STORAGE_LOCK_FILE, lock_storage, try_lock_storage};
 pub use writer::{BlobStats, write_blob};

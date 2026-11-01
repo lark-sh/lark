@@ -2189,7 +2189,7 @@ mod tests {
                 eprintln!("  Coalesced to {} updates", updates.len());
 
                 let result = session
-                    .apply_updates_with_sidecar(&updates, Some(&sidecar_io))
+                    .apply_updates_with_sidecar(&updates, Some(&sidecar_io), 0)
                     .await;
                 match result {
                     Ok(crate::session::ApplyResult::Applied(stats)) => {
@@ -2245,6 +2245,7 @@ mod tests {
                     let check_session = crate::session::BlobSession::open_with_sidecar(
                         check_raw,
                         Some(&check_sidecar),
+                        0,
                     )
                     .await
                     .unwrap_or_else(|e| {
@@ -2395,7 +2396,7 @@ mod tests {
             let fresh_io = CachedIO::new(fresh_raw);
             let fresh_sidecar = fresh_io.open_related("sidecar").await.unwrap();
             let fresh_session =
-                crate::session::BlobSession::open_with_sidecar(fresh_io, Some(&fresh_sidecar))
+                crate::session::BlobSession::open_with_sidecar(fresh_io, Some(&fresh_sidecar), 0)
                     .await
                     .unwrap_or_else(|e| panic!("fresh session open failed: {:?}", e));
 
@@ -2503,7 +2504,7 @@ mod tests {
                 eprintln!("  Coalesced to {} updates", updates.len());
 
                 let result = session
-                    .apply_updates_with_sidecar(&updates, Some(&sidecar_io))
+                    .apply_updates_with_sidecar(&updates, Some(&sidecar_io), 0)
                     .await;
                 match result {
                     Ok(crate::session::ApplyResult::Applied(stats)) => {

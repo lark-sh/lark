@@ -428,7 +428,10 @@ pub fn set_wal_sync_interval_ms(ms: u64) {
 }
 
 pub fn wal_sync_interval_ms() -> u64 {
-    WAL_SYNC_INTERVAL_MS.load(std::sync::atomic::Ordering::Relaxed)
+    match crate::storage::io_trace::durability() {
+        Some((interval, _)) => interval,
+        None => WAL_SYNC_INTERVAL_MS.load(std::sync::atomic::Ordering::Relaxed),
+    }
 }
 
 /// Whether each WAL flush issues a real `fdatasync` to force data onto the
@@ -445,7 +448,10 @@ pub fn set_fsync_on_wal_flush(enabled: bool) {
 }
 
 pub fn fsync_on_wal_flush() -> bool {
-    FSYNC_ON_WAL_FLUSH.load(std::sync::atomic::Ordering::Relaxed)
+    match crate::storage::io_trace::durability() {
+        Some((_, fsync)) => fsync,
+        None => FSYNC_ON_WAL_FLUSH.load(std::sync::atomic::Ordering::Relaxed),
+    }
 }
 
 /// Maximum number of inbox messages a database drains in one scheduling slice

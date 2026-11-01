@@ -71,6 +71,10 @@ pub struct CachedIO<IO: BlobIO> {
     /// Cache region offsets that have been modified in write-back mode and
     /// need to be flushed to the underlying IO.
     dirty_regions: Rc<RefCell<HashSet<u64>>>,
+    /// Regions that exist only to hold a deferred write, such as a value being
+    /// overwritten. They're dropped after the flush: the cache is limited by
+    /// region count, so it shouldn't keep values of any size.
+    deferred_only: Rc<RefCell<HashSet<u64>>>,
 }
 
 impl<IO: BlobIO + Clone> Clone for CachedIO<IO> {
@@ -80,6 +84,32 @@ impl<IO: BlobIO + Clone> Clone for CachedIO<IO> {
 }
 
 impl<IO: BlobIO> CachedIO<IO> {
+    /// The deferred writes in offset order, with adjacent regions joined.
+    fn dirty_regions_merged(&self) -> Vec<(u64, Vec<u8>)> {
+        let mut dirty_data: Vec<(u64, Vec<u8>)> = {
+            let dirty = self.dirty_regions.borrow();
+            let regions = self.regions.borrow();
+            dirty
+                .iter()
+                .filter_map(|&offset| regions.get(&offset).map(|data| (offset, data.clone())))
+                .collect()
+        };
+        dirty_data.sort_by_key(|(offset, _)| *offset);
+
+        // Merge truly adjacent regions (where one ends exactly where the next starts)
+        let mut merged: Vec<(u64, Vec<u8>)> = Vec::new();
+        for (offset, data) in dirty_data {
+            if let Some((prev_off, prev_data)) = merged.last_mut()
+                && *prev_off + prev_data.len() as u64 == offset
+            {
+                prev_data.extend_from_slice(&data);
+                continue;
+            }
+            merged.push((offset, data));
+        }
+        merged
+    }
+
     /// Wrap an existing BlobIO with a read cache.
     pub fn new(inner: IO) -> Self {
         let cap = if MAX_CACHED_REGIONS > 0 {
@@ -98,6 +128,7 @@ impl<IO: BlobIO> CachedIO<IO> {
             cache_header_misses: Rc::new(Cell::new(0)),
             write_back: Cell::new(false),
             dirty_regions: Rc::new(RefCell::new(HashSet::new())),
+            deferred_only: Rc::new(RefCell::new(HashSet::new())),
         }
     }
 
@@ -378,13 +409,10 @@ impl<IO: BlobIO> BlobIO for CachedIO<IO> {
     #[allow(clippy::await_holding_refcell_ref)]
     async fn pwrite_deferred(&self, offset: u64, data: &[u8]) -> io::Result<()> {
         if self.write_back.get() {
-            // Write-back mode: patch the cached region covering this write.
-            // pwrite_deferred is used for parent index entry updates, which
-            // always target bytes within cached container headers.
+            // Write-back mode: patch the cached regions this write touches.
             let mut regions = self.regions.borrow_mut();
             let write_end = offset + data.len() as u64;
             let mut fully_covered = false;
-            let mut any_overlap = false;
 
             let scan_from = regions.range(..=offset).next_back().map(|(&k, _)| k);
             let start = scan_from.unwrap_or(offset);
@@ -395,7 +423,6 @@ impl<IO: BlobIO> BlobIO for CachedIO<IO> {
                     continue;
                 }
 
-                any_overlap = true;
                 if region_offset <= offset && region_end >= write_end {
                     fully_covered = true;
                 }
@@ -415,18 +442,18 @@ impl<IO: BlobIO> BlobIO for CachedIO<IO> {
             }
 
             if !fully_covered {
-                if any_overlap {
-                    // Partial overlap on a deferred write — this should not
-                    // happen. Deferred writes target index entries within
-                    // cached container headers.
-                    eprintln!(
-                        "[ERROR] pwrite_deferred partial overlap with cache: offset={} len={}",
-                        offset,
-                        data.len()
-                    );
+                // Nothing cached covers this, so it becomes a dirty region of its
+                // own. It can't go to disk now: it may point at data that isn't
+                // synced yet.
+                let region = regions.entry(offset).or_default();
+                if region.len() < data.len() {
+                    region.resize(data.len(), 0);
                 }
+                region[..data.len()].copy_from_slice(data);
                 drop(regions);
-                self.inner.pwrite(offset, data).await?;
+                self.dirty_regions.borrow_mut().insert(offset);
+                self.deferred_only.borrow_mut().insert(offset);
+                self.lru_order.borrow_mut().put(offset, ());
             }
         } else {
             // Not in write-back mode — same as pwrite
@@ -498,6 +525,7 @@ impl<IO: BlobIO> BlobIO for CachedIO<IO> {
             cache_header_misses: Rc::clone(&self.cache_header_misses),
             write_back: Cell::new(false),
             dirty_regions: Rc::clone(&self.dirty_regions),
+            deferred_only: Rc::clone(&self.deferred_only),
         })
     }
 
@@ -642,29 +670,13 @@ impl<IO: BlobIO> BlobIO for CachedIO<IO> {
         self.write_back.set(enabled);
     }
 
-    async fn flush_write_back(&self) -> io::Result<()> {
-        // Collect all dirty region data, sorted by offset
-        let mut dirty_data: Vec<(u64, Vec<u8>)> = {
-            let dirty = self.dirty_regions.borrow();
-            let regions = self.regions.borrow();
-            dirty
-                .iter()
-                .filter_map(|&offset| regions.get(&offset).map(|data| (offset, data.clone())))
-                .collect()
-        };
-        dirty_data.sort_by_key(|(offset, _)| *offset);
+    async fn prepare_write_back(&self) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        self.inner.sync().await?;
+        Ok(self.dirty_regions_merged())
+    }
 
-        // Merge truly adjacent regions (where one ends exactly where the next starts)
-        let mut merged: Vec<(u64, Vec<u8>)> = Vec::new();
-        for (offset, data) in dirty_data {
-            if let Some((prev_off, prev_data)) = merged.last_mut()
-                && *prev_off + prev_data.len() as u64 == offset
-            {
-                prev_data.extend_from_slice(&data);
-                continue;
-            }
-            merged.push((offset, data));
-        }
+    async fn flush_write_back(&self) -> io::Result<()> {
+        let merged = self.dirty_regions_merged();
 
         // Sync all appended data to disk before writing headers that reference it.
         // This ensures that if a reader sees an updated header, the data it
@@ -679,6 +691,10 @@ impl<IO: BlobIO> BlobIO for CachedIO<IO> {
         self.inner.sync().await?;
 
         self.dirty_regions.borrow_mut().clear();
+        for offset in self.deferred_only.borrow_mut().drain() {
+            self.regions.borrow_mut().remove(&offset);
+            self.lru_order.borrow_mut().pop(&offset);
+        }
         self.write_back.set(false);
         Ok(())
     }
@@ -687,6 +703,7 @@ impl<IO: BlobIO> BlobIO for CachedIO<IO> {
         self.regions.borrow_mut().clear();
         self.lru_order.borrow_mut().clear();
         self.dirty_regions.borrow_mut().clear();
+        self.deferred_only.borrow_mut().clear();
         self.write_back.set(false);
     }
 
@@ -721,6 +738,33 @@ mod tests {
 
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
         futures::executor::block_on(f)
+    }
+
+    /// A deferred write stays in memory until the flush, even with nothing cached
+    /// at that offset: it may point at data that isn't synced yet.
+    #[test]
+    fn test_deferred_write_waits_for_the_flush() {
+        block_on(async {
+            let raw = MemBlobIO::from_bytes(vec![7u8; 100]);
+            let cached = CachedIO::new(raw.clone());
+            cached.set_write_back(true);
+
+            cached.pwrite_deferred(10, &[1, 2, 3]).await.unwrap();
+
+            assert_eq!(&raw.data()[10..13], &[7, 7, 7], "reached the file early");
+            assert_eq!(cached.pread(10, 3).await.unwrap(), vec![1, 2, 3]);
+            assert_eq!(cached.pread(9, 5).await.unwrap(), vec![7, 1, 2, 3, 7]);
+
+            let pending = cached.prepare_write_back().await.unwrap();
+            assert_eq!(pending, vec![(10, vec![1, 2, 3])]);
+
+            cached.flush_write_back().await.unwrap();
+            assert_eq!(&raw.data()[10..13], &[1, 2, 3]);
+
+            // It was only held for the flush, so the cache doesn't keep it.
+            assert_eq!(cached.region_count(), 0);
+            assert_eq!(cached.pread(10, 3).await.unwrap(), vec![1, 2, 3]);
+        })
     }
 
     #[test]

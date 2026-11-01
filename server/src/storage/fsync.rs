@@ -24,6 +24,8 @@ use std::time::Duration;
 
 use glommio::io::BufferedFile;
 
+use super::io_trace;
+
 /// Sync a directory to ensure all directory entries are durable.
 ///
 /// This is necessary after creating or renaming files to ensure the
@@ -31,6 +33,7 @@ use glommio::io::BufferedFile;
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
     let dir_file = File::open(dir)?;
     dir_file.sync_all()?;
+    io_trace::sync_dir(dir);
     Ok(())
 }
 
@@ -50,12 +53,16 @@ pub fn write_file_durable(path: &Path, data: &[u8]) -> io::Result<()> {
     // Write to temp file and fsync
     {
         let mut file = File::create(&temp_path)?;
+        io_trace::create(&temp_path, true);
         file.write_all(data)?;
+        io_trace::write(&temp_path, 0, data);
         file.sync_all()?;
+        io_trace::sync(&temp_path);
     }
 
     // Rename for atomicity
     fs::rename(&temp_path, path)?;
+    io_trace::rename(&temp_path, path);
 
     // Fsync parent directory to make rename durable
     if let Some(parent) = path.parent() {
@@ -128,16 +135,21 @@ pub async fn sync_file_async(path: &Path) -> io::Result<()> {
     let file = BufferedFile::open(path).await?;
     file.fdatasync().await?;
     file.close().await?;
+    io_trace::sync(path);
     Ok(())
 }
 
 /// Sync a directory to ensure directory entries are durable.
 ///
-/// Note: Glommio doesn't have native async directory sync, so we use sync + yield.
-/// Directory fsync is a fast metadata operation.
+/// Glommio has no async directory sync, and a directory fsync can wait on a
+/// filesystem journal commit, so this runs on the blocking pool. Only the caller
+/// waits, not the other databases on this core.
 pub async fn sync_dir_async(dir: &Path) -> io::Result<()> {
-    sync_dir(dir)?;
-    glommio::yield_if_needed().await;
+    let path = dir.to_path_buf();
+    glommio::executor()
+        .spawn_blocking(move || File::open(&path)?.sync_all())
+        .await?;
+    io_trace::sync_dir(dir);
     Ok(())
 }
 
@@ -162,6 +174,7 @@ pub async fn write_file_durable_async(path: &Path, data: &[u8]) -> io::Result<()
             .truncate(true)
             .buffered_open(&temp_path)
             .await?;
+        io_trace::create(&temp_path, true);
 
         let mut writer = StreamWriterBuilder::new(file)
             .with_sync_on_close_disabled(true)
@@ -169,6 +182,7 @@ pub async fn write_file_durable_async(path: &Path, data: &[u8]) -> io::Result<()
 
         writer.write_all(data).await?;
         writer.close().await?;
+        io_trace::write(&temp_path, 0, data);
     }
 
     // Fsync the temp file
@@ -176,6 +190,7 @@ pub async fn write_file_durable_async(path: &Path, data: &[u8]) -> io::Result<()
 
     // Rename for atomicity (sync op + yield)
     fs::rename(&temp_path, path)?;
+    io_trace::rename(&temp_path, path);
     glommio::yield_if_needed().await;
 
     // Fsync parent directory to make rename durable
@@ -192,6 +207,9 @@ pub async fn write_file_durable_async(path: &Path, data: &[u8]) -> io::Result<()
 /// metadata operation. We yield after to allow other tasks to run.
 pub async fn remove_file_async(path: &Path) -> io::Result<()> {
     let result = fs::remove_file(path);
+    if result.is_ok() {
+        io_trace::remove(path);
+    }
     glommio::yield_if_needed().await;
     result
 }
@@ -222,6 +240,7 @@ pub async fn write_file_async(path: &Path, data: &[u8]) -> io::Result<()> {
         .truncate(true)
         .buffered_open(path)
         .await?;
+    io_trace::create(path, true);
 
     let mut writer = StreamWriterBuilder::new(file)
         .with_sync_on_close_disabled(true)
@@ -229,6 +248,7 @@ pub async fn write_file_async(path: &Path, data: &[u8]) -> io::Result<()> {
 
     writer.write_all(data).await?;
     writer.close().await?;
+    io_trace::write(path, 0, data);
     Ok(())
 }
 
@@ -242,6 +262,7 @@ pub async fn create_dir_all_async(path: &Path) -> io::Result<()> {
 /// Rename a file or directory.
 pub async fn rename_async(from: &Path, to: &Path) -> io::Result<()> {
     fs::rename(from, to)?;
+    io_trace::rename(from, to);
     glommio::yield_if_needed().await;
     Ok(())
 }
@@ -283,6 +304,7 @@ pub struct AppendFile {
     /// them, so syncing this handle durably persists the StreamWriter's writes.
     sync_handle: glommio::io::BufferedFile,
     size: u64,
+    path: std::path::PathBuf,
 }
 
 impl AppendFile {
@@ -296,6 +318,7 @@ impl AppendFile {
             .append(true)
             .buffered_open(path)
             .await?;
+        io_trace::create(path, false);
 
         let size = file.file_size().await?;
 
@@ -315,6 +338,7 @@ impl AppendFile {
             writer,
             sync_handle,
             size,
+            path: path.to_path_buf(),
         })
     }
 
@@ -322,6 +346,7 @@ impl AppendFile {
     pub async fn write(&mut self, data: &[u8]) -> io::Result<()> {
         use futures::io::AsyncWriteExt;
         self.writer.write_all(data).await?;
+        io_trace::write(&self.path, self.size, data);
         self.size += data.len() as u64;
         Ok(())
     }
@@ -339,6 +364,7 @@ impl AppendFile {
         self.writer.flush().await?;
         if fsync {
             self.sync_handle.fdatasync().await?;
+            io_trace::sync(&self.path);
         }
         Ok(())
     }

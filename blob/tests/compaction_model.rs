@@ -402,20 +402,24 @@ fn run(script: &[Step]) -> Result<(), TestCaseError> {
                 let parsed = parse_wal_lines(&text, Path::new("fuzz.wal"), false)
                     .map_err(|e| TestCaseError::fail(format!("{at}: parse: {e}")))?;
                 let updates = coalesce_wal_entries(parsed);
-                block_on(session.apply_updates_with_sidecar(&updates, Some(&sidecar)))
+                block_on(session.apply_updates_with_sidecar(&updates, Some(&sidecar), 0))
                     .map_err(|e| TestCaseError::fail(format!("{at}: apply: {e}")))?;
             }
             Step::FullCompact => {
                 let dst = MemBlobIO::new();
                 block_on(session.root_compact(dst.clone()))
                     .map_err(|e| TestCaseError::fail(format!("{at}: root_compact: {e}")))?;
-                block_on(session.apply_updates_with_sidecar(&[], Some(&sidecar)))
+                block_on(session.apply_updates_with_sidecar(&[], Some(&sidecar), 0))
                     .map_err(|e| TestCaseError::fail(format!("{at}: sidecar: {e}")))?;
                 io = dst;
             }
             Step::Reopen => {
-                session = block_on(BlobSession::open_with_sidecar(io.clone(), Some(&sidecar)))
-                    .map_err(|e| TestCaseError::fail(format!("{at}: reopen: {e}")))?;
+                session = block_on(BlobSession::open_with_sidecar(
+                    io.clone(),
+                    Some(&sidecar),
+                    0,
+                ))
+                .map_err(|e| TestCaseError::fail(format!("{at}: reopen: {e}")))?;
             }
         }
         check(&session, &model, &at)?;

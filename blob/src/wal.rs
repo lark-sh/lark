@@ -92,11 +92,9 @@ pub fn parse_wal_sequence(filename: &str) -> Option<i64> {
 
 /// Parse WAL entries from lines, with strict corruption detection.
 ///
-/// If `allow_trailing_truncation` is true (only valid for the LAST WAL file
-/// during replay), a malformed final line is tolerated — this handles the case
-/// where the server crashed mid-write. Any malformed line that is NOT the last
-/// line is always a fatal error, because it means data was lost or corrupted
-/// in the middle of the file.
+/// If `allow_trailing_truncation` is true, a malformed final line is skipped with
+/// a warning, for tools reading a WAL that may have been cut short. Otherwise any
+/// malformed line is an error, and nothing is skipped.
 ///
 /// `path` is only used in log and error messages.
 pub fn parse_wal_lines(
@@ -120,7 +118,7 @@ pub fn parse_wal_lines(
             Ok(entry) => entries.push(entry),
             Err(e) => {
                 if is_last_line && allow_trailing_truncation {
-                    // Last line of last file — likely truncated on crash, acceptable
+                    // Possibly cut short by a crash; the caller accepts that.
                     warn!(
                         "[WAL Reader] Skipping truncated last line in {:?} line {}: {}",
                         path,
@@ -128,13 +126,11 @@ pub fn parse_wal_lines(
                         e
                     );
                 } else {
-                    // Corruption in the middle of a file — fatal
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "WAL corruption in {:?} at line {} (not last line): {}. \
-                             This indicates data loss — refusing to load. \
-                             Manual inspection required.",
+                            "WAL corruption in {:?} at line {}: {}. \
+                             Refusing to load. Manual inspection required.",
                             path,
                             line_num + 1,
                             e
