@@ -22,54 +22,92 @@ If your app works against Firebase through the JS SDK, this suite is the evidenc
 
 ## Durability
 
-The durability contract has two modes, chosen per deployment:
+Lark's job is to keep the data you give it. This section covers how it does that, what happens when something fails, and the trade you're making with each durability mode.
 
-- Default: the write-ahead log is flushed every 2 seconds. A write acknowledged inside that window may be lost if the server dies before the flush; any write acknowledged before the window must survive. A graceful stop (SIGTERM or SIGINT) flushes before exiting, so the window applies only to crashes.
-- Strict (`--durability strict` in the harness, fsync tuning in deployment): the WAL is fsync'd before the ACK is sent. No acknowledged write may be lost.
+### How your data stays safe
 
-The tool that holds Lark to this contract is [`tools/chaos-monkey`](tools/chaos-monkey), a standalone binary that plays the role of the gateway: it writes continuously to a real `lark-server` over the actual wire protocol, SIGKILLs the process at random moments, restarts it, and compares what the server recovers against its own ground-truth model of every acknowledged write.
+**The write-ahead log (WAL) comes first.** Every write is added to the end of a log file for its database before anything else happens. If the server stops for any reason, it replays the log on the way back up.
+
+**The blob is the long-term home for your data.** In the background, Lark folds finished WAL files into `blob.lark` in batches. Each batch writes its new data and syncs it to disk first. It then saves a copy of every change to existing data before making any of those changes, and only marks the batch as done once all of it is on disk.
+
+**A crash at any point in that process is recoverable.** If a batch is cut off, Lark finishes it from the saved copy on the next load, then replays any WAL the blob doesn't hold yet. You don't need to run anything, and there's no separate recovery mode: this is what every startup does.
+
+**If the WAL is damaged, Lark stops and tells you.** It won't guess at damaged data, so that database refuses to load until someone has looked at it. Your other databases keep running.
+
+### What happens when something goes wrong
+
+| What happened | What Lark does | What you need to do |
+|---|---|---|
+| Normal restart or deploy (SIGTERM) | Saves everything before exiting | Nothing |
+| The server process crashes | Recovers on restart | Nothing |
+| The machine crashes or loses power | Recovers on restart | Usually nothing. See [If a database refuses to load](#if-a-database-refuses-to-load) |
+| A disk fails or is lost | Can't recover by itself | Restore from a [backup](docs/BACKUP.md) |
+
+How much recent data a crash can cost depends on your durability mode.
+
+### Choosing a durability mode
+
+Lark doesn't confirm every write the same way. By default it confirms a write immediately and saves it to the WAL a moment later, which is fast but leaves a short window where a crash can lose it. You choose where to sit on that trade with two settings, covered in [DEPLOYMENT.md](docs/DEPLOYMENT.md#durability):
+
+| Mode | Process crash can lose | Machine crash can lose | Write speed |
+|---|---|---|---|
+| **Default** | Up to the last 2 seconds | Up to about 30 seconds on a default Linux install | Fastest |
+| **Power-safe** | Up to the last 2 seconds | Up to the last 2 seconds | Fast |
+| **Synchronous** | Nothing confirmed | Up to about 30 seconds on a default Linux install | Slower |
+| **Strict** | Nothing confirmed | Nothing confirmed | Slowest |
+
+In every mode, a crash can only cost you recent writes. Data that's already in the blob is safe.
+
+The settings apply to the whole server. If losing a confirmed write would be a serious problem for your app, use strict. If a few seconds of lost writes is acceptable, the default gives you much faster writes.
+
+### If a database refuses to load
+
+Lark logs this and leaves the file exactly as it was:
+
+```text
+[STORAGE INTEGRITY] my-project/my-db: Failed to initialize: WAL corruption in ".../wal/000042.wal" at line 118 ...
+```
+
+After a machine crash, this nearly always means the last line was only partly written. In strict mode that write was never confirmed to a client, so nothing you were promised is lost.
+
+To fix it, open the file and remove the damaged line, keep a copy first if you'd like one, and the database loads on its next connection. If the damage isn't on the last line, or you didn't just have a crash, treat it as a damaged disk: check the disk and consider restoring from a backup.
+
+### What Lark can't protect against
+
+Lark relies on your disk telling the truth. If a drive confirms a sync without actually saving the data, no software can recover what's gone. Lark also doesn't checksum your data in the blob or WAL, so slow corruption on a failing disk may not be noticed until something tries to read it. Use reliable storage, consider RAID or a filesystem with checksums, and keep [backups](docs/BACKUP.md).
+
+### How we test this
+
+We test the two things that go wrong in real life: the process dying, and the machine dying.
+
+[`tools/chaos-monkey`](tools/chaos-monkey) plays the part of your gateway. It writes to a real `lark-server`, kills the process at random moments, restarts it, and checks every confirmed write against its own record. That includes compaction: it can run a full compaction between the kill and the restart. Runs are seeded, so a failure can be replayed.
 
 ```bash
 ./tools/chaos-monkey/run.sh                      # 1-hour run, default durability
-./tools/chaos-monkey/run.sh --durability strict  # zero-loss contract
+./tools/chaos-monkey/run.sh --durability strict  # nothing confirmed may be lost
 ./tools/chaos-monkey/run.sh --duration 5h
 ./tools/chaos-monkey/run-seed.sh                 # short fixed-seed run for repro
 ```
 
-Some details of the harness:
-
-- It verifies data before each kill as well as after the restart, so a violation can be attributed to recovery rather than to a live-server bug.
-- It checks deletes as well as writes. Every acknowledged value is read back individually, and every subtree the run replaced or deleted is read whole and must hold exactly what the run wrote there: no deleted children coming back, no null stored as a value.
-- It inspects the raw on-disk state after each crash: WAL files must be valid JSONL, the blob and sequence files must parse.
-- Between kill and restart it can run `lark-compact` to force a full blob re-compaction, so recovery is verified through the compactor, the piece of a storage engine where bugs are most expensive.
-- The operation mix is weighted toward writes that have actually broken things in the past: multi-path updates at the root (a real WAL-replay bug), multi-path updates that null existing paths and deletes immediately followed by a write beneath them (real compaction bugs), transactions on blob-backed paths, unicode and deeply nested keys, burst writes that force WAL rotation.
-- Runs are seeded. A violating run replays exactly with the same `--seed`, so a failure is a reproducible artifact rather than an anecdote.
-- It can run with security rules enabled, so durability is exercised with the authorization path in play.
-
-To be precise about the crash model: what the harness kills is the process, at an arbitrary instant, including mid-flush and mid-compaction. The kernel's page cache survives that, so power loss is covered by crash images, below. In strict mode the claim is that the WAL has been fsync'd before the client sees an ACK.
-
-### Crash images
-
-[`server/tests/integration_crash.rs`](server/tests/integration_crash.rs) tests what a crash leaves on disk, including a power loss. With the `io-trace` feature, a seeded workload runs against a real `Database` and `StorageWorker` and records every durable file operation: writes, syncs, renames and directory syncs. From that journal it rebuilds what a crash at a chosen point could leave, and recovers each image with the same server code.
+A killed process can't show what a power cut does, so crash images cover that. This test records every file operation a real server makes, rebuilds what a machine crash could leave on disk at chosen moments, and recovers each result using the same server code. It then keeps writing and restarts twice, because some damage only appears later.
 
 ```bash
 cargo test -p lark-server --features io-trace --test integration_crash
-LARK_CRASH_CASES=2000 LARK_CRASH_SEED=7 cargo test -p lark-server --features io-trace --test integration_crash
 ```
 
-Run this for any change to compaction, the WAL, or the order of durable writes. It isn't part of CI, though CI does keep it compiling. Set `LARK_CRASH_KEEP` to a directory to keep each failing image. Strict durability runs all three of these crash models, and default durability runs the process kill and the ext4 power loss:
+These run on a model of a disk, not real hardware, so they show that Lark's write ordering holds up under that model. Unit tests in `lark-blob` and the `integration_persistence` suite cover the storage engine underneath.
 
-| Model | What survives |
-|---|---|
-| Process kill | Everything issued |
-| Power loss on ext4 | Synced data; unsynced data lands in pieces (any 4K pages or 512-byte sectors, with cut-off or zeroed tails), and directory entries commit in journal order |
-| Power loss, POSIX directories | The same, but a new entry survives only an fsync of its directory |
+### For contributors
 
-A torn line at the end of the newest WAL file must be refused with the WAL left alone, and the test then trims it as an operator would. After that, each image has to pass three stages: it holds every acknowledged write and is the state after some prefix of the writes; several more compactions all finish; and two restarts read back the right data. The later stages matter, because some damage only appears batches or restarts after the crash. Default durability can lose acknowledged writes, so its first stage checks less: everything in the blob must be intact, and any other path must hold a value that was written to it. Controls keep the harness honest: replaying a complete journal has to rebuild the real directory byte for byte, an intact directory has to recover, and an image missing an acknowledged write has to be reported.
+A write takes this path:
 
-These images come from a model of the disk. They show that Lark's write ordering holds up under that model, not that any particular kernel or device behaves as modelled, and `lark-compact` isn't part of the recorded workload.
+1. It's added to an in-memory buffer, which is flushed to the newest WAL file. When that happens depends on the durability mode.
+2. At 5MB the WAL rotates, and the per-core `StorageWorker` picks up finished files.
+3. The worker applies a batch in this order: write new data to free or appended space, sync it, write and sync the sidecar with a copy of every change to existing bytes, make those changes, sync the blob, drop the copy, then write `sequence`.
 
-Under the chaos-monkey layer, the storage engine has conventional coverage of its own: the `lark-blob` crate carries roughly 200 unit tests over the on-disk format, sessions, free list, dictionary, and incremental compaction, and the `integration_persistence` suite covers WAL replay, graceful-shutdown flushing, deletion persistence, and write coalescing. A slow `#[ignore]`d suite (`integration_storage_worker`) exercises real compaction timing; it runs as part of `make test-all`.
+`sequence` is the commit point. Until it's written, the WAL can replay the batch, and the saved copy repairs anything a crash tore. Two rules keep this safe: a batch doesn't touch live bytes before its flush, and a sidecar only counts when its sequence matches.
+
+Run the crash images for any change to compaction, the WAL or the order of durable writes. They aren't in CI. `LARK_CRASH_CASES` and `LARK_CRASH_SEED` change the run, and `LARK_CRASH_KEEP` saves failing images. See [WRITE_LIFECYCLE.md](docs/WRITE_LIFECYCLE.md) and [`blob/README.md`](blob/README.md#crash-safety) for detail.
 
 ## REST Conformance
 

@@ -44,15 +44,15 @@ DB_DIR="$LARK_DATA_DIR/my-project/my-database"
 touch "$DB_DIR/.compacting"
 flock "$DB_DIR/.storage.lock" true
 
-# 2. Copy the database files. Order doesn't matter — they're now static
-#    (the WAL keeps appending, but appends are always safe to copy).
+# 2. Copy the database files. The blob, sidecar and sequence are static now.
+#    The WAL keeps growing, so the copy can end partway through a line.
 cp -a "$DB_DIR" /path/to/backup/my-project/
 
 # 3. Resume compaction.
 rm "$DB_DIR/.compacting"
 ```
 
-While `.compacting` is present, lark-server's storage worker skips its incremental compaction pass entirely (`server/src/storage/worker.rs`), and a batch that started before the marker holds `.storage.lock` until it finishes, so once `flock` returns, `blob.lark`, `sidecar.lark`, `blob.generation`, and `sequence` do not change during the copy. Live writes continue uninterrupted: they land in the WAL, which is append-only and safe to copy at any time. **Remember to remove the marker afterward**; if it's left behind, compaction never resumes and the WAL grows unbounded. After an hour, lark-server logs a warning for a marker it's still skipping. (This is the same mechanism `lark-compact` uses while it holds the blob for a full re-compaction.)
+While `.compacting` is present, lark-server's storage worker skips its incremental compaction pass entirely (`server/src/storage/worker.rs`), and a batch that started before the marker holds `.storage.lock` until it finishes, so once `flock` returns, `blob.lark`, `sidecar.lark`, `blob.generation`, and `sequence` do not change during the copy. Live writes continue uninterrupted: they land in the WAL, and a restored database replays anything in it that the blob doesn't hold yet. **Remember to remove the marker afterward**; if it's left behind, compaction never resumes and the WAL grows unbounded. After an hour, lark-server logs a warning for a marker it's still skipping. (This is the same mechanism `lark-compact` uses while it holds the blob for a full re-compaction.)
 
 To snapshot the whole deployment when there are many databases, place a `.compacting` marker in each database directory before copying, then remove it after copying that database's folder.
 
@@ -62,7 +62,7 @@ If `LARK_DATA_DIR` lives on snapshot-capable storage (ZFS, LVM, btrfs, EBS), an 
 
 ### Without the marker
 
-Even a plain `cp -a` of a live database directory restores to a valid (if slightly stale) database. See [Data correctness guarantee](#data-correctness-guarantee) below. The `.compacting` marker just removes the "slightly stale" window and the small risk of free-list skew, so it's the recommended default. Filesystem snapshots and the marker are both ways to get a *clean* point-in-time copy; the plain copy is the fallback when neither is available.
+Don't rely on a plain copy of a live database. A compaction batch can change files while they're being copied, so the blob and `sequence` can end up out of step, and the restored database can be damaged or missing writes without any warning. Use the marker, or a filesystem snapshot.
 
 ### Backing up lark-edge metadata
 
@@ -75,17 +75,12 @@ Even a plain `cp -a` of a live database directory restores to a valid (if slight
 2. Restore the lark-edge metadata store (`lark.db` or the Postgres database).
 3. Copy the backed-up `LARK_DATA_DIR` tree (or individual database directories) into place. Ensure no `.compacting` markers were included in the backup; if any slipped in, delete them.
 4. Start lark-server.
+5. If a database refuses to load, its newest WAL file probably ends partway through a line, since the copy was taken while it was being written. Follow [If a database refuses to load](../TESTING.md#if-a-database-refuses-to-load). A filesystem snapshot can leave the same thing.
 
 On startup, lark-server opens each `blob.lark`, reads its `blob.generation` and `sequence`, and replays any WAL entries newer than `sequence` forward (`load_from_disk` / `load_wal_entries` in `server/src/db/database/persistence.rs`). **Restore uses the exact same path as a normal startup**; there is no separate recovery mode. A backup is just a database that hasn't been opened yet.
 
-## Data correctness guarantee
+## Why this works
 
-Use the marker-bracketed copy above. It stops a batch from changing `blob.lark` during the copy, which a copy taken without it can't rule out: a batch's in-place writes span many pages. The rest of the design keeps recovery simple:
+The marker and lock stop compaction, so the blob, sidecar and `sequence` all hold still and match each other during the copy. The WAL is the only file still changing, and a restored database replays anything in it that the blob doesn't hold yet. Include the sidecar in every copy: it's only free-space bookkeeping unless the database crashed during a compaction, when it holds what finishes that batch.
 
-1. **Data is durable before it's referenced.** When the blob is updated, newly appended data is fsynced to disk *before* the header that points to it is written, and the header is fsynced after (`flush_write_back` in `blob/src/cached_io.rs`). So freshly-appended bytes are unreferenced waste until a header points at them, and a header never points at data that isn't there.
-
-2. **A stale sidecar costs only space.** `sidecar.lark` holds the free list and pending dictionary keys. Key bytes live inline in the blob itself, and a sidecar that doesn't match `sequence` is ignored, so some reclaimable space goes untracked until the next full compaction. The exception is a database that crashed part way through a batch's flush: its sidecar holds what finishes that batch, so always copy it with the blob.
-
-3. **The WAL is append-only.** WAL files are only ever appended to and rotated, so copying them live is always safe. Anything in the WAL but not yet in the blob is replayed on the next open.
-
-The `.compacting` marker turns "slightly stale but valid" into "exactly consistent" by ensuring `blob.lark`/`sidecar.lark`/`sequence` don't move at all during the copy. See the [Storage section of CONTRIBUTING](../CONTRIBUTING.md#storage) for the full on-disk design and [WRITE_LIFECYCLE.md](WRITE_LIFECYCLE.md) for how writes flow from client to disk.
+See the [Storage section of CONTRIBUTING](../CONTRIBUTING.md#storage) for the full on-disk design and [WRITE_LIFECYCLE.md](WRITE_LIFECYCLE.md) for how writes flow from client to disk.
