@@ -54,6 +54,8 @@ When a client performs a write (set/update/delete), the server responds with:
 1. **Data event(s) first** - The write is echoed back to the writer (and all other subscribers)
 2. **ACK/NACK second** - Confirmation that the write was accepted/rejected
 
+The ACK always comes, but data events don't. A write that leaves the data as it was has nothing to send, and nobody receives an event for it, the writer included. An update drops the keys that didn't change, comparing each key's whole value. Comparison only uses data the server has in memory, so an unchanged write to unloaded data is still sent. Volatile paths are always sent.
+
 ## Compare-and-Swap (CAS) Writes
 
 A SET can carry an optional compare-and-swap hash. Three shapes:

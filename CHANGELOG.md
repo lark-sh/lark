@@ -14,6 +14,8 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 
 ### Changed
 
+- A write that leaves the data as it was no longer sends events, and an update sends only the keys that changed. The comparison uses data already in memory and never reads from disk, so listeners may still receive an unchanged write to data that isn't loaded. Clients keep receiving their ack.
+- A listener below an update's path no longer receives its whole value again when none of the update's keys reach it.
 - Compaction batches change existing blob bytes only during their flush, and the sidecar records those writes first, so a crash during a flush is finished on the next load.
 - The sidecar is stamped with its WAL sequence and checksummed. A crash mid-batch can no longer lead to live regions being reused.
 - A database with a damaged WAL file refuses to load, naming the file and line, and leaves the file as it is. That now includes a line cut short at the end of the newest file, which used to be skipped and then stall compaction. To recover, remove the damaged line.

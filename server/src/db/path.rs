@@ -223,6 +223,16 @@ pub fn normalize_path(path: &str) -> String {
     format!("/{}", trimmed)
 }
 
+/// True if `path` is a strict descendant of `ancestor`. Both must be normalized.
+pub fn is_below(path: &str, ancestor: &str) -> bool {
+    match ancestor {
+        "/" => path != "/",
+        _ => path
+            .strip_prefix(ancestor)
+            .is_some_and(|rest| rest.starts_with('/')),
+    }
+}
+
 /// Error returned when a key is invalid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyError {
