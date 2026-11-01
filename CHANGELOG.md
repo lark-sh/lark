@@ -22,7 +22,7 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 
 ### Added
 
-- Crash-image tests in `server/tests/integration_crash.rs`, covering process kills and power loss. See [TESTING.md](TESTING.md#crash-images).
+- Crash-image tests in `server/tests/integration_crash.rs`, covering process kills and power loss. See [TESTING.md](TESTING.md#how-we-test-this).
 
 ## [0.4.0] — 2026-10-31
 

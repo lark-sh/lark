@@ -437,12 +437,12 @@ Writes go to a write-ahead log (WAL) that is compacted into the blob on disk. Tw
 
 | Goal | `LARK_WAL_SYNC_INTERVAL_MS` | `LARK_FSYNC_ON_WAL_FLUSH` | Behavior |
 |---|---|---|---|
-| **Default** (throughput) | `2000` | `false` | Writes are ACKed immediately; the buffer flushes to the OS page cache every 2s. Survives a **process** crash, but a **power loss** can lose up to ~2s of acknowledged writes plus anything the kernel hasn't written back. |
+| **Default** (throughput) | `2000` | `false` | Writes are ACKed immediately and held in memory for up to 2s, then flushed to the OS page cache. A **process** crash can lose up to ~2s of acknowledged writes, and a **power loss** can also lose anything the kernel hasn't written back. |
 | **Power-safe** | `2000` | `true` | Same 2s window, but each flush is `fdatasync`'d, so data in a completed flush survives power loss. |
 | **Synchronous** | `0` | `false` | Each write is flushed to the page cache before its ACK. No in-memory loss window; survives process crash but not power loss. |
 | **Strict** | `0` | `true` | Each write is flushed **and** `fdatasync`'d before its ACK, so a delivered ACK means the write is durable on the device. Highest per-write latency. |
 
-Because the interval is in-memory buffering (not batching for throughput on a single connection), lowering it or setting it to `0` increases the fsync/flush rate and therefore write latency. Pick the weakest setting that meets your data-loss tolerance. These are process-wide (all databases on the node share them), set once at startup.
+Because the interval is in-memory buffering (not batching for throughput on a single connection), lowering it or setting it to `0` increases the fsync/flush rate and therefore write latency. Pick the weakest setting that meets your data-loss tolerance. These are process-wide (all databases on the node share them), set once at startup. See [Durability in TESTING.md](../TESTING.md#durability) for what each mode can lose in each kind of crash.
 
 ### `lark-edge` (the gateway / coordinator)
 
