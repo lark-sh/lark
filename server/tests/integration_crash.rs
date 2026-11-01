@@ -620,6 +620,16 @@ fn torn_wal(files: &Files) -> Option<(String, usize)> {
         })
 }
 
+/// The newest WAL file with entries the blob doesn't hold yet.
+fn newest_uncompacted_wal(files: &Files) -> Option<String> {
+    let sequence = blob_sequence(files);
+    files
+        .iter()
+        .filter(|(path, data)| !data.is_empty() && wal_sequence(path).is_some_and(|w| w > sequence))
+        .map(|(path, _)| path.clone())
+        .max()
+}
+
 fn wal_sequence(path: &str) -> Option<i64> {
     lark_blob::wal::parse_wal_sequence(path.rsplit('/').next()?)
 }
@@ -951,16 +961,18 @@ fn an_intact_directory_recovers() {
 /// The checks can fail: an image missing an acknowledged write is reported.
 #[test]
 fn a_lost_acknowledged_write_is_detected() {
-    let recording = record(seed(), Durability::Strict);
-    let mut files = read_tree(recording.root.path());
+    // A run can end just after a rotation, with every entry already compacted and
+    // nothing left to lose, so use the first one that doesn't.
+    let (recording, mut files, last_wal) = (seed()..seed() + 20)
+        .find_map(|seed| {
+            let recording = record(seed, Durability::Strict);
+            let files = read_tree(recording.root.path());
+            let wal = newest_uncompacted_wal(&files)?;
+            Some((recording, files, wal))
+        })
+        .expect("a run with an uncompacted WAL entry");
     let all = recording.writes.len();
 
-    let last_wal = files
-        .iter()
-        .filter(|(path, data)| path.ends_with(".wal") && !data.is_empty())
-        .map(|(path, _)| path.clone())
-        .max()
-        .expect("a WAL file with entries");
     let data = files.get_mut(&last_wal).unwrap();
     let keep = data[..data.len() - 1]
         .iter()
