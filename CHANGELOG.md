@@ -26,6 +26,11 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 
 - Crash-image tests in `server/tests/integration_crash.rs`, covering process kills and power loss. See [TESTING.md](TESTING.md#how-we-test-this).
 
+### Fixed
+
+- A transaction's null condition passes on a path with no data on blob-backed databases. It used to fail on any path that had been read or checked, so a `transaction()` on an empty path retried until it gave up.
+- A set to null inside a transaction deletes the value. It used to be skipped, and the transaction was still acknowledged.
+
 ## [0.4.0] — 2026-10-31
 
 ### Upgrading

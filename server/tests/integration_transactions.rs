@@ -8,6 +8,7 @@ use common::{TestServer, compute_jcs_hash, run_test};
 use lark_server::protocol::TransactionOp;
 use serde_json::json;
 use std::time::Duration;
+use tempfile::TempDir;
 
 // =============================================================================
 // Basic Transaction Tests
@@ -731,5 +732,102 @@ fn test_transaction_condition_with_hash_on_null() {
             result.is_err(),
             "Transaction should fail when path exists but null hash expected"
         );
+    });
+}
+
+// =============================================================================
+// Null Conditions on Blob-Backed Databases
+// =============================================================================
+
+fn expect_null(path: &str) -> TransactionOp {
+    TransactionOp {
+        op: "c".to_string(),
+        path: path.to_string(),
+        value: None,
+        hash: None,
+    }
+}
+
+fn set_op(path: &str, value: serde_json::Value) -> TransactionOp {
+    TransactionOp {
+        op: "s".to_string(),
+        path: path.to_string(),
+        value: Some(value),
+        hash: None,
+    }
+}
+
+#[test]
+fn test_null_condition_passes_on_missing_blob_backed_path() {
+    run_test(|| async {
+        let dir = TempDir::new().unwrap();
+        let server = TestServer::with_persistence(dir.path().to_str().unwrap());
+        server
+            .set_rules_with_ephemeral(
+                "test-project",
+                json!({"rules": {".read": true, ".write": true}}),
+                false,
+            )
+            .unwrap();
+        let mut client = server.client();
+        client.connect("test-project/null-condition").await;
+
+        // A read leaves the "loaded, doesn't exist" marker in the tree, and so
+        // does checking the condition itself. Neither counts as a value.
+        assert_eq!(client.once("/counter").await.unwrap(), json!(null));
+        client
+            .transaction(vec![expect_null("/counter"), set_op("/counter", json!(1))])
+            .await
+            .expect("null condition should pass on a missing path");
+        assert_eq!(client.once("/counter").await.unwrap(), json!(1));
+
+        client
+            .transaction(vec![
+                expect_null("/never/read"),
+                set_op("/never/read", json!(2)),
+            ])
+            .await
+            .expect("null condition should pass on a path never read");
+
+        // Control: the condition still fails once the path holds a value.
+        let result = client
+            .transaction(vec![expect_null("/counter"), set_op("/counter", json!(3))])
+            .await;
+        assert!(result.is_err(), "null condition should fail on a value");
+        assert_eq!(client.once("/counter").await.unwrap(), json!(1));
+    });
+}
+
+#[test]
+fn test_set_null_in_transaction_deletes() {
+    run_test(|| async {
+        let server = TestServer::new();
+        let mut client = server.client();
+        client.connect("set-null").await;
+        client.set("/item", json!({"a": 1})).await.unwrap();
+        client.set("/other", json!(1)).await.unwrap();
+        client.subscribe("/item", &["value"]).await.unwrap();
+        glommio::timer::sleep(Duration::from_millis(50)).await;
+        client.clear_events().await;
+
+        // A JSON null reaches the server as a set with no value.
+        client
+            .transaction(vec![
+                TransactionOp {
+                    op: "s".to_string(),
+                    path: "/item".to_string(),
+                    value: None,
+                    hash: None,
+                },
+                set_op("/other", json!(2)),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(client.once("/item").await.unwrap(), json!(null));
+        assert_eq!(client.once("/other").await.unwrap(), json!(2));
+        glommio::timer::sleep(Duration::from_millis(50)).await;
+        let events = client.events().await;
+        assert_eq!(events.len(), 1, "listeners should see the delete");
     });
 }
