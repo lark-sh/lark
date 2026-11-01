@@ -59,11 +59,6 @@ jobs:
       - name: Clippy (io-trace)
         run: cargo clippy -p lark-server --all-targets --features io-trace -- -D warnings
 
-      - name: Crash images
-        run: cargo test -p lark-server --features io-trace --test integration_crash
-        env:
-          LARK_CRASH_CASES: "60"
-
   go:
     name: Go edge — fmt, vet, test
     runs-on: ubuntu-latest

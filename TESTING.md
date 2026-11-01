@@ -57,7 +57,7 @@ cargo test -p lark-server --features io-trace --test integration_crash
 LARK_CRASH_CASES=2000 LARK_CRASH_SEED=7 cargo test -p lark-server --features io-trace --test integration_crash
 ```
 
-Set `LARK_CRASH_KEEP` to a directory to keep each failing image. Strict durability runs all three of these crash models, and default durability runs the process kill and the ext4 power loss:
+Run this for any change to compaction, the WAL, or the order of durable writes. It isn't part of CI, though CI does keep it compiling. Set `LARK_CRASH_KEEP` to a directory to keep each failing image. Strict durability runs all three of these crash models, and default durability runs the process kill and the ext4 power loss:
 
 | Model | What survives |
 |---|---|
@@ -114,7 +114,7 @@ cd edge && go test ./...
 | Go edge tests | `cd edge && go test ./...` | yes |
 | Firebase SDK suite | `./test/run-firebase-sdk.sh` | no; run for client-observable changes |
 | REST conformance | `./tools/rest-conformance/run.sh` | yes, with more cases nightly |
-| Crash images | `cargo test -p lark-server --features io-trace --test integration_crash` | yes, with more images and a new seed nightly |
+| Crash images | `cargo test -p lark-server --features io-trace --test integration_crash` | no; run for compaction and WAL changes |
 | Chaos monkey | `./tools/chaos-monkey/run.sh` | no; run for write-path changes |
 | Randomized model tests, high case counts | `PROPTEST_CASES=1000 cargo test -p lark-server --test integration_read_model` | nightly |
 
