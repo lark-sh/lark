@@ -327,22 +327,31 @@ impl Database {
                         // are Sentinels (not empty Objects). Empty Object intermediates
                         // would lie about being "fully loaded" and cause subsequent
                         // reads to short-circuit promotion, returning partial data.
-                        if blob_backed {
+                        let changed = if blob_backed {
                             self.remove_sentinel_paths_below(&op.path);
-                            self.tree
+                            let changed = self
+                                .tree
                                 .write()
                                 .unwrap()
                                 .set_lazy(&path, processed.clone());
                             self.track_sentinels_after_write(&op.path);
+                            changed
                         } else {
-                            self.tree.write().unwrap().set(&path, processed.clone());
-                        }
+                            self.tree.write().unwrap().set(&path, processed.clone())
+                        };
                         wal_entries.push((
                             op.path.clone(),
                             "set".to_string(),
                             Some(processed.clone()),
                         ));
-                        changes.push((op.path.clone(), "set".to_string(), Some(processed), None));
+                        if self.needs_broadcast(&op.path, changed, false) {
+                            changes.push((
+                                op.path.clone(),
+                                "set".to_string(),
+                                Some(processed),
+                                None,
+                            ));
+                        }
                     }
                 }
                 "u" | "update" => {
@@ -366,8 +375,9 @@ impl Database {
                         // For blob-backed DBs, use update_lazy so the merge writes
                         // through Sentinel intermediates instead of clobbering them
                         // into Objects. Subsequent reads will promote on demand.
-                        if blob_backed {
-                            self.tree
+                        let unchanged = if blob_backed {
+                            let unchanged = self
+                                .tree
                                 .write()
                                 .unwrap()
                                 .update_lazy(&path, &processed_map);
@@ -379,29 +389,37 @@ impl Database {
                                 let leaf_path = format!("{}/{}", base, key);
                                 self.track_sentinels_after_write(&leaf_path);
                             }
+                            unchanged
                         } else {
-                            self.tree.write().unwrap().update(&path, &processed_map);
-                        }
+                            self.tree.write().unwrap().update(&path, &processed_map)
+                        };
                         wal_entries.push((
                             op.path.clone(),
                             "update".to_string(),
                             Some(Value::Object(processed_map.clone())),
                         ));
-                        changes.push((
-                            op.path.clone(),
-                            "update".to_string(),
-                            None,
-                            Some(processed_map),
-                        ));
+                        if let Some(changed) =
+                            self.changed_updates(&op.path, processed_map, unchanged, false)
+                        {
+                            changes.push((
+                                op.path.clone(),
+                                "update".to_string(),
+                                None,
+                                Some(changed),
+                            ));
+                        }
                     }
                 }
                 "d" | "remove" => {
+                    let changed = !self.tree.read().unwrap().holds(&path, None);
                     self.tree.write().unwrap().remove(&path);
                     // Clear sentinel tracking at and below the deleted path —
                     // those nodes are gone (matches handle_remove).
                     self.remove_sentinel_paths_below(&op.path);
                     wal_entries.push((op.path.clone(), "remove".to_string(), None));
-                    changes.push((op.path.clone(), "remove".to_string(), None, None));
+                    if self.needs_broadcast(&op.path, changed, false) {
+                        changes.push((op.path.clone(), "remove".to_string(), None, None));
+                    }
                 }
                 "c" => {
                     // Condition - already checked above
@@ -498,22 +516,26 @@ impl Database {
                                 self.view_manager.clear_volatile_for_path(&action.path);
                             }
                             self.remove_sentinel_paths_below(&action.path);
-                            if self.is_blob_backed() {
-                                self.tree.write().unwrap().set_lazy(&path, value.clone());
+                            let changed = if self.is_blob_backed() {
+                                let changed =
+                                    self.tree.write().unwrap().set_lazy(&path, value.clone());
                                 self.track_sentinels_after_write(&action.path);
+                                changed
                             } else {
-                                self.tree.write().unwrap().set(&path, value.clone());
-                            }
+                                self.tree.write().unwrap().set(&path, value.clone())
+                            };
                             self.wal_write_set(&action.path, &value);
-                            self.broadcast_mutation(
-                                &action.path,
-                                "set",
-                                Some(value),
-                                None,
-                                false,
-                                None,
-                            )
-                            .await;
+                            if self.needs_broadcast(&action.path, changed, false) {
+                                self.broadcast_mutation(
+                                    &action.path,
+                                    "set",
+                                    Some(value),
+                                    None,
+                                    false,
+                                    None,
+                                )
+                                .await;
+                            }
                         }
                     }
                     "update" | "u" => {
@@ -524,26 +546,32 @@ impl Database {
                             // For blob-backed DBs, use update_lazy so the merge writes
                             // through Sentinel intermediates instead of creating empty
                             // Objects that would lie about being fully loaded.
-                            if self.is_blob_backed() {
-                                self.tree.write().unwrap().update_lazy(&path, &updates);
+                            let unchanged = if self.is_blob_backed() {
+                                let unchanged =
+                                    self.tree.write().unwrap().update_lazy(&path, &updates);
                                 let base = action.path.trim_end_matches('/');
                                 for key in updates.keys() {
                                     let leaf_path = format!("{}/{}", base, key);
                                     self.track_sentinels_after_write(&leaf_path);
                                 }
+                                unchanged
                             } else {
-                                self.tree.write().unwrap().update(&path, &updates);
-                            }
+                                self.tree.write().unwrap().update(&path, &updates)
+                            };
                             self.wal_write_update(&action.path, &updates);
-                            self.broadcast_mutation(
-                                &action.path,
-                                "update",
-                                None,
-                                Some(updates),
-                                false,
-                                None,
-                            )
-                            .await;
+                            if let Some(changed) =
+                                self.changed_updates(&action.path, updates, unchanged, false)
+                            {
+                                self.broadcast_mutation(
+                                    &action.path,
+                                    "update",
+                                    None,
+                                    Some(changed),
+                                    false,
+                                    None,
+                                )
+                                .await;
+                            }
                         }
                     }
                     "remove" | "d" => {
@@ -552,11 +580,21 @@ impl Database {
                         if self.is_volatile_path(&action.path) {
                             self.view_manager.clear_volatile_for_path(&action.path);
                         }
+                        let changed = !self.tree.read().unwrap().holds(&path, None);
                         self.tree.write().unwrap().remove(&path);
                         self.remove_sentinel_paths_below(&action.path);
                         self.wal_write_delete(&action.path);
-                        self.broadcast_mutation(&action.path, "remove", None, None, false, None)
+                        if self.needs_broadcast(&action.path, changed, false) {
+                            self.broadcast_mutation(
+                                &action.path,
+                                "remove",
+                                None,
+                                None,
+                                false,
+                                None,
+                            )
                             .await;
+                        }
                     }
                     _ => {}
                 }

@@ -49,7 +49,7 @@ use serde_json::{Map, Value};
 use std::sync::Arc;
 
 use crate::db::database::ConnectionSender;
-use crate::db::path::Path;
+use crate::db::path::{Path, is_below, normalize_path};
 use crate::db::query::{
     Limit, OrderBy, Query, QueryError, QueryParams, SortEntry, apply_query_to_sort_entries,
     is_in_range,

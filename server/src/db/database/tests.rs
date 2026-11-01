@@ -89,6 +89,26 @@ fn test_path_matches_pattern() {
     assert!(!path_matches_pattern("/other/test", "cursors/*")); // Wrong prefix
 }
 
+#[test]
+fn test_path_overlaps_pattern() {
+    // At or below the pattern
+    assert!(path_overlaps_pattern("/cursors/abc", "cursors/*"));
+    assert!(path_overlaps_pattern("/cursors/abc/x", "cursors/*"));
+
+    // Above the pattern
+    assert!(path_overlaps_pattern("/cursors", "cursors/*"));
+    assert!(path_overlaps_pattern("/", "cursors/*"));
+    assert!(path_overlaps_pattern("/players/p1", "players/*/position"));
+
+    // Elsewhere
+    assert!(!path_overlaps_pattern("/other", "cursors/*"));
+    assert!(!path_overlaps_pattern("/other/abc", "cursors/*"));
+    assert!(!path_overlaps_pattern(
+        "/players/p1/name",
+        "players/*/position"
+    ));
+}
+
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     let local_ex = glommio::LocalExecutor::default();
     local_ex.run(f)

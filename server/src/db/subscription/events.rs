@@ -133,6 +133,7 @@ impl ViewManager {
         let shared_views = self.find_affected_shared_views(&event.path, event.volatile);
         shared_views
             .iter()
+            .filter(|v| !update_misses_view(event, &v.path))
             .map(|v| AffectedViewInfo {
                 path: v.path.clone(),
                 query_id: v.query_id.clone(),
@@ -777,4 +778,18 @@ impl ViewManager {
             _ => EventCategory::Change,
         }
     }
+}
+
+/// True if `event` is an update that changes nothing under a view below its path.
+/// Such a view would otherwise be read in full and resent, though none of the
+/// update's keys reach it.
+fn update_misses_view(event: &MutationEvent, view_path: &str) -> bool {
+    let Some(updates) = &event.updates else {
+        return false;
+    };
+    is_below(view_path, &event.path)
+        && !updates.keys().any(|key| {
+            let target = normalize_path(&format!("{}/{}", event.path, key));
+            view_path == target || is_below(view_path, &target) || is_below(&target, view_path)
+        })
 }

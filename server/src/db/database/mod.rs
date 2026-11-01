@@ -51,7 +51,7 @@ use crate::db::firebase_hash::{compute_firebase_hash, is_firebase_hash};
 use crate::db::query::{QueryError, QueryParams};
 use crate::db::subscription::{MutationEvent, SubscribeError, ViewManager};
 use crate::db::value::ArcValueSortExt;
-use crate::db::{ArcValue, Path, Tree};
+use crate::db::{ArcValue, Path, Tree, is_below};
 use crate::protocol::{ClientMessage, MAX_VOLATILE_WRITE_SIZE, ServerMessage, error, op};
 use crate::rules::{
     AuthInfo as RulesAuthInfo, Evaluator, NewData, RuleSet, RulesContext, TreeGetter,
@@ -406,6 +406,15 @@ fn path_matches_pattern(path: &str, pattern: &str) -> bool {
     }
 
     true
+}
+
+/// True if a volatile path pattern applies at `path`, above it or below it: the
+/// two agree on every segment they share.
+fn path_overlaps_pattern(path: &str, pattern: &str) -> bool {
+    let path = path.split('/').filter(|s| !s.is_empty());
+    let pattern = pattern.split('/').filter(|s| !s.is_empty());
+    path.zip(pattern)
+        .all(|(path_seg, pattern_seg)| pattern_seg == "*" || path_seg == pattern_seg)
 }
 
 /// Volatile batch flush interval for high-frequency clients (KCP/WebTransport)

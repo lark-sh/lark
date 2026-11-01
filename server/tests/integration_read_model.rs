@@ -68,6 +68,12 @@ enum Step {
     Delete(Vec<String>),
     /// A transaction that deletes one path and sets another.
     Transaction(Vec<String>, Vec<String>, Value),
+    /// Sends the previous write again, which should change nothing.
+    Repeat,
+    /// Sets a path to the value it already holds.
+    Resave(Vec<String>),
+    /// Merges a path's current children back into it, with one key replaced.
+    ResaveMerge(Vec<String>, Value),
     Read(Vec<String>),
     ReadMissing(Vec<String>),
     Query(Vec<String>, usize),
@@ -106,6 +112,14 @@ fn step(mode: Mode) -> BoxedStrategy<Step> {
             1,
             (path(), path(), value())
                 .prop_map(|(d, s, v)| Step::Transaction(d, s, v))
+                .boxed(),
+        ),
+        (3, Just(Step::Repeat).boxed()),
+        (2, maybe_root().prop_map(Step::Resave).boxed()),
+        (
+            2,
+            (maybe_root(), value())
+                .prop_map(|(p, v)| Step::ResaveMerge(p, v))
                 .boxed(),
         ),
         (4, maybe_root().prop_map(Step::Read).boxed()),
@@ -322,16 +336,15 @@ async fn check_shallow(client: &TestClient, model: &Value, segments: &[String]) 
     }
 }
 
-/// Applies every event the subscriber has been sent to its mirror.
-async fn drain_events(subscriber: &TestClient, mirror: &mut Value) {
+/// Applies every event the subscriber to `view` has been sent to its mirror.
+async fn drain_events(subscriber: &TestClient, view: &str, mirror: &mut Value) {
     glommio::timer::sleep(Duration::from_millis(5)).await;
     let events = subscriber.events().await;
     subscriber.clear_events().await;
-    let root_prefix = format!("/{ROOT}");
     for event in events {
         let path = event.path.as_deref().unwrap_or("/");
         let segments: Vec<String> = path
-            .strip_prefix(root_prefix.as_str())
+            .strip_prefix(view)
             .unwrap_or(path)
             .split('/')
             .filter(|s| !s.is_empty())
@@ -428,6 +441,23 @@ async fn apply_write(client: &TestClient, model: &mut Value, step: &Step) {
             model_write(model, deleted, &Value::Null);
             model_write(model, written, &clean(value));
         }
+        Step::Resave(segments) => {
+            let value = model_read(model, segments);
+            client.set(&wire_path(segments), value).await.unwrap();
+        }
+        Step::ResaveMerge(segments, value) => {
+            let mut updates = match model_read(model, segments) {
+                Value::Object(children) => children,
+                _ => Map::new(),
+            };
+            updates.insert("gamma".to_string(), value.clone());
+            client
+                .update(&wire_path(segments), Value::Object(updates))
+                .await
+                .unwrap();
+            let target = [segments.as_slice(), &["gamma".to_string()]].concat();
+            model_write(model, &target, &clean(value));
+        }
         _ => {}
     }
 }
@@ -466,15 +496,23 @@ async fn run_script(initial: Value, steps: Vec<Step>, mode: Mode) {
     client.connect(&db_id).await;
 
     let mut mirror = Value::Null;
+    let root_view = format!("/{ROOT}");
+    let child_view = format!("/{ROOT}/{}", KEYS[0]);
+    let child_key = [KEYS[0].to_string()];
+    let mut child_mirror = Value::Null;
     let mut subscriber = server.client();
+    let mut child_subscriber = server.client();
     if mode.subscriber {
         subscriber.connect(&db_id).await;
-        subscriber
-            .subscribe(&format!("/{ROOT}"), &["value"])
+        subscriber.subscribe(&root_view, &["value"]).await.unwrap();
+        child_subscriber.connect(&db_id).await;
+        child_subscriber
+            .subscribe(&child_view, &["value"])
             .await
             .unwrap();
     }
 
+    let mut last_write = None;
     for step in &steps {
         match step {
             Step::Evict => client.force_evict_all().await,
@@ -483,6 +521,7 @@ async fn run_script(initial: Value, steps: Vec<Step>, mode: Mode) {
                 // Default durability acks before the WAL sync; let it land first.
                 glommio::timer::sleep(WAL_SYNC_WAIT).await;
                 subscriber.disconnect().await;
+                child_subscriber.disconnect().await;
                 client.disconnect().await;
                 glommio::timer::sleep(Duration::from_millis(50)).await;
                 server.shutdown().await;
@@ -493,16 +532,31 @@ async fn run_script(initial: Value, steps: Vec<Step>, mode: Mode) {
                 client = server.client();
                 client.connect(&db_id).await;
                 subscriber = server.client();
+                child_subscriber = server.client();
                 if mode.subscriber {
                     mirror = Value::Null;
+                    child_mirror = Value::Null;
                     subscriber.connect(&db_id).await;
-                    subscriber
-                        .subscribe(&format!("/{ROOT}"), &["value"])
+                    subscriber.subscribe(&root_view, &["value"]).await.unwrap();
+                    child_subscriber.connect(&db_id).await;
+                    child_subscriber
+                        .subscribe(&child_view, &["value"])
                         .await
                         .unwrap();
                 }
             }
+            Step::Repeat => {
+                if let Some(write) = &last_write {
+                    apply_write(&client, &mut model, write).await;
+                }
+            }
             _ => {
+                if matches!(
+                    step,
+                    Step::Update(..) | Step::Set(..) | Step::Delete(..) | Step::Transaction(..)
+                ) {
+                    last_write = Some(step.clone());
+                }
                 apply_write(&client, &mut model, step).await;
                 check_step(&client, &model, step).await;
             }
@@ -511,8 +565,14 @@ async fn run_script(initial: Value, steps: Vec<Step>, mode: Mode) {
 
     check_read(&client, &model, &[]).await;
     if mode.subscriber {
-        drain_events(&subscriber, &mut mirror).await;
+        drain_events(&subscriber, &root_view, &mut mirror).await;
         assert_eq!(mirror, model, "subscriber mirror");
+        drain_events(&child_subscriber, &child_view, &mut child_mirror).await;
+        assert_eq!(
+            child_mirror,
+            model_read(&model, &child_key),
+            "child subscriber mirror"
+        );
     }
 }
 

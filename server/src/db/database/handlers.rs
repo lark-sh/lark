@@ -222,29 +222,32 @@ impl Database {
 
         // Set the value in tree. For blob-backed DBs, use set_lazy so
         // intermediate nodes are Sentinels (no eager loading needed for SET).
-        if self.is_blob_backed() {
+        let changed = if self.is_blob_backed() {
             // Clear stale descendant sentinel entries — set_lazy replaces the subtree
             self.remove_sentinel_paths_below(path_str);
-            self.tree.write().unwrap().set_lazy(&path, value.clone());
+            let changed = self.tree.write().unwrap().set_lazy(&path, value.clone());
             self.track_sentinels_after_write(path_str);
+            changed
         } else {
-            self.tree.write().unwrap().set(&path, value.clone());
-        }
+            self.tree.write().unwrap().set(&path, value.clone())
+        };
 
         // Append to the WAL for durability — buffered in memory here; flushed
         // (and fdatasync'd, if enabled) on the next WAL sync. See sync_wal.
         self.wal_write_set(path_str, &value);
 
         // Broadcast to subscribers via ViewManager
-        self.broadcast_mutation(
-            path_str,
-            "set",
-            Some(value),
-            None,
-            is_volatile,
-            Some(client_id),
-        )
-        .await;
+        if self.needs_broadcast(path_str, changed, is_volatile) {
+            self.broadcast_mutation(
+                path_str,
+                "set",
+                Some(value),
+                None,
+                is_volatile,
+                Some(client_id),
+            )
+            .await;
+        }
 
         // Record for deduplication (skip volatile writes - they don't need deduplication)
         if !is_volatile {
@@ -445,8 +448,8 @@ impl Database {
         //
         // Mirrors the pattern in `handle_set` and `handle_transaction`'s UPDATE
         // arm.
-        if self.is_blob_backed() {
-            self.tree.write().unwrap().update_lazy(&path, &updates);
+        let unchanged = if self.is_blob_backed() {
+            let unchanged = self.tree.write().unwrap().update_lazy(&path, &updates);
             // Track Sentinel intermediates created by each leaf write —
             // `track_sentinels_after_write` walks ancestors of its argument,
             // so passing each leaf path catches the update-path itself
@@ -456,9 +459,10 @@ impl Database {
                 let leaf_path = format!("{}/{}", base, key);
                 self.track_sentinels_after_write(&leaf_path);
             }
+            unchanged
         } else {
-            self.tree.write().unwrap().update(&path, &updates);
-        }
+            self.tree.write().unwrap().update(&path, &updates)
+        };
 
         // Append to the WAL for durability (non-volatile writes only) — buffered
         // in memory here; flushed on the next WAL sync. See sync_wal.
@@ -466,16 +470,18 @@ impl Database {
             self.wal_write_update(path_str, &updates);
         }
 
-        // Broadcast to subscribers
-        self.broadcast_mutation(
-            path_str,
-            "update",
-            None,
-            Some(updates),
-            volatile,
-            Some(client_id),
-        )
-        .await;
+        // Broadcast the keys that changed to subscribers
+        if let Some(changed) = self.changed_updates(path_str, updates, unchanged, volatile) {
+            self.broadcast_mutation(
+                path_str,
+                "update",
+                None,
+                Some(changed),
+                volatile,
+                Some(client_id),
+            )
+            .await;
+        }
 
         // Record for deduplication (skip volatile writes)
         if !volatile {
@@ -557,6 +563,7 @@ impl Database {
         }
 
         // Remove the value from tree (no need to pre-load from blob for delete)
+        let changed = !self.tree.read().unwrap().holds(&path, None);
         self.tree.write().unwrap().remove(&path);
         // Clear sentinel tracking at and below the deleted path — those nodes are gone
         self.remove_sentinel_paths_below(path_str);
@@ -568,8 +575,10 @@ impl Database {
         }
 
         // Broadcast deletion to subscribers
-        self.broadcast_mutation(path_str, "remove", None, None, volatile, Some(client_id))
-            .await;
+        if self.needs_broadcast(path_str, changed, volatile) {
+            self.broadcast_mutation(path_str, "remove", None, None, volatile, Some(client_id))
+                .await;
+        }
 
         // Record for deduplication (skip volatile writes)
         if !volatile {

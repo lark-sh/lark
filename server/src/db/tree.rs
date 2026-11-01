@@ -75,30 +75,42 @@ impl Tree {
         self.get_value(&Path::parse(path))
     }
 
+    /// True if `path` already holds exactly `value`, where `None` means no data.
+    /// Key order doesn't matter, since objects are maps. Only data in memory
+    /// counts: a Sentinel at or below `path` never compares equal, so anything not
+    /// loaded reads as different and nothing is fetched to find out.
+    pub fn holds(&self, path: &Path, value: Option<&ArcValue>) -> bool {
+        match (self.get(path), value) {
+            (Some(current), Some(value)) => current == value,
+            (Some(current), None) => current.is_empty_container(),
+            (None, Some(_)) => false,
+            // Missing below a Sentinel could still be in the blob.
+            (None, None) => self.has_loaded_ancestor(path),
+        }
+    }
+
     /// Set a value at the given path, creating intermediate nodes as needed.
     /// Values are cleaned before storage: null, {}, and [] are treated as deletions.
-    /// Returns true if a value was set, false if it was deleted/cleaned away.
+    /// Returns false if the path already held this value (see `holds`).
     pub fn set(&mut self, path: &Path, value: Value) -> bool {
         // Clean the value first
-        let cleaned = match ArcValue::from_value_cleaned(value) {
-            Some(v) => v,
-            None => {
-                // Cleaned to nothing = deletion
-                self.remove(path);
-                return false;
+        let cleaned = ArcValue::from_value_cleaned(value);
+        let changed = !self.holds(path, cleaned.as_ref());
+
+        match cleaned {
+            Some(cleaned) if path.is_root() => self.root = cleaned,
+            Some(cleaned) => {
+                // Use mut set_path for in-place mutation when refcount == 1
+                let segments = path.segments();
+                let refs: Vec<&str> = segments.iter().map(|s| s.as_ref()).collect();
+                self.root.set_path_mut(&refs, cleaned);
             }
-        };
-
-        if path.is_root() {
-            self.root = cleaned;
-            return true;
+            // Cleaned to nothing = deletion
+            None => {
+                self.remove(path);
+            }
         }
-
-        // Use mut set_path for in-place mutation when refcount == 1
-        let segments = path.segments();
-        let refs: Vec<&str> = segments.iter().map(|s| s.as_ref()).collect();
-        self.root.set_path_mut(&refs, cleaned);
-        true
+        changed
     }
 
     /// Set an already-cleaned ArcValue at the given path.
@@ -123,24 +135,23 @@ impl Tree {
 
     /// Set a value at the given path, creating Sentinel intermediates instead of Object.
     /// Used for blob-backed databases where we don't want to eagerly create real nodes.
+    /// Returns false if the path already held this value (see `holds`).
     pub fn set_lazy(&mut self, path: &Path, value: Value) -> bool {
-        let cleaned = match ArcValue::from_value_cleaned(value) {
-            Some(v) => v,
+        let cleaned = ArcValue::from_value_cleaned(value);
+        let changed = !self.holds(path, cleaned.as_ref());
+
+        match cleaned {
+            Some(cleaned) if path.is_root() => self.root = cleaned,
+            Some(cleaned) => {
+                let segments = path.segments();
+                let refs: Vec<&str> = segments.iter().map(|s| s.as_ref()).collect();
+                self.root.set_path_mut_sentinel(&refs, cleaned);
+            }
             None => {
                 self.remove(path);
-                return false;
             }
-        };
-
-        if path.is_root() {
-            self.root = cleaned;
-            return true;
         }
-
-        let segments = path.segments();
-        let refs: Vec<&str> = segments.iter().map(|s| s.as_ref()).collect();
-        self.root.set_path_mut_sentinel(&refs, cleaned);
-        true
+        changed
     }
 
     /// Set an already-cleaned ArcValue at the given path using Sentinel intermediates.
@@ -159,15 +170,22 @@ impl Tree {
     /// Update performs a partial update at the given path.
     /// Only updates specified keys, leaves others untouched.
     /// Keys containing "/" are treated as relative paths.
-    pub fn update(&mut self, path: &Path, updates: &serde_json::Map<String, Value>) {
+    /// Returns the keys that already held their value (see `holds`). Each key is
+    /// compared just before it's applied, so keys that overlap see each other.
+    pub fn update(&mut self, path: &Path, updates: &serde_json::Map<String, Value>) -> Vec<String> {
+        let mut unchanged = Vec::new();
         for (key, value) in updates {
             // Build the full path for this update
             // Keys may contain "/" and are treated as relative paths
             let update_path = path.join(key);
+            let cleaned = ArcValue::from_value_cleaned(value.clone());
+            if self.holds(&update_path, cleaned.as_ref()) {
+                unchanged.push(key.clone());
+            }
 
-            // Clean and set/remove the value
+            // Set/remove the value
             // Use set_arc_uncleaned since from_value_cleaned already cleans
-            match ArcValue::from_value_cleaned(value.clone()) {
+            match cleaned {
                 Some(cleaned) => {
                     self.set_arc_uncleaned(&update_path, cleaned);
                 }
@@ -176,10 +194,15 @@ impl Tree {
                 }
             }
         }
+        unchanged
     }
 
     /// Update at the given path string.
-    pub fn update_str(&mut self, path: &str, updates: &serde_json::Map<String, Value>) {
+    pub fn update_str(
+        &mut self,
+        path: &str,
+        updates: &serde_json::Map<String, Value>,
+    ) -> Vec<String> {
         self.update(&Path::parse(path), updates)
     }
 
@@ -187,10 +210,20 @@ impl Tree {
     /// Each updated key is set via `set_arc_uncleaned_lazy`, so intermediates that
     /// don't yet exist become Sentinels rather than empty Objects — preserving the
     /// "needs promotion" signal so subsequent reads correctly load blob data.
-    pub fn update_lazy(&mut self, path: &Path, updates: &serde_json::Map<String, Value>) {
+    /// Returns the keys that already held their value, as `update` does.
+    pub fn update_lazy(
+        &mut self,
+        path: &Path,
+        updates: &serde_json::Map<String, Value>,
+    ) -> Vec<String> {
+        let mut unchanged = Vec::new();
         for (key, value) in updates {
             let update_path = path.join(key);
-            match ArcValue::from_value_cleaned(value.clone()) {
+            let cleaned = ArcValue::from_value_cleaned(value.clone());
+            if self.holds(&update_path, cleaned.as_ref()) {
+                unchanged.push(key.clone());
+            }
+            match cleaned {
                 Some(cleaned) => {
                     self.set_arc_uncleaned_lazy(&update_path, cleaned);
                 }
@@ -199,6 +232,7 @@ impl Tree {
                 }
             }
         }
+        unchanged
     }
 
     /// Remove the node at the given path.
@@ -1018,11 +1052,85 @@ mod tests {
         assert_eq!(tree.get_value_str("/key"), Some(json!("value")));
 
         // Setting null should remove via the remove path
-        let result = tree.set_lazy(&Path::parse("/key"), Value::Null);
-        assert!(!result); // returns false for null/empty
+        let changed = tree.set_lazy(&Path::parse("/key"), Value::Null);
+        assert!(changed);
 
         // Value should be gone
         assert!(tree.get(&Path::parse("/key")).is_none());
+    }
+
+    #[test]
+    fn test_set_reports_whether_it_changed_anything() {
+        let mut tree = Tree::new();
+        let path = Path::parse("/a");
+
+        assert!(tree.set(&path, json!({"x": 1, "y": {"z": 2}})));
+        assert!(!tree.set(&path, json!({"y": {"z": 2}, "x": 1})));
+        assert!(tree.set(&path, json!({"x": 1, "y": {"z": 3}})));
+
+        // Nulls and empty objects are dropped before comparing.
+        assert!(!tree.set(&path, json!({"x": 1, "y": {"z": 3}, "w": null, "v": {}})));
+
+        assert!(tree.set(&path, Value::Null));
+        assert!(!tree.set(&path, Value::Null));
+        assert!(!tree.set(&Path::parse("/never/written"), Value::Null));
+    }
+
+    #[test]
+    fn test_arrays_compare_with_their_stored_form() {
+        let mut tree = Tree::new();
+        let path = Path::parse("/a");
+
+        tree.set(&path, json!(["x", "y"]));
+        assert!(!tree.set(&path, json!({"0": "x", "1": "y"})));
+        assert!(!tree.set(&path, json!(["x", "y"])));
+        assert!(tree.set(&path, json!(["x", "z"])));
+    }
+
+    #[test]
+    fn test_unloaded_data_never_counts_as_unchanged() {
+        let mut tree = Tree::new_sentinel();
+        let path = Path::parse("/a");
+
+        // Nothing here is loaded, so these could all change what's in the blob.
+        assert!(tree.set_lazy(&path, Value::Null));
+        assert!(!tree.holds(&Path::parse("/b"), None));
+
+        // A loaded Object with an unloaded child can't match any stored value.
+        tree.set_lazy(&path, json!({"x": 1}));
+        tree.set_arc_uncleaned_lazy(&Path::parse("/a/y"), ArcValue::empty_sentinel());
+        assert!(tree.set_lazy(&path, json!({"x": 1})));
+        tree.set_arc_uncleaned_lazy(&Path::parse("/a/y"), ArcValue::empty_sentinel());
+        assert!(tree.set_lazy(&path, json!({"x": 1, "y": 2})));
+
+        // What was written stays in memory, so the same write again is unchanged.
+        assert!(!tree.set_lazy(&path, json!({"x": 1, "y": 2})));
+    }
+
+    #[test]
+    fn test_update_returns_unchanged_keys() {
+        let mut tree = Tree::new();
+        let path = Path::parse("/a");
+        tree.set(&path, json!({"x": 1, "y": {"z": 2}}));
+
+        let updates = json!({"x": 1, "y/z": 2, "w": 3, "v": null});
+        let unchanged = tree.update(&path, updates.as_object().unwrap());
+        assert_eq!(unchanged, ["v", "x", "y/z"]);
+
+        let unchanged = tree.update_lazy(&path, updates.as_object().unwrap());
+        assert_eq!(unchanged, ["v", "w", "x", "y/z"]);
+    }
+
+    #[test]
+    fn test_update_compares_each_key_after_the_ones_before_it() {
+        let mut tree = Tree::new();
+        let path = Path::parse("/a");
+        tree.set(&path, json!({"x": {"y": 1}}));
+
+        // "x" replaces the object, so "x/y" changes it back and isn't unchanged.
+        let updates = json!({"x": {"y": 2}, "x/y": 1});
+        assert!(tree.update(&path, updates.as_object().unwrap()).is_empty());
+        assert_eq!(tree.get_value_str("/a/x/y"), Some(json!(1)));
     }
 
     #[test]

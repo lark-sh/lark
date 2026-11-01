@@ -150,6 +150,43 @@ impl Database {
     // Event Broadcasting
     // =========================================================================
 
+    /// True if listeners need to hear about a write at `path`. A write that left
+    /// the data as it was has nothing to tell them, which saves the whole fan-out.
+    /// A write only counts as unchanged against data already in memory (see
+    /// `Tree::holds`), so unloaded data is sent rather than read back to compare.
+    ///
+    /// Volatile data is always sent, because the tree doesn't show what listeners
+    /// hold there. Volatile writes can be lost in transit, and volatile SETs reach
+    /// listeners without touching the tree at all: clearing a cursor on disconnect
+    /// looks like deleting nothing.
+    pub(super) fn needs_broadcast(&self, path: &str, changed: bool, volatile: bool) -> bool {
+        changed
+            || volatile
+            || self
+                .volatile_paths
+                .iter()
+                .any(|pattern| path_overlaps_pattern(path, pattern))
+    }
+
+    /// Removes the `unchanged` keys from an update, leaving what listeners need
+    /// to hear. Keys are compared whole, so one that differs anywhere inside is
+    /// sent in full. Returns None if nothing is left to send.
+    pub(super) fn changed_updates(
+        &self,
+        path: &str,
+        mut updates: serde_json::Map<String, Value>,
+        unchanged: Vec<String>,
+        volatile: bool,
+    ) -> Option<serde_json::Map<String, Value>> {
+        if unchanged.is_empty() || self.needs_broadcast(path, false, volatile) {
+            return Some(updates);
+        }
+        for key in &unchanged {
+            updates.remove(key);
+        }
+        (!updates.is_empty()).then_some(updates)
+    }
+
     /// Broadcast a mutation to all affected views.
     pub(super) async fn broadcast_mutation(
         &mut self,
@@ -362,15 +399,5 @@ impl Database {
         if bytes_sent > 0 {
             self.metrics.record_volatile_outbound_bytes(bytes_sent);
         }
-    }
-}
-
-/// True if `path` is a strict descendant of `ancestor`. Both must be normalized.
-pub(super) fn is_below(path: &str, ancestor: &str) -> bool {
-    match ancestor {
-        "/" => path != "/",
-        _ => path
-            .strip_prefix(ancestor)
-            .is_some_and(|rest| rest.starts_with('/')),
     }
 }
