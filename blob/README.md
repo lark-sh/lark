@@ -146,16 +146,18 @@ All unique structural field names across the database, stored once. Collection k
 
 Note: OSON's approach uses "partial dictionary rebuilding by tracking dictionary codes that have been actually changed due to insertion of new distinct field names and then only patching those changed dictionary codes." We avoid this complexity by appending new fields unsorted, which is simpler and avoids patching a potentially GB-sized blob.
 
-### Sidecar (free list + pending keys)
+### Sidecar (free list + pending keys + pending flush)
 
-Every blob has a small companion file (`sidecar.lark` on disk) that carries state the blob itself can't represent cheaply: the **free list** of reusable byte regions, and any **pending dictionary keys** written inline since the last root re-compaction.
+Every blob has a small companion file (`sidecar.lark` on disk) that carries state the blob itself can't represent cheaply: the **free list** of reusable byte regions, any **pending dictionary keys** written inline since the last root re-compaction, and, only while a batch is flushing, that batch's **in-place writes**.
 
-**On-disk format (v7):**
+**On-disk format (v8):**
 
 ```
 +---------------------------------------------+
 | magic "LRKF" (4 bytes)                      |
-| version: u32 = 7                            |
+| version: u32 = 8                            |
+| sequence: i64       (WAL sequence described)|
+| main_len: u64       (this section's length) |
 | region_count: u64                           |
 | bytes_freed: u64    (lifetime, monotonic)   |
 | bytes_reused: u64   (lifetime, monotonic)   |
@@ -169,9 +171,22 @@ Every blob has a small companion file (`sidecar.lark` on disk) that carries stat
 |   pending_key_count: u32                    |
 |   (key_len: u16, key_bytes: [u8]) × count   |
 +---------------------------------------------+
+| checksum: u64       (xxh64 of this section) |
++---------------------------------------------+
+
+While a batch is flushing, a second section follows:
+
++---------------------------------------------+
+| magic "LRKW" (4 bytes)                      |
+| blob_size: u64                              |
+| flush_count: u32                            |
+| (offset: u64, len: u32, bytes: [u8])        |
+|   × flush_count                             |
+| checksum: u64       (xxh64 of this section) |
++---------------------------------------------+
 ```
 
-Magic + version verify the file matches the format the running binary expects; old versions are rejected outright (v1–v6 → error).
+Magic + version verify the file matches the format the running binary expects. A sidecar from an older version, or one that fails its checksum, is ignored, which only costs the free space it listed until the next full compaction.
 
 **`pending_keys`** are structural field names that were referenced in an incremental write but aren't in the dictionary yet. Rather than rewriting the dictionary on every incremental update (which would touch a fixed region of the blob constantly and force a write-back), the writer stores those keys inline in the affected collection's key-string area, marks them in the sidecar, and the next `root_compact()` drains the pending set into the dictionary as part of the rewrite.
 
@@ -224,7 +239,19 @@ The two-cycle delay matches the worst case for an in-flight reader: they may hav
 
 #### Crash safety
 
-The sidecar is rewritten as a single atomic file alongside each batch of blob writes (`apply_updates_with_sidecar`). If a crash happens between the blob write and the sidecar write, the worst case is that some freed regions look "live" until the next root re-compaction, i.e. the blob keeps a little extra dead space but is still correct. The blob never points at bytes the sidecar doesn't know about, because the blob's parent-index entries are the source of truth for what's live; the sidecar is just an accounting hint for "what's safe to overwrite."
+A batch reaches disk in this order, which is what makes a crash at any point recoverable:
+
+1. New data goes to free or appended space, which nothing references yet. Writes to existing bytes (index entries, container headers, in-place values) stay in memory.
+2. That data is synced.
+3. The sidecar is written and synced, holding the batch's free list and its complete set of in-place writes, stamped with the batch's WAL sequence.
+4. The in-place writes go to the blob, which is synced.
+5. The sidecar is truncated back to its main section, since the blob now has those writes.
+6. The caller commits the batch by writing `sequence`.
+
+Two rules cover a crash before step 6, since the WAL replays the batch either way:
+
+- **A sidecar only counts at its own sequence.** Until `sequence` matches, the blob may still reference regions the sidecar calls free, so `open_with_sidecar` ignores it. That leaks the free space until the next root re-compaction, and never reuses live bytes.
+- **An interrupted flush is finished first.** The in-place writes in step 4 span many pages and a crash can land any of them, so `finish_interrupted_flush` writes the whole set again from the sidecar before anything reads the blob. A flush section that fails its checksum means step 3 never finished, so step 4 never started.
 
 ### Size Overhead
 
@@ -310,18 +337,18 @@ For each WAL entry (SET /characters/-abc123/hp = 42):
 2. Serialize the new value to bytes
 3. Compare new_size vs old_size:
    a) new_size == old_size:
-      -> pwrite() at same offset (length-preserved byte replacement)
+      -> Deferred write at same offset (length-preserved byte replacement)
    b) new_size < old_size:
-      -> pwrite() at same offset, return the unused bytes to the sidecar free list
+      -> Deferred write at same offset, return the unused bytes to the sidecar free list
    c) new_size > old_size:
       -> append() new value at EOF (or reuse a free-list slot of appropriate size)
-      -> pwrite() the parent's index entry with new offset/size and the
+      -> Deferred write of the parent's index entry with new offset/size and the
          TYPE_FLAGS_FORWARDED bit set (the entry now points at the absolute
          file offset of the relocated child)
       -> If the entry was ALREADY forwarded: the old location's bytes go back
          to the free list and the parent's entry is updated to the new location.
          No multi-hop chains — the redirect always lives in the parent's index.
-4. Record last-applied WAL sequence in the sidecar
+4. Deferred writes reach the blob when the batch flushes (see Crash safety)
 ```
 
 **Inserting a new child into a collection (e.g., new chat message):**
@@ -405,7 +432,7 @@ blob/
 |   +-- session_incremental.rs  # in-place updates, free-list reuse, forwarding
 |   +-- incremental.rs      # apply_updates entry point
 |   +-- compact.rs          # full re-compaction (read tree, rewrite clean)
-|   +-- segment.rs          # Sidecar format (free list + pending dict keys)
+|   +-- segment.rs          # Sidecar format (free list, pending dict keys, pending flush)
 |                           #   — historical name; no segments anymore
 |   +-- free_list.rs        # blob's reusable-range tracker (lives in the sidecar)
 |   +-- nav_cache.rs        # in-memory navigation offset cache
@@ -463,9 +490,13 @@ impl<IO: BlobIO> BlobSession<IO> {
     /// Open an existing blob, read header + dictionary.
     pub async fn open(io: IO) -> Result<Self>;
 
-    /// Open with the companion sidecar (free list + pending dictionary keys).
-    pub async fn open_with_sidecar<SIO: BlobIO>(io: IO, sidecar: Option<&SIO>)
-        -> Result<Self>;
+    /// Open with the companion sidecar, if it matches `sequence`, the WAL
+    /// sequence the blob is committed through.
+    pub async fn open_with_sidecar<SIO: BlobIO>(
+        io: IO,
+        sidecar: Option<&SIO>,
+        sequence: i64,
+    ) -> Result<Self>;
 
     /// Initialize a fresh empty blob (Sentinel root).
     pub async fn init(io: IO) -> Result<Self>;
@@ -474,11 +505,13 @@ impl<IO: BlobIO> BlobSession<IO> {
     pub async fn apply_updates(&mut self, updates: &[(Vec<String>, Option<ArcValue>)])
         -> Result<ApplyResult>;
 
-    /// Same, but also persist the updated sidecar at the end.
+    /// Same, but also persist the sidecar, stamped with the WAL sequence this
+    /// batch brings the blob to.
     pub async fn apply_updates_with_sidecar<SIO: BlobIO>(
         &mut self,
         updates: &[(Vec<String>, Option<ArcValue>)],
         sidecar: Option<&SIO>,
+        sequence: i64,
     ) -> Result<ApplyResult>;
 
     /// Full root re-compaction into a fresh BlobIO.

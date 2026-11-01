@@ -19,10 +19,10 @@
 //! `.compacting` marker stays, which keeps the server's storage worker off the
 //! replaced file. Running `lark-compact` again finishes the job.
 
-use lark_blob::BlobSession;
 use lark_blob::io::StdBlobIO;
 use lark_blob::lock_storage;
 use lark_blob::segment::Sidecar;
+use lark_blob::{BlobSession, finish_interrupted_flush};
 
 use std::fs::File;
 use std::io::Write;
@@ -71,6 +71,14 @@ fn sidecar_path(dir: &Path) -> PathBuf {
 fn read_blob_generation(dir: &Path) -> u64 {
     match std::fs::read_to_string(dir.join("blob.generation")) {
         Ok(s) => s.trim().parse::<u64>().unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
+/// The WAL sequence the blob is committed through.
+fn read_sequence(dir: &Path) -> i64 {
+    match std::fs::read_to_string(dir.join("sequence")) {
+        Ok(s) => s.trim().parse::<i64>().unwrap_or(0),
         Err(_) => 0,
     }
 }
@@ -151,6 +159,7 @@ fn compact_database_inner(db_dir: &Path) -> Result<Option<CompactResult>, Compac
 
     let start = Instant::now();
     let current_gen = read_blob_generation(db_dir);
+    let sequence = read_sequence(db_dir);
 
     // Open BlobSession with sidecar.
     let blob_io =
@@ -163,8 +172,18 @@ fn compact_database_inner(db_dir: &Path) -> Result<Option<CompactResult>, Compac
         None
     };
 
-    let mut session = block_on(BlobSession::open_with_sidecar(blob_io, sidecar_io.as_ref()))
-        .map_err(|e| format!("failed to open BlobSession: {}", e))?;
+    // This may be the first thing to touch the blob after a crash.
+    if let Some(sidecar_io) = &sidecar_io {
+        block_on(finish_interrupted_flush(&blob_io, sidecar_io, sequence))
+            .map_err(|e| format!("failed to finish interrupted batch: {}", e))?;
+    }
+
+    let mut session = block_on(BlobSession::open_with_sidecar(
+        blob_io,
+        sidecar_io.as_ref(),
+        sequence,
+    ))
+    .map_err(|e| format!("failed to open BlobSession: {}", e))?;
 
     // Root compaction (defrags blob, absorbs pending dictionary keys)
     // into a temporary file we can atomically swap into place.
@@ -183,7 +202,7 @@ fn compact_database_inner(db_dir: &Path) -> Result<Option<CompactResult>, Compac
         Some(io) => io,
         None => StdBlobIO::create(&sp).map_err(|e| format!("failed to create sidecar: {}", e))?,
     };
-    block_on(session.apply_updates_with_sidecar(&[], Some(&sidecar_write_io)))
+    block_on(session.apply_updates_with_sidecar(&[], Some(&sidecar_write_io), sequence))
         .map_err(|e| format!("failed to write sidecar: {}", e))?;
 
     // The new blob has to be on disk before it replaces the old one, or a power

@@ -353,7 +353,11 @@ impl<IO: BlobIO> BlobSession<IO> {
                 let old_is_container =
                     old_type_tag == TYPE_COLLECTION || old_type_tag == TYPE_ARRAY;
                 if new_size <= old_size && !old_is_container {
-                    self.io.pwrite(child_abs_offset, &new_bytes).await?;
+                    // This overwrites a live value, so it waits for the batch's
+                    // flush like every other change to existing bytes.
+                    self.io
+                        .pwrite_deferred(child_abs_offset, &new_bytes)
+                        .await?;
 
                     let new_type_tag = new_bytes[0];
                     if new_type_tag != old_type_tag || new_size != old_size {
@@ -367,7 +371,7 @@ impl<IO: BlobIO> BlobSession<IO> {
                         self.io.pread_into(offset_pos, &mut offset_buf).await?;
                         entry_buf[1..9].copy_from_slice(&offset_buf);
                         entry_buf[9..17].copy_from_slice(&new_size.to_le_bytes());
-                        self.io.pwrite(type_flags_pos, &entry_buf).await?;
+                        self.io.pwrite_deferred(type_flags_pos, &entry_buf).await?;
                     }
 
                     stats.in_place_updates += 1;
@@ -417,7 +421,9 @@ impl<IO: BlobIO> BlobSession<IO> {
                     key = target_key,
                     "collection child deleted (TYPE_NULL overwrite)"
                 );
-                self.io.pwrite(child_abs_offset, &[TYPE_NULL]).await?;
+                self.io
+                    .pwrite_deferred(child_abs_offset, &[TYPE_NULL])
+                    .await?;
                 let type_flags_pos = index_entry_abs_pos + 8;
                 let null_flags = make_type_flags(TYPE_NULL, false);
                 // Write type_flags + offset (unchanged) + size=0 to mark as tombstone

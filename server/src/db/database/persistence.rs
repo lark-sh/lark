@@ -82,6 +82,12 @@ impl Database {
                 .await
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
             lark_blob::BlobIO::sync(session.io()).await?;
+            // The blob's name, and the new directories above it.
+            for dir in data_dir.ancestors().take(3) {
+                if !dir.as_os_str().is_empty() {
+                    crate::storage::sync_dir_async(dir).await?;
+                }
+            }
 
             self.blob_session = Some(session);
             self.blob_generation = 0;
@@ -93,6 +99,8 @@ impl Database {
             // Continue to WAL replay below
             return self.load_wal_entries().await;
         }
+
+        self.finish_interrupted_flush(&data_dir, &bp).await?;
 
         let blob_gen = read_blob_generation(&data_dir);
 
@@ -120,6 +128,38 @@ impl Database {
         );
 
         self.load_wal_entries().await
+    }
+
+    /// Completes any batch a crash interrupted before this blob is read.
+    async fn finish_interrupted_flush(
+        &self,
+        data_dir: &std::path::Path,
+        blob_path: &std::path::Path,
+    ) -> std::io::Result<()> {
+        let sidecar = sidecar_path(data_dir);
+        if crate::storage::file_size_async(&sidecar).await == 0 {
+            return Ok(());
+        }
+        // If a storage worker or lark-compact holds this, it's working on the
+        // blob right now, so there's no interrupted batch to finish.
+        let Some(_lock) = lark_blob::try_lock_storage(data_dir)? else {
+            return Ok(());
+        };
+        let sequence = Self::read_sequence_file(data_dir).await;
+        let blob = GlommioBlobIO::open(blob_path).await?;
+        let sidecar = GlommioBlobIO::open(&sidecar).await?;
+        let finished = lark_blob::finish_interrupted_flush(&blob, &sidecar, sequence)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        if finished {
+            warn!(
+                "[Persistence] {}: Finished a compaction batch that a crash interrupted",
+                self.id
+            );
+        }
+        lark_blob::BlobIO::close(blob).await?;
+        lark_blob::BlobIO::close(sidecar).await?;
+        Ok(())
     }
 
     /// Load uncompacted WAL entries from disk into pending_wal_entries.

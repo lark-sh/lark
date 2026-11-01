@@ -10,7 +10,7 @@ use crate::format::{BlobHeader, FieldIdSize, HEADER_SIZE, VERSION};
 use crate::free_list::FreeList;
 use crate::incremental::IncrementalStats;
 use crate::io::BlobIO;
-use crate::segment::Sidecar;
+use crate::segment::{PendingFlush, Sidecar};
 use std::collections::HashSet;
 use tracing::debug;
 
@@ -65,19 +65,71 @@ pub struct BlobSession<IO: BlobIO> {
     pub(crate) pending_keys: HashSet<String>,
 }
 
+/// Completes a batch's in-place writes if a crash interrupted them, and returns
+/// whether it did. Call this before reading a blob that may have crashed, passing
+/// the WAL sequence it's committed through.
+///
+/// Those writes span many pages and any of them can land, which would leave
+/// collection indexes mixing old and new entries that WAL replay can't repair. A
+/// sidecar still holding them has their complete set, written and synced before
+/// the first of them. Writing them all again leaves the blob with the whole batch,
+/// and WAL replay then applies it over that as usual.
+///
+/// A blob too short for those writes can't come from a crash, so it's an error.
+pub async fn finish_interrupted_flush<IO: BlobIO, SIO: BlobIO>(
+    blob: &IO,
+    sidecar: &SIO,
+    sequence: i64,
+) -> Result<bool> {
+    let size = sidecar.size().await? as usize;
+    if size == 0 {
+        return Ok(false);
+    }
+    let data = sidecar.pread(0, size).await.map_err(BlobError::Io)?;
+    let Ok(record) = Sidecar::from_bytes(&data) else {
+        return Ok(false);
+    };
+    if record.sequence <= sequence || record.flush.regions.is_empty() {
+        return Ok(false);
+    }
+    let blob_size = blob.size().await?;
+    if blob_size < record.flush.blob_size {
+        return Err(BlobError::InternalError(format!(
+            "blob is {} bytes, but its interrupted flush needs {}",
+            blob_size, record.flush.blob_size
+        )));
+    }
+
+    for (offset, bytes) in &record.flush.regions {
+        blob.pwrite(*offset, bytes).await.map_err(BlobError::Io)?;
+    }
+    blob.sync().await.map_err(BlobError::Io)?;
+
+    // Done with: writing these again later could undo newer writes.
+    sidecar.truncate(0).await.map_err(BlobError::Io)?;
+    sidecar.sync().await.map_err(BlobError::Io)?;
+    Ok(true)
+}
+
 impl<IO: BlobIO> BlobSession<IO> {
     /// Open an existing blob — reads and caches header and dictionary.
     /// Free list starts empty. Use `open_with_sidecar` to restore it.
     pub async fn open(io: IO) -> Result<Self> {
-        Self::open_with_sidecar::<IO>(io, None::<&IO>).await
+        Self::open_with_sidecar::<IO>(io, None::<&IO>, 0).await
     }
 
     /// Open an existing blob, restoring the free list from a sidecar IO.
     ///
     /// The sidecar IO should point to the free list file (e.g., `sidecar.lark`
-    /// alongside the blob file). If the sidecar doesn't exist or is empty,
-    /// pass `None` — the free list starts empty.
-    pub async fn open_with_sidecar<SIO: BlobIO>(io: IO, sidecar: Option<&SIO>) -> Result<Self> {
+    /// alongside the blob file), and `sequence` is the WAL sequence the blob is
+    /// committed through. A sidecar for any other sequence, or a damaged one, is
+    /// ignored and the free list starts empty, which only leaks that free space
+    /// until the next full compaction. See [`crate::segment`].
+    pub async fn open_with_sidecar<SIO: BlobIO>(
+        io: IO,
+        sidecar: Option<&SIO>,
+        sequence: i64,
+    ) -> Result<Self> {
         let header = crate::session_reader::read_header(&io).await?;
         let field_id_size = header.field_id_size()?;
         let dict = crate::session_reader::read_dictionary(&io, &header).await?;
@@ -88,11 +140,11 @@ impl<IO: BlobIO> BlobSession<IO> {
                 if size > 0 {
                     let data = sio.pread(0, size).await.map_err(BlobError::Io)?;
                     match Sidecar::from_bytes(&data) {
-                        Ok(sc) => {
+                        Ok(sc) if sc.sequence == sequence => {
                             let pk: HashSet<String> = sc.pending_keys.into_iter().collect();
                             (sc.free_list, pk)
                         }
-                        Err(_) => (FreeList::new(), HashSet::new()),
+                        _ => (FreeList::new(), HashSet::new()),
                     }
                 } else {
                     (FreeList::new(), HashSet::new())
@@ -138,19 +190,23 @@ impl<IO: BlobIO> BlobSession<IO> {
         &mut self,
         updates: &[(Vec<String>, Option<ArcValue>)],
     ) -> Result<ApplyResult> {
-        self.apply_updates_with_sidecar::<IO>(updates, None::<&IO>)
+        self.apply_updates_with_sidecar::<IO>(updates, None::<&IO>, 0)
             .await
     }
 
     /// Apply a batch of WAL updates with sidecar persistence.
     ///
     /// If `sidecar` is provided, the free list is written and synced to it
-    /// BEFORE the blob is synced. This ensures crash safety: on recovery,
-    /// the worst case is losing some freed regions (leak, not corruption).
+    /// BEFORE the blob is synced, stamped with `sequence`, the WAL sequence this
+    /// batch brings the blob to. Reopening only trusts it once that sequence has
+    /// committed, so a crash in between leaks free space rather than reusing
+    /// regions the blob still references. It also holds the batch's in-place writes
+    /// until they've finished; see [`finish_interrupted_flush`].
     pub async fn apply_updates_with_sidecar<SIO: BlobIO>(
         &mut self,
         updates: &[(Vec<String>, Option<ArcValue>)],
         sidecar: Option<&SIO>,
+        sequence: i64,
     ) -> Result<ApplyResult> {
         let mut stats = IncrementalStats::default();
 
@@ -218,10 +274,19 @@ impl<IO: BlobIO> BlobSession<IO> {
             return Err(e);
         }
 
-        // Persist free list to sidecar BEFORE flushing the write-back cache.
+        // Persist the sidecar BEFORE flushing the write-back cache. The batch's new
+        // data is synced first, so the recorded writes never point at missing bytes.
+        let mut main_len = None;
         if let Some(sio) = sidecar {
+            let regions = self.io.prepare_write_back().await.map_err(BlobError::Io)?;
+            let flush = PendingFlush {
+                blob_size: self.io.size().await?,
+                regions,
+            };
             let pending: Vec<String> = self.pending_keys.iter().cloned().collect();
-            let bytes = Sidecar::serialize(&self.free_list, &pending);
+            let mut bytes = Sidecar::serialize(&self.free_list, &pending, sequence);
+            main_len = Some(bytes.len() as u64);
+            bytes.extend_from_slice(&flush.to_bytes());
             sio.truncate(0).await.map_err(BlobError::Io)?;
             sio.append(&bytes).await.map_err(BlobError::Io)?;
             sio.sync().await.map_err(BlobError::Io)?;
@@ -229,6 +294,12 @@ impl<IO: BlobIO> BlobSession<IO> {
 
         // Flush deferred write-back regions to disk.
         self.io.flush_write_back().await.map_err(BlobError::Io)?;
+
+        // Those writes are on disk now, so the sidecar can drop its copy. This needs
+        // no sync: if a crash brings the copy back, it writes the same bytes.
+        if let (Some(sio), Some(main_len)) = (sidecar, main_len) {
+            sio.truncate(main_len).await.map_err(BlobError::Io)?;
+        }
 
         // Update header total_size on disk and in cache
         let total_size = self.io.size().await?;
@@ -606,9 +677,206 @@ impl<IO: BlobIO> BlobSession<IO> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cached_io::CachedIO;
     use crate::io::MemBlobIO;
     use crate::writer::write_blob;
     use serde_json::json;
+
+    type Updates = Vec<(Vec<String>, Option<ArcValue>)>;
+
+    fn set(path: &[&str], value: serde_json::Value) -> (Vec<String>, Option<ArcValue>) {
+        let path = path.iter().map(|s| s.to_string()).collect();
+        (path, Some(ArcValue::from_value(value)))
+    }
+
+    /// A sidecar is written before its batch commits, and until then the blob may
+    /// still use the regions it lists as free.
+    #[test]
+    fn test_sidecar_is_only_trusted_at_its_own_sequence() {
+        block_on(async {
+            let raw = MemBlobIO::new();
+            let root = ArcValue::from_value(json!({ "a": "x" }));
+            write_blob(&raw, &root).await.unwrap();
+            let sidecar = MemBlobIO::new();
+
+            let mut session =
+                BlobSession::open_with_sidecar(CachedIO::new(raw.clone()), Some(&sidecar), 0)
+                    .await
+                    .unwrap();
+            let big = |size: usize| vec![set(&["a"], json!("v".repeat(size)))];
+            for (sequence, size) in [(1, 5000), (2, 6000), (3, 7000)] {
+                session
+                    .apply_updates_with_sidecar(&big(size), Some(&sidecar), sequence)
+                    .await
+                    .unwrap();
+            }
+            assert!(session.free_list.all_regions().len() >= 2);
+
+            let open_at = |sequence| {
+                let (raw, sidecar) = (raw.clone(), sidecar.clone());
+                async move {
+                    BlobSession::open_with_sidecar(raw, Some(&sidecar), sequence)
+                        .await
+                        .unwrap()
+                }
+            };
+            assert!(!open_at(3).await.free_list.all_regions().is_empty());
+            assert!(open_at(2).await.free_list.all_regions().is_empty());
+        })
+    }
+
+    /// Runs one in-place insert. Returns the blob before and after, a sidecar as a
+    /// crash during the flush would leave it, the update, and the expected result.
+    async fn in_place_batch() -> (Vec<u8>, Vec<u8>, Vec<u8>, Updates, serde_json::Value) {
+        let items: serde_json::Map<String, serde_json::Value> = (0..600)
+            .map(|i| {
+                (
+                    format!("key{i:04}"),
+                    json!({ "v": format!("value-{i:04}-xxxxxxxx") }),
+                )
+            })
+            .collect();
+        let raw = MemBlobIO::new();
+        write_blob(&raw, &ArcValue::from_value(json!({ "items": items })))
+            .await
+            .unwrap();
+        let sidecar = MemBlobIO::new();
+        let mut session =
+            BlobSession::open_with_sidecar(CachedIO::new(raw.clone()), Some(&sidecar), 0)
+                .await
+                .unwrap();
+
+        // The first insert copies the collection and gives it reserved slots.
+        let seed = vec![set(&["items", "seed"], json!({ "v": "seed" }))];
+        session
+            .apply_updates_with_sidecar(&seed, Some(&sidecar), 1)
+            .await
+            .unwrap();
+        let before = raw.data().to_vec();
+
+        let batch = vec![set(&["items", "new"], json!({ "v": "new" }))];
+        session
+            .apply_updates_with_sidecar(&batch, Some(&sidecar), 2)
+            .await
+            .unwrap();
+        let expected = session.read_subtree(&[]).await.unwrap().to_value();
+        let after = raw.data().to_vec();
+
+        // A finished batch leaves no record, so build the one it wrote.
+        let main = sidecar.data().to_vec();
+        let at_rest = Sidecar::from_bytes(&main).unwrap();
+        assert!(
+            at_rest.flush.regions.is_empty(),
+            "finished flush left a record"
+        );
+        let regions = (0..before.len().div_ceil(4096))
+            .map(|page| (page * 4096, ((page + 1) * 4096).min(before.len())))
+            .filter(|&(start, end)| before[start..end] != after[start..end])
+            .map(|(start, end)| (start as u64, after[start..end].to_vec()))
+            .collect();
+        let flush = PendingFlush {
+            blob_size: after.len() as u64,
+            regions,
+        };
+        let mut during_flush = main;
+        during_flush.extend_from_slice(&flush.to_bytes());
+        (before, after, during_flush, batch, expected)
+    }
+
+    /// An image holding every other page of the batch's in-place changes.
+    fn torn_image(before: &[u8], after: &[u8]) -> Vec<u8> {
+        let mut image = after.to_vec();
+        let dirty = (0..before.len().div_ceil(4096)).filter(|page| {
+            let (start, end) = (page * 4096, ((page + 1) * 4096).min(before.len()));
+            before[start..end] != after[start..end]
+        });
+        for (i, page) in dirty.enumerate() {
+            if i % 2 == 0 {
+                let (start, end) = (page * 4096, ((page + 1) * 4096).min(before.len()));
+                image[start..end].copy_from_slice(&before[start..end]);
+            }
+        }
+        image
+    }
+
+    /// In-place writes that land in pieces are completed from the sidecar, and a
+    /// replay of the batch over the result gives the right data.
+    #[test]
+    fn test_finish_interrupted_flush_repairs_a_torn_collection() {
+        block_on(async {
+            let (before, after, sidecar_bytes, batch, expected) = in_place_batch().await;
+            let image = torn_image(&before, &after);
+            assert_ne!(image, after);
+
+            let raw = MemBlobIO::from_bytes(image);
+            let sidecar = MemBlobIO::from_bytes(sidecar_bytes);
+            assert!(finish_interrupted_flush(&raw, &sidecar, 1).await.unwrap());
+            assert_eq!(sidecar.size().await.unwrap(), 0, "should only run once");
+
+            let mut session = BlobSession::open_with_sidecar(CachedIO::new(raw), Some(&sidecar), 1)
+                .await
+                .unwrap();
+            assert_eq!(
+                session.read_subtree(&[]).await.unwrap().to_value(),
+                expected
+            );
+            session
+                .apply_updates_with_sidecar(&batch, Some(&sidecar), 2)
+                .await
+                .unwrap();
+            assert_eq!(
+                session.read_subtree(&[]).await.unwrap().to_value(),
+                expected
+            );
+        })
+    }
+
+    /// Without the repair the same image is damaged, so the test above can fail.
+    #[test]
+    fn test_torn_collection_is_damaged_without_the_repair() {
+        block_on(async {
+            let (before, after, _, _, expected) = in_place_batch().await;
+            let raw = MemBlobIO::from_bytes(torn_image(&before, &after));
+            let session = BlobSession::open(CachedIO::new(raw)).await.unwrap();
+            let read = session.read_subtree(&[]).await.map(|v| v.to_value());
+            assert!(!matches!(read, Ok(ref value) if *value == expected));
+        })
+    }
+
+    /// Once its sequence has committed, the recorded writes are history: later
+    /// batches may have changed those bytes.
+    #[test]
+    fn test_finish_interrupted_flush_ignores_committed_batches() {
+        block_on(async {
+            let (_, after, sidecar_bytes, _, _) = in_place_batch().await;
+            let raw = MemBlobIO::from_bytes(after.clone());
+            let sidecar = MemBlobIO::from_bytes(sidecar_bytes.clone());
+
+            assert!(!finish_interrupted_flush(&raw, &sidecar, 2).await.unwrap());
+            assert_eq!(raw.data().to_vec(), after);
+            assert_eq!(sidecar.data().to_vec(), sidecar_bytes);
+        })
+    }
+
+    /// A damaged record is never applied, and neither is one the blob is too short
+    /// for, which stops the load.
+    #[test]
+    fn test_finish_interrupted_flush_refuses_a_bad_sidecar() {
+        block_on(async {
+            let (before, after, mut sidecar_bytes, _, _) = in_place_batch().await;
+
+            let short = MemBlobIO::from_bytes(after[..after.len() - 1].to_vec());
+            let sidecar = MemBlobIO::from_bytes(sidecar_bytes.clone());
+            assert!(finish_interrupted_flush(&short, &sidecar, 1).await.is_err());
+
+            let last = sidecar_bytes.len() - 1;
+            sidecar_bytes[last] ^= 1;
+            let raw = MemBlobIO::from_bytes(before.clone());
+            let sidecar = MemBlobIO::from_bytes(sidecar_bytes);
+            assert!(!finish_interrupted_flush(&raw, &sidecar, 1).await.unwrap());
+            assert_eq!(raw.data().to_vec(), before);
+        })
+    }
 
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
         futures::executor::block_on(f)
@@ -2837,7 +3105,7 @@ mod tests {
                 updates.push((path, Some(val)));
             }
             let r = session
-                .apply_updates_with_sidecar(&updates, Some(&sidecar_io))
+                .apply_updates_with_sidecar(&updates, Some(&sidecar_io), 0)
                 .await
                 .expect("batch 1 should succeed");
             match &r {
@@ -2878,7 +3146,7 @@ mod tests {
                 updates2.push((path, Some(val)));
             }
             let r = session
-                .apply_updates_with_sidecar(&updates2, Some(&sidecar_io))
+                .apply_updates_with_sidecar(&updates2, Some(&sidecar_io), 0)
                 .await
                 .expect("batch 2 should succeed");
             match &r {
@@ -2930,7 +3198,7 @@ mod tests {
                 updates3.push((path, Some(val)));
             }
             let r = session
-                .apply_updates_with_sidecar(&updates3, Some(&sidecar_io))
+                .apply_updates_with_sidecar(&updates3, Some(&sidecar_io), 0)
                 .await
                 .expect("batch 3 should succeed");
             match &r {
@@ -2966,7 +3234,7 @@ mod tests {
                 }
             }
             let r = session
-                .apply_updates_with_sidecar(&updates4, Some(&sidecar_io))
+                .apply_updates_with_sidecar(&updates4, Some(&sidecar_io), 0)
                 .await
                 .expect("batch 4 should succeed");
             match &r {
@@ -2994,7 +3262,7 @@ mod tests {
                 }
             }
             let r = session
-                .apply_updates_with_sidecar(&updates5, Some(&sidecar_io))
+                .apply_updates_with_sidecar(&updates5, Some(&sidecar_io), 0)
                 .await
                 .expect("batch 5 should succeed");
             match &r {
@@ -3115,7 +3383,7 @@ mod tests {
                 }
 
                 let r = session
-                    .apply_updates_with_sidecar(&batch_updates, Some(&sidecar_io))
+                    .apply_updates_with_sidecar(&batch_updates, Some(&sidecar_io), 0)
                     .await
                     .unwrap_or_else(|e| panic!("batch {} failed: {:?}", batch_num, e));
                 match &r {
@@ -3147,7 +3415,7 @@ mod tests {
                     let fresh_io = CachedIO::new(fresh_raw);
                     let fresh_sidecar = fresh_io.open_related("sidecar").await.unwrap();
                     let fresh_session =
-                        BlobSession::open_with_sidecar(fresh_io, Some(&fresh_sidecar))
+                        BlobSession::open_with_sidecar(fresh_io, Some(&fresh_sidecar), 0)
                             .await
                             .unwrap_or_else(|e| {
                                 panic!(
@@ -3189,7 +3457,7 @@ mod tests {
                 updates.push((vec!["data".to_string(), format!("-item-{}", i)], Some(val)));
             }
             session
-                .apply_updates_with_sidecar(&updates, Some(&sidecar_io))
+                .apply_updates_with_sidecar(&updates, Some(&sidecar_io), 0)
                 .await
                 .unwrap();
 

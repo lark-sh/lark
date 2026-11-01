@@ -5,6 +5,7 @@
 //! requests to io_uring and yields to the scheduler while waiting for completion,
 //! allowing other databases on the same core to make progress.
 
+use crate::storage::io_trace;
 use glommio::io::{BufferedFile, OpenOptions};
 use lark_blob::BlobIO;
 use std::cell::Cell;
@@ -49,6 +50,7 @@ impl GlommioBlobIO {
             .create(true)
             .buffered_open(path)
             .await?;
+        io_trace::create(path, false);
         let size = file.file_size().await?;
         Ok(GlommioBlobIO {
             file,
@@ -66,6 +68,7 @@ impl GlommioBlobIO {
             .truncate(true)
             .buffered_open(path)
             .await?;
+        io_trace::create(path, true);
         Ok(GlommioBlobIO {
             file,
             size: Cell::new(0),
@@ -181,6 +184,7 @@ impl BlobIO for GlommioBlobIO {
                 Err(e) => return Err(e.into()),
             }
         }
+        io_trace::write(&self.path, offset, data);
         let end = offset + data.len() as u64;
         if end > self.size.get() {
             self.size.set(end);
@@ -197,12 +201,14 @@ impl BlobIO for GlommioBlobIO {
                 Err(e) => return Err(e.into()),
             }
         }
+        io_trace::write(&self.path, offset, data);
         self.size.set(self.size.get() + data.len() as u64);
         Ok(offset)
     }
 
     async fn sync(&self) -> io::Result<()> {
         self.file.fdatasync().await?;
+        io_trace::sync(&self.path);
         Ok(())
     }
 
@@ -212,6 +218,7 @@ impl BlobIO for GlommioBlobIO {
 
     async fn truncate(&self, new_size: u64) -> io::Result<()> {
         self.file.truncate(new_size).await?;
+        io_trace::truncate(&self.path, new_size);
         self.size.set(new_size);
         Ok(())
     }

@@ -527,7 +527,7 @@ if now.duration_since(last_wal_sync) >= wal_sync_interval {
 
 Setting both gives strict per-write durability at the cost of write latency.
 
-On WAL rotation, a `CompactionRequest` is sent to the per-core StorageWorker via `LocalChannel`.
+On WAL rotation, a `CompactionRequest` is sent to the per-core StorageWorker via `LocalChannel`. Rotation doesn't wait for the finished file to reach the device: the StorageWorker syncs it before compacting it.
 
 #### Record Processed
 

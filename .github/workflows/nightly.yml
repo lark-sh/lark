@@ -42,6 +42,13 @@ jobs:
         env:
           PROPTEST_CASES: "10000"
 
+      # A new seed each night; the run number in the log replays a failure.
+      - name: Crash images
+        run: cargo test -p lark-server --features io-trace --test integration_crash
+        env:
+          LARK_CRASH_CASES: "2000"
+          LARK_CRASH_SEED: ${{ github.run_number }}
+
       - name: Server model
         run: cargo test -p lark-server --test integration_read_model
         env:

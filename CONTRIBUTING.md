@@ -112,7 +112,7 @@ Three layers, all per-database:
 
 - **WAL**: `wal/000001.wal`, JSONL, flushed every 2 seconds, rotates at 5 MB.
 - **Blob**: `blob.lark`, single binary file in the `lark-blob` format. Compact on-disk representation. Loaded lazily.
-- **Sidecar**: `sidecar.lark`. Free list + pending dictionary keys, written alongside each compaction batch.
+- **Sidecar**: `sidecar.lark`. Free list and pending dictionary keys, written before each compaction batch's flush, plus that batch's in-place writes until the flush finishes.
 
 ```
 {data_dir}/{project}/{database}/

@@ -2,6 +2,7 @@
 
 pub mod fsync;
 pub mod glommio_blob_io;
+pub mod io_trace;
 pub mod wal;
 pub mod worker;
 

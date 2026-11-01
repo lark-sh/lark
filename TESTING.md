@@ -46,7 +46,28 @@ Some details of the harness:
 - Runs are seeded. A violating run replays exactly with the same `--seed`, so a failure is a reproducible artifact rather than an anecdote.
 - It can run with security rules enabled, so durability is exercised with the authorization path in play.
 
-To be precise about the crash model: what the harness kills is the process, at an arbitrary instant, including mid-flush and mid-compaction. It does not simulate power loss or torn writes at the device layer. In strict mode the claim is that the WAL has been fsync'd before the client sees an ACK.
+To be precise about the crash model: what the harness kills is the process, at an arbitrary instant, including mid-flush and mid-compaction. The kernel's page cache survives that, so power loss is covered by crash images, below. In strict mode the claim is that the WAL has been fsync'd before the client sees an ACK.
+
+### Crash images
+
+[`server/tests/integration_crash.rs`](server/tests/integration_crash.rs) tests what a crash leaves on disk, including a power loss. With the `io-trace` feature, a seeded workload runs against a real `Database` and `StorageWorker` and records every durable file operation: writes, syncs, renames and directory syncs. From that journal it rebuilds what a crash at a chosen point could leave, and recovers each image with the same server code.
+
+```bash
+cargo test -p lark-server --features io-trace --test integration_crash
+LARK_CRASH_CASES=2000 LARK_CRASH_SEED=7 cargo test -p lark-server --features io-trace --test integration_crash
+```
+
+Set `LARK_CRASH_KEEP` to a directory to keep each failing image. Strict durability runs all three of these crash models, and default durability runs the process kill and the ext4 power loss:
+
+| Model | What survives |
+|---|---|
+| Process kill | Everything issued |
+| Power loss on ext4 | Synced data; unsynced data lands in pieces (any 4K pages or 512-byte sectors, with cut-off or zeroed tails), and directory entries commit in journal order |
+| Power loss, POSIX directories | The same, but a new entry survives only an fsync of its directory |
+
+A torn line at the end of the newest WAL file must be refused with the WAL left alone, and the test then trims it as an operator would. After that, each image has to pass three stages: it holds every acknowledged write and is the state after some prefix of the writes; several more compactions all finish; and two restarts read back the right data. The later stages matter, because some damage only appears batches or restarts after the crash. Default durability can lose acknowledged writes, so its first stage checks less: everything in the blob must be intact, and any other path must hold a value that was written to it. Controls keep the harness honest: replaying a complete journal has to rebuild the real directory byte for byte, an intact directory has to recover, and an image missing an acknowledged write has to be reported.
+
+These images come from a model of the disk. They show that Lark's write ordering holds up under that model, not that any particular kernel or device behaves as modelled, and `lark-compact` isn't part of the recorded workload.
 
 Under the chaos-monkey layer, the storage engine has conventional coverage of its own: the `lark-blob` crate carries roughly 200 unit tests over the on-disk format, sessions, free list, dictionary, and incremental compaction, and the `integration_persistence` suite covers WAL replay, graceful-shutdown flushing, deletion persistence, and write coalescing. A slow `#[ignore]`d suite (`integration_storage_worker`) exercises real compaction timing; it runs as part of `make test-all`.
 
@@ -93,6 +114,7 @@ cd edge && go test ./...
 | Go edge tests | `cd edge && go test ./...` | yes |
 | Firebase SDK suite | `./test/run-firebase-sdk.sh` | no; run for client-observable changes |
 | REST conformance | `./tools/rest-conformance/run.sh` | yes, with more cases nightly |
+| Crash images | `cargo test -p lark-server --features io-trace --test integration_crash` | yes, with more images and a new seed nightly |
 | Chaos monkey | `./tools/chaos-monkey/run.sh` | no; run for write-path changes |
 | Randomized model tests, high case counts | `PROPTEST_CASES=1000 cargo test -p lark-server --test integration_read_model` | nightly |
 
