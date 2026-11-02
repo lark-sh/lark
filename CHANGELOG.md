@@ -88,6 +88,7 @@ If you back up with the `.compacting` marker, add the `flock` step in [BACKUP.md
 - REST requests denied by security rules now get a 401 instead of a 403, as Firebase documents. Clients that check for 403 need updating.
 - The `lark-server` image now builds from `Cargo.lock` with the toolchain pinned in `rust-toolchain.toml`. It previously resolved the newest compatible crates and the current stable Rust at build time, so images could contain versions CI had never tested.
 - Updated the pinned Rust toolchain to 1.99.1.
+- `lark-server` now uses `lark-sh/glommio`, which is glommio 0.9.0 with fixes for an executor that could hang permanently, a memory leak when tasks are destroyed, and a process abort when a task panics. It also drops the unused `lockfree` and `bitmaps` crates, which clears the last `cargo audit` vulnerability.
 
 ## [0.3.0] — 2026-10-11
 
