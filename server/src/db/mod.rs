@@ -9,7 +9,7 @@ mod value;
 
 pub use database::{
     AuthInfo, ClientInfo, CompactionComplete, ConnectionSender, Database, DatabaseHandle,
-    DatabaseState, DisconnectAction, InboxMessage, SendError, blob_path, log_dropped_send,
+    DatabaseState, DisconnectAction, Inbox, InboxMessage, SendError, blob_path, log_dropped_send,
     read_blob_generation, set_broadcast_views_per_batch, set_db_batch_max_messages,
     set_db_batch_max_ms, set_eviction_idle_secs, set_fsync_on_wal_flush,
     set_max_on_disconnect_actions_per_client, set_max_on_disconnect_bytes_per_client,

@@ -48,7 +48,7 @@ pub struct CompactionRequest {
     /// Database ID for logging
     pub database_id: String,
     /// Inbox sender for the database — used to send compaction notifications.
-    pub inbox_sender: Rc<LocalSender<InboxMessage>>,
+    pub inbox_sender: Rc<LocalSender<crate::db::Inbox>>,
     /// Shared CachedIO from the Database's BlobSession.
     /// Cloned via clone_for_reading() — shares the Rc-backed byte cache so
     /// StorageWorker writes are immediately visible to the Database's reads.
@@ -330,7 +330,7 @@ impl StorageWorker {
             }),
             ..Default::default()
         };
-        if inbox_sender.try_send(compaction_msg).is_err() {
+        if inbox_sender.try_send(Box::new(compaction_msg)).is_err() {
             warn!(
                 "[StorageWorker] {}: Failed to send compaction_complete to database (inbox full)",
                 db_id
