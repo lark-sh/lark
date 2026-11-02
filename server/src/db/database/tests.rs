@@ -1233,10 +1233,14 @@ fn test_wal_failed_allows_volatile_writes() {
             ..Default::default()
         };
 
-        // Volatile writes return None (no ack)
-        let response = db.handle_set("client1", &msg, true).await;
-        assert!(
-            response.is_none(),
+        // The write carries a request ID, so it gets an ack, not a NACK
+        let response = db
+            .handle_set("client1", &msg, true)
+            .await
+            .expect("a volatile write with a request ID gets an answer");
+        assert_eq!(
+            response.ack.as_deref(),
+            Some("r1"),
             "Volatile writes should not be NACKed even when WAL failed"
         );
     })

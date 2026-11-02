@@ -373,3 +373,87 @@ fn test_volatile_write_over_size_cap_is_dropped() {
         );
     });
 }
+
+fn position_rules() -> Value {
+    json!({
+        "rules": {
+            "players": {
+                "$uid": {
+                    "position": {
+                        ".read": true,
+                        ".write": true,
+                        ".volatile": true
+                    }
+                }
+            },
+            ".read": true,
+            ".write": true
+        }
+    })
+}
+
+#[test]
+fn test_volatile_set_with_request_id_is_acked() {
+    // A client that sends every write with a request ID (as Firebase SDK
+    // clients do) gets an ack for a set to a volatile path, and the write still
+    // goes out as volatile: subscribers see it and nothing is stored.
+    run_test(|| async {
+        let server = TestServer::new();
+        server
+            .set_rules("volatile-ack-db", position_rules())
+            .expect("Failed to set rules");
+
+        let mut writer = server.client();
+        let mut subscriber = server.client();
+        writer.connect("volatile-ack-db").await;
+        subscriber.connect("volatile-ack-db").await;
+
+        subscriber
+            .subscribe("/players/p1/position", &["value"])
+            .await
+            .expect("Failed to subscribe");
+        let _ = subscriber.wait_for_event(Duration::from_secs(1)).await;
+        subscriber.clear_events().await;
+
+        writer
+            .set("/players/p1/position", json!({"x": 1, "y": 2}))
+            .await
+            .expect("a volatile set with a request ID should be acked");
+
+        // Wait past the slow volatile flush (see test_volatile_write_received_by_subscribers).
+        glommio::timer::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !subscriber.events().await.is_empty(),
+            "subscriber should receive the volatile write"
+        );
+
+        let stored = writer
+            .once("/players/p1/position")
+            .await
+            .expect("Failed to read");
+        assert_eq!(stored, Value::Null, "volatile writes are not stored");
+    });
+}
+
+#[test]
+fn test_oversized_volatile_set_with_request_id_is_nacked() {
+    run_test(|| async {
+        let server = TestServer::new();
+        server
+            .set_rules("volatile-nack-db", position_rules())
+            .expect("Failed to set rules");
+
+        let mut writer = server.client();
+        writer.connect("volatile-nack-db").await;
+
+        let big = "x".repeat(3 * 1024);
+        let err = writer
+            .set("/players/p1/position", json!({ "payload": big }))
+            .await
+            .expect_err("an oversized volatile set should be nacked");
+        assert!(
+            err.starts_with("payload_too_large"),
+            "unexpected error: {err}"
+        );
+    });
+}

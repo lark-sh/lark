@@ -75,22 +75,22 @@ impl Database {
 
         // Validate .value/.priority patterns
         if let Err(e) = validate_value_priority(&value, path_str) {
-            if !volatile {
-                self.record_nacked_write(client_id, request_id);
-                return Some(ServerMessage::nack(request_id, error::INVALID_DATA, &e));
+            if volatile && request_id.is_empty() {
+                return None; // Nobody is waiting for an answer
             }
-            return None; // Swallow NACK for volatile writes
+            self.record_nacked_write(client_id, request_id);
+            return Some(ServerMessage::nack(request_id, error::INVALID_DATA, &e));
         }
 
         // Process server values (like {".sv": "timestamp"} or {".sv": {"increment": 10}})
         let value = match process_server_values(value, path_str, &self.tree) {
             Ok((processed, _)) => processed,
             Err(e) => {
-                if !volatile {
-                    self.record_nacked_write(client_id, request_id);
-                    return Some(ServerMessage::nack(request_id, error::INVALID_DATA, &e));
+                if volatile && request_id.is_empty() {
+                    return None; // Nobody is waiting for an answer
                 }
-                return None; // Swallow NACK for volatile writes
+                self.record_nacked_write(client_id, request_id);
+                return Some(ServerMessage::nack(request_id, error::INVALID_DATA, &e));
             }
         };
 
@@ -109,15 +109,15 @@ impl Database {
                 self.id, path_str, client_id, auth_summary
             );
             self.metrics.record_permission_denial();
-            if !volatile {
-                self.record_nacked_write(client_id, request_id);
-                return Some(ServerMessage::nack(
-                    request_id,
-                    error::PERMISSION_DENIED,
-                    "Permission denied",
-                ));
+            if volatile && request_id.is_empty() {
+                return None; // Nobody is waiting for an answer
             }
-            return None; // Swallow NACK for volatile writes
+            self.record_nacked_write(client_id, request_id);
+            return Some(ServerMessage::nack(
+                request_id,
+                error::PERMISSION_DENIED,
+                "Permission denied",
+            ));
         }
 
         // Check compare-and-swap hash if provided (Firebase transaction support)
@@ -191,10 +191,10 @@ impl Database {
         // amplification: volatile writes skip WAL but broadcast to every subscriber,
         // and they're exempt from the per-DB byte rate limiter (no durable cost) —
         // so without this, one client could blast 16MB (SDK) or 256MB (REST) of
-        // payload at N subscribers per write. Volatile writes don't get NACKs;
-        // silently drop, matching how this path swallows other errors above.
+        // payload at N subscribers per write. A write that carries a request ID
+        // gets a NACK; one without is dropped silently.
         if is_volatile && estimate_value_bytes(&value) > MAX_VOLATILE_WRITE_SIZE {
-            return None;
+            return volatile_too_large(request_id);
         }
 
         // Check if this is a volatile path - use ViewManager batching, skip persistence
@@ -207,8 +207,9 @@ impl Database {
             // Meter into the volatile buckets (kept separate from durable writes).
             self.metrics.record_volatile_write(msg.payload_size);
 
-            // No ack for volatile writes
-            return None;
+            // Answer a write that carries a request ID: its client is waiting
+            // for one, even though the rules made this path volatile.
+            return (!request_id.is_empty()).then(|| ServerMessage::ack(request_id));
         }
 
         // Durable write: charge the per-database write-rate limiter before
@@ -257,12 +258,8 @@ impl Database {
         // Record write metrics using raw payload size captured at parse time
         self.metrics.record_write(msg.payload_size);
 
-        // Return ack (only if not volatile and has request_id)
-        if !msg.is_volatile() && !request_id.is_empty() {
-            Some(ServerMessage::ack(request_id))
-        } else {
-            None
-        }
+        // Return ack (only if the write has a request ID)
+        (!request_id.is_empty()).then(|| ServerMessage::ack(request_id))
     }
 
     pub(super) async fn handle_update(
@@ -324,12 +321,12 @@ impl Database {
         // Cap volatile writes at MAX_VOLATILE_WRITE_SIZE — same fan-out
         // amplification threat as handle_set. UPDATE's wire-flag gate matches
         // its WAL-skip decision (handle_set uses is_volatile_path; that
-        // divergence is tracked separately). Silently drop, no NACK.
+        // divergence is tracked separately). NACK if the write has a request ID.
         if volatile
             && let Some(ref v) = msg.value
             && estimate_value_bytes(v) > MAX_VOLATILE_WRITE_SIZE
         {
-            return None;
+            return volatile_too_large(request_id);
         }
 
         // Reject this write at the size cap, including volatile writes (not
@@ -497,12 +494,8 @@ impl Database {
             self.metrics.record_write(msg.payload_size);
         }
 
-        // Return ack
-        if !msg.is_volatile() && !request_id.is_empty() {
-            Some(ServerMessage::ack(request_id))
-        } else {
-            None
-        }
+        // Return ack (only if the write has a request ID)
+        (!request_id.is_empty()).then(|| ServerMessage::ack(request_id))
     }
 
     pub(super) async fn handle_remove(
@@ -600,4 +593,16 @@ impl Database {
             None
         }
     }
+}
+
+/// The answer to a volatile write over MAX_VOLATILE_WRITE_SIZE: a NACK when the
+/// client sent a request ID and is waiting for one, otherwise nothing.
+fn volatile_too_large(request_id: &str) -> Option<ServerMessage> {
+    (!request_id.is_empty()).then(|| {
+        ServerMessage::nack(
+            request_id,
+            error::PAYLOAD_TOO_LARGE,
+            "volatile write is larger than the volatile size limit",
+        )
+    })
 }
