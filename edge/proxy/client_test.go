@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -844,5 +845,69 @@ func TestLarkAuthBeforeRoutingAnswersEachRequest(t *testing.T) {
 	}
 	if got[0]["ac"] != "1" || got[1]["ae"] != "2" || got[2]["ac"] != "3" {
 		t.Errorf("answers should match their requests in order, got %v", got)
+	}
+}
+
+// A first message over 16 KB arrives as a frame count and then its frames. The
+// proxy routes once the whole message is in, and forwards every frame as sent.
+func TestClientFirebaseChunkedFirstMessageStartsRouting(t *testing.T) {
+	transport := NewMockTransport(backend.ProtocolWebSocket)
+	client := newTestClient(1, transport, ProtocolFirebase)
+
+	big := make([]byte, 40*1024)
+	for i := range big {
+		big[i] = 'x'
+	}
+	msg, err := sonic.Marshal(map[string]interface{}{
+		"t": "d",
+		"d": map[string]interface{}{
+			"r": 1,
+			"a": "p",
+			"b": map[string]interface{}{"p": "/big", "d": string(big)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var frames [][]byte
+	for start := 0; start < len(msg); start += 16384 {
+		end := min(start+16384, len(msg))
+		frames = append(frames, msg[start:end])
+	}
+
+	client.handleFirebaseMessage([]byte(strconv.Itoa(len(frames))))
+	for i, frame := range frames {
+		if client.State() != StateConnected {
+			t.Fatalf("routing started before frame %d of %d", i+1, len(frames))
+		}
+		client.handleFirebaseMessage(frame)
+	}
+
+	if client.State() != StateRouting {
+		t.Fatalf("state after the last frame: got %v, want %v", client.State(), StateRouting)
+	}
+	if client.databaseID != "default" {
+		t.Errorf("databaseID: got %q, want %q", client.databaseID, "default")
+	}
+
+	client.bufferMu.Lock()
+	defer client.bufferMu.Unlock()
+	if len(client.buffer) != len(frames)+1 {
+		t.Fatalf("buffered %d messages, want the count and %d frames", len(client.buffer), len(frames))
+	}
+	if string(client.buffer[0]) != strconv.Itoa(len(frames)) {
+		t.Errorf("first buffered message: got %q, want the frame count", client.buffer[0])
+	}
+}
+
+func TestClientFirebaseTooManyFramesCloses(t *testing.T) {
+	transport := NewMockTransport(backend.ProtocolWebSocket)
+	client := newTestClient(1, transport, ProtocolFirebase)
+
+	client.handleFirebaseMessage([]byte("999999"))
+
+	if client.fbFramesLeft != 0 {
+		t.Errorf("a frame count over the limit must not start reassembly")
 	}
 }

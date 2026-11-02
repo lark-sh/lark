@@ -34,6 +34,7 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 - A native client that authenticates again, as when switching users, gets an answer under that request's ID. Before its first read or write it got no answer, and afterwards the answer carried the first auth's ID, so the client timed out either way. A rejected token there now gets an auth error.
 - A set to a path the rules mark `.volatile` gets an ack when it carries a request ID, as every Firebase SDK write does, and a NACK when it is over the volatile size limit. Firebase SDK clients used to wait forever for an answer. Native clients send volatile writes without a request ID and are unaffected.
 - A rules change reaches every database that loads afterwards. A server core kept a project's rules after its last database there unloaded, and rule changes are only sent to cores with a database loaded, so a database that loaded there later could run with the old rules until the server restarted. A core now drops a project's rules when it stops using them and fetches the current ones on the next load.
+- A Firebase SDK connection whose first operation is over 16 KB, such as a large `set()` before any read, connects normally. The edge looked for the database path in each 16 KB piece on its own, found none, and the connection never got past routing.
 
 ## [0.4.0] — 2026-10-31
 
