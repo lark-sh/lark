@@ -39,6 +39,7 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 - A set to a path the rules mark `.volatile` gets an ack when it carries a request ID, as every Firebase SDK write does, and a NACK when it is over the volatile size limit. Firebase SDK clients used to wait forever for an answer. Native clients send volatile writes without a request ID and are unaffected.
 - A rules change reaches every database that loads afterwards. A server core kept a project's rules after its last database there unloaded, and rule changes are only sent to cores with a database loaded, so a database that loaded there later could run with the old rules until the server restarted. A core now drops a project's rules when it stops using them and fetches the current ones on the next load.
 - A Firebase SDK connection whose first operation is over 16 KB, such as a large `set()` before any read, connects normally. The edge looked for the database path in each 16 KB piece on its own, found none, and the connection never got past routing.
+- Writes from Firebase SDK clients count their size. It was always 0, so `write_bytes` and `volatile_bytes_in` in `db_metrics` left them out, and the per-database write-rate limiter never charged them.
 
 ## [0.4.0] — 2026-10-31
 

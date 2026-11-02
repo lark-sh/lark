@@ -484,9 +484,23 @@ impl FirebaseAdapter {
     /// Translate a complete Firebase message to Lark format.
     ///
     /// Returns `(message, response)` where:
-    /// - `message`: the translated Lark message (None if message should be ignored)
+    /// - `message`: the translated Lark message (None if message should be ignored),
+    ///   with `payload_size` set to the size of the Firebase message, as
+    ///   `ClientMessage::parse` sets it for a native one. Write metrics and the
+    ///   write-rate limiter count it.
     /// - `response`: optional bytes to send back to the client (e.g., keepalive pong)
     pub fn translate_incoming(
+        &self,
+        data: &[u8],
+    ) -> Result<(Option<ClientMessage>, Option<Vec<u8>>), String> {
+        let (mut message, response) = self.translate_message(data)?;
+        if let Some(msg) = message.as_mut() {
+            msg.payload_size = data.len();
+        }
+        Ok((message, response))
+    }
+
+    fn translate_message(
         &self,
         data: &[u8],
     ) -> Result<(Option<ClientMessage>, Option<Vec<u8>>), String> {
@@ -1405,6 +1419,44 @@ mod tests {
         assert_eq!(msg.path, Some("/players/abc".to_string()));
         assert_eq!(msg.value, Some(json!({"name": "Alice"})));
         assert_eq!(msg.request_id, Some("1".to_string()));
+    }
+
+    #[test]
+    fn test_translated_write_carries_its_size() {
+        let adapter = FirebaseAdapter::new("proj", "host");
+        let bytes = serde_json::to_vec(&json!({
+            "t": "d",
+            "d": {"r": 1, "a": "p", "b": {"p": "/players/abc", "d": {"name": "Alice"}}}
+        }))
+        .unwrap();
+
+        let (msg, _) = adapter.translate_incoming(&bytes).unwrap();
+        assert_eq!(msg.unwrap().payload_size, bytes.len());
+    }
+
+    #[test]
+    fn test_reassembled_write_carries_its_whole_size() {
+        let mut adapter = FirebaseAdapter::new("proj", "host");
+        let bytes = serde_json::to_vec(&json!({
+            "t": "d",
+            "d": {"r": 2, "a": "m", "b": {"p": "/big", "d": {"blob": "x".repeat(40_000)}}}
+        }))
+        .unwrap();
+        let frames: Vec<&[u8]> = bytes.chunks(FIREBASE_MAX_FRAME_SIZE).collect();
+
+        let count = frames.len().to_string();
+        assert!(
+            adapter
+                .handle_incoming_frame(count.as_bytes())
+                .unwrap()
+                .0
+                .is_none()
+        );
+        let mut message = None;
+        for frame in frames {
+            message = adapter.handle_incoming_frame(frame).unwrap().0;
+        }
+        assert_eq!(message.unwrap().payload_size, bytes.len());
     }
 
     #[test]
