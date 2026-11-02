@@ -30,6 +30,7 @@ impl Database {
             on_disconnect: HashMap::new(),
             state: DatabaseState::Loading,
             last_activity: Instant::now(),
+            unload_compaction_started: None,
             fatal_error: false,
             volatile_paths: Vec::new(),
             evaluator: None,
@@ -43,6 +44,7 @@ impl Database {
             blob_generation: 0,
 
             pending_wal_entries: Vec::new(),
+            held_wal_bytes: BTreeMap::new(),
             wal_index: WalIndex::new(),
             blob_sequence: 0,
             promoted_paths: HashMap::new(),
@@ -85,6 +87,7 @@ impl Database {
             on_disconnect: HashMap::new(),
             state: DatabaseState::Loading,
             last_activity: Instant::now(),
+            unload_compaction_started: None,
             fatal_error: false,
             volatile_paths: Vec::new(),
             evaluator: None,
@@ -97,6 +100,7 @@ impl Database {
             blob_session: None, // Initialized in load_from_disk()
             blob_generation: 0, // Initialized in load_from_disk()
             pending_wal_entries: Vec::new(),
+            held_wal_bytes: BTreeMap::new(),
             wal_index: WalIndex::new(),
             blob_sequence: 0,
             promoted_paths: HashMap::new(),

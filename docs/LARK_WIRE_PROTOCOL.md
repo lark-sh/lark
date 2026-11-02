@@ -80,14 +80,15 @@ The hash is computed over the current server-side value. Two formats are accepte
 
 ## Volatile Writes
 
-Volatile writes (`x: true`) are fire-and-forget with minimal overhead:
-- **No request ID required** - `r` field is optional for volatile writes
-- **No ack/nack sent** - server never responds to volatile writes
-- **Silently dropped on error** - size limit, invalid JSON, or rules failure = silent drop
+A set, update or remove to a path the rules mark `.volatile` is a volatile write. The rules decide: the server ignores an `x` field on a write. Volatile writes are fire-and-forget with minimal overhead:
+- **Not stored** - they go to listeners in batches and nothing is written to the database
+- **No request ID required** - send them without `r`, and the server doesn't answer
+- **Answered if `r` is present** - an ack, or a NACK for an error, so a client that sends every write with a request ID isn't left waiting
+- **Silently dropped on error without `r`** - size limit, invalid JSON, or rules failure = silent drop
 - **No deduplication tracking** - `pw` field is ignored, no write records kept
 
 ```json
-{"o": "s", "p": "/players/abc/pos", "v": {"x":1,"y":2}, "x": true}
+{"o": "s", "p": "/players/abc/pos", "v": {"x":1,"y":2}}
 ```
 
 ## Event Types (Delta-Based)

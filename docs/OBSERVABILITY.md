@@ -81,6 +81,7 @@ Because `lark-server` also writes every metric sample to **stdout** as a JSON li
 | `events_sent` | events pushed to subscribers |
 | `ccu`, `subscriptions` | concurrent connections / active subscriptions (gauges) |
 | `data_size_bytes` | on-disk size of the database's blob (gauge) |
+| `held_wal_bytes`, `held_wal_entries` | WAL entries not yet compacted into the blob, which the database holds in memory: their size in the WAL and their count (gauges) |
 | `latency_avg_us`, `latency_max_us` | request latency (TCP receive → processing complete; excludes client network time) |
 | `permission_denials`, `size_rejections` | rules rejections / oversized-payload rejections |
 

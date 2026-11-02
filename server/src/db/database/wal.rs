@@ -114,6 +114,18 @@ impl Database {
         }
     }
 
+    /// Records an entry just appended to the WAL buffer: it stays in
+    /// pending_wal_entries until compaction puts it in the blob.
+    fn hold_wal_entry(&mut self, entry: WalEntry, bytes: u64) {
+        self.wal_dirty = true;
+        self.wal_pending_entries += 1;
+        self.wal_pending_bytes += bytes;
+        *self.held_wal_bytes.entry(entry.sequence).or_default() += bytes;
+        let idx = self.pending_wal_entries.len();
+        self.wal_index.add(&entry.path, idx);
+        self.pending_wal_entries.push(entry);
+    }
+
     /// Write a SET operation to the WAL (in-memory buffer only, no I/O).
     /// Returns false if serialization failed (caller should NACK).
     pub(super) fn wal_write_set(&mut self, path: &str, value: &Value) -> bool {
@@ -130,12 +142,8 @@ impl Database {
             entry.sequence = writer.sequence();
             match writer.append_one(&entry) {
                 Ok(_) => {
-                    self.wal_dirty = true;
-                    self.wal_pending_entries += 1;
-                    self.wal_pending_bytes += writer.bytes_written_last_append();
-                    let idx = self.pending_wal_entries.len();
-                    self.wal_index.add(&entry.path, idx);
-                    self.pending_wal_entries.push(entry);
+                    let bytes = writer.bytes_written_last_append();
+                    self.hold_wal_entry(entry, bytes);
                     true
                 }
                 Err(e) => {
@@ -164,12 +172,8 @@ impl Database {
             entry.sequence = writer.sequence();
             match writer.append_one(&entry) {
                 Ok(_) => {
-                    self.wal_dirty = true;
-                    self.wal_pending_entries += 1;
-                    self.wal_pending_bytes += writer.bytes_written_last_append();
-                    let idx = self.pending_wal_entries.len();
-                    self.wal_index.add(&entry.path, idx);
-                    self.pending_wal_entries.push(entry);
+                    let bytes = writer.bytes_written_last_append();
+                    self.hold_wal_entry(entry, bytes);
                     true
                 }
                 Err(e) => {
@@ -194,12 +198,8 @@ impl Database {
             entry.sequence = writer.sequence();
             match writer.append_one(&entry) {
                 Ok(_) => {
-                    self.wal_dirty = true;
-                    self.wal_pending_entries += 1;
-                    self.wal_pending_bytes += writer.bytes_written_last_append();
-                    let idx = self.pending_wal_entries.len();
-                    self.wal_index.add(&entry.path, idx);
-                    self.pending_wal_entries.push(entry);
+                    let bytes = writer.bytes_written_last_append();
+                    self.hold_wal_entry(entry, bytes);
                     true
                 }
                 Err(e) => {
@@ -257,6 +257,47 @@ impl Database {
                 }
             }
         }
+    }
+
+    /// Gets an idle database ready to unload by compacting its WAL into the
+    /// blob first, so the next load has nothing to replay and none of it is
+    /// held in memory. The first call rotates the WAL and asks the storage
+    /// worker to compact it, and the database keeps running meanwhile. Returns
+    /// true once nothing is held, or once the compaction has had
+    /// UNLOAD_COMPACTION_WAIT (it may be skipped, as while lark-compact holds
+    /// the storage lock; the WAL is then replayed on the next load as before).
+    pub(super) async fn ready_to_unload(&mut self) -> bool {
+        if self.pending_wal_entries.is_empty() || self.compaction_tx.is_none() || self.wal_failed {
+            return true;
+        }
+        if let Some(started) = self.unload_compaction_started {
+            return started.elapsed() >= UNLOAD_COMPACTION_WAIT;
+        }
+        self.unload_compaction_started = Some(Instant::now());
+
+        self.sync_wal().await;
+        let Some(writer) = self.wal_writer.as_mut() else {
+            return true;
+        };
+        if let Err(e) = writer.rotate_if_not_empty(fsync_on_wal_flush()).await {
+            warn!(
+                "[Persistence] {}: rotating the WAL before unloading failed: {}",
+                self.id, e
+            );
+            return true;
+        }
+        debug!(
+            "[Persistence] {}: idle, compacting {} held WAL entries before unloading",
+            self.id,
+            self.pending_wal_entries.len()
+        );
+        self.notify_compaction().await;
+        false
+    }
+
+    /// Total size in the WAL of entries not yet compacted into the blob.
+    pub(super) fn held_wal_bytes(&self) -> u64 {
+        self.held_wal_bytes.values().sum()
     }
 
     /// Write a .compaction-queue marker so lark-compact knows to sync this DB's WAL files.

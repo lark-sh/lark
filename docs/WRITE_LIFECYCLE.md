@@ -499,6 +499,8 @@ Every write site that introduces or removes Sentinels must keep `sentinel_paths`
 self.wal_write_set(path_str, &value);
 ```
 
+`handle_set` skips this call when the write leaves the data as it was, `handle_update` skips it when every key held its value, and `handle_remove` skips it when there was nothing to remove. An update with any changed key goes in as sent. Only data already in memory counts as unchanged (see `Tree::holds`), so a write to data that isn't loaded is always written. This relies on memory matching the blob plus the WAL, which is why a write the rules make volatile never touches the tree, and why the server ignores a client's own volatile flag.
+
 Implementation:
 1. **Canonicalize SET-to-null**: if `value.is_null()`, route to `wal_write_delete` instead. Without this, `WalEntry::set(path, Null)` serializes as `{"o":"s","v":null}`, which serde reads back as `value: None` on restart, so the SET arm of WAL replay would silently skip the entry. This canonicalization gives the WAL a single encoding for "delete" (`WalOp::Delete`, no `v` field) regardless of which wire shape produced it (Lark `remove()`, Firebase `set(null)`, transaction SET-with-null, on-disconnect SET-with-null).
 2. Create `WalEntry::Set { path, value }`
@@ -528,6 +530,8 @@ if now.duration_since(last_wal_sync) >= wal_sync_interval {
 Setting both gives strict per-write durability at the cost of write latency.
 
 On WAL rotation, a `CompactionRequest` is sent to the per-core StorageWorker via `LocalChannel`. Rotation doesn't wait for the finished file to reach the device: the StorageWorker syncs it before compacting it.
+
+Entries stay in `pending_wal_entries`, in memory, until compaction puts them in the blob. A database that has had no clients for 60 seconds compacts before it unloads (`ready_to_unload`): it rotates the WAL if the current file holds anything, asks for a compaction and keeps running. It unloads once nothing is held, or after 30 seconds if the compaction was skipped, as when `lark-compact` holds the storage lock. A client that connects meanwhile is served as usual. The next load then has no WAL to replay. The `held_wal_bytes` and `held_wal_entries` metrics report what each database holds.
 
 #### Record Processed
 

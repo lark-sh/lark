@@ -5,10 +5,11 @@ impl Database {
         &mut self,
         client_id: &str,
         msg: &ClientMessage,
-        volatile: bool,
     ) -> Option<ServerMessage> {
         let request_id = msg.request_id.as_deref().unwrap_or("");
         let path_str = msg.path.as_deref().unwrap_or("/");
+        // The rules decide whether a path is volatile; a flag the client sends is ignored.
+        let volatile = self.is_volatile_path(path_str);
 
         // Reject malformed paths or value keys before any work, the rules
         // evaluator, or the WAL/blob writers. SET stores its value object as-is,
@@ -184,21 +185,18 @@ impl Database {
             }
         }
 
-        // Determine if this path is volatile based on RULES (don't trust client flag)
-        let is_volatile = self.is_volatile_path(path_str);
-
         // Cap volatile writes at MAX_VOLATILE_WRITE_SIZE. The threat is fan-out
         // amplification: volatile writes skip WAL but broadcast to every subscriber,
         // and they're exempt from the per-DB byte rate limiter (no durable cost) —
         // so without this, one client could blast 16MB (SDK) or 256MB (REST) of
         // payload at N subscribers per write. A write that carries a request ID
         // gets a NACK; one without is dropped silently.
-        if is_volatile && estimate_value_bytes(&value) > MAX_VOLATILE_WRITE_SIZE {
+        if volatile && estimate_value_bytes(&value) > MAX_VOLATILE_WRITE_SIZE {
             return volatile_too_large(request_id);
         }
 
         // Check if this is a volatile path - use ViewManager batching, skip persistence
-        if is_volatile {
+        if volatile {
             // Fast path: buffer in ViewManager for batch sending
             let value_bytes = Bytes::from(serde_json::to_vec(&value).unwrap_or_default());
             self.view_manager
@@ -235,25 +233,21 @@ impl Database {
 
         // Append to the WAL for durability — buffered in memory here; flushed
         // (and fdatasync'd, if enabled) on the next WAL sync. See sync_wal.
-        self.wal_write_set(path_str, &value);
+        // A write that leaves the data as it was has nothing to replay and
+        // stays out. It only counts as unchanged against data in memory (see
+        // Tree::holds), never data that hasn't been loaded.
+        if changed {
+            self.wal_write_set(path_str, &value);
+        }
 
         // Broadcast to subscribers via ViewManager
-        if self.needs_broadcast(path_str, changed, is_volatile) {
-            self.broadcast_mutation(
-                path_str,
-                "set",
-                Some(value),
-                None,
-                is_volatile,
-                Some(client_id),
-            )
-            .await;
+        if self.needs_broadcast(path_str, changed, false) {
+            self.broadcast_mutation(path_str, "set", Some(value), None, false, Some(client_id))
+                .await;
         }
 
-        // Record for deduplication (skip volatile writes - they don't need deduplication)
-        if !is_volatile {
-            self.record_processed_write(client_id, request_id);
-        }
+        // Record for deduplication
+        self.record_processed_write(client_id, request_id);
 
         // Record write metrics using raw payload size captured at parse time
         self.metrics.record_write(msg.payload_size);
@@ -266,11 +260,12 @@ impl Database {
         &mut self,
         client_id: &str,
         msg: &ClientMessage,
-        volatile: bool,
     ) -> Option<ServerMessage> {
         let request_id = msg.request_id.as_deref().unwrap_or("");
         let path_str = msg.path.as_deref().unwrap_or("/");
         let path = Path::parse(path_str);
+        // The rules decide whether a path is volatile, as in handle_set.
+        let volatile = self.is_volatile_path(path_str);
 
         // Reject malformed paths or value keys before any work. Each UPDATE child
         // key is a relative path appended to the base, and each child value's
@@ -319,9 +314,7 @@ impl Database {
         }
 
         // Cap volatile writes at MAX_VOLATILE_WRITE_SIZE — same fan-out
-        // amplification threat as handle_set. UPDATE's wire-flag gate matches
-        // its WAL-skip decision (handle_set uses is_volatile_path; that
-        // divergence is tracked separately). NACK if the write has a request ID.
+        // amplification threat as handle_set. NACK if the write has a request ID.
         if volatile
             && let Some(ref v) = msg.value
             && estimate_value_bytes(v) > MAX_VOLATILE_WRITE_SIZE
@@ -422,12 +415,25 @@ impl Database {
             }
         }
 
+        // A volatile path: fan each key out in batches without storing it, as
+        // handle_set does.
+        if volatile {
+            let base = path_str.trim_end_matches('/');
+            for (key, value) in &updates {
+                let value_bytes = Bytes::from(serde_json::to_vec(value).unwrap_or_default());
+                self.view_manager.buffer_volatile(
+                    &format!("{}/{}", base, key),
+                    value_bytes,
+                    client_id,
+                );
+            }
+            self.metrics.record_volatile_write(msg.payload_size);
+            return (!request_id.is_empty()).then(|| ServerMessage::ack(request_id));
+        }
+
         // Durable update: charge the rate limiter before mutating the tree so a
-        // reject leaves it untouched. Volatile updates skip the WAL (below), so
-        // they skip the charge too; ephemeral DBs are exempt (in check_write_rate).
-        if !volatile
-            && let Some(nack) = self.check_write_rate(msg.payload_size, client_id, request_id)
-        {
+        // reject leaves it untouched. Ephemeral DBs are exempt (in check_write_rate).
+        if let Some(nack) = self.check_write_rate(msg.payload_size, client_id, request_id) {
             return Some(nack);
         }
 
@@ -461,38 +467,31 @@ impl Database {
             self.tree.write().unwrap().update(&path, &updates)
         };
 
-        // Append to the WAL for durability (non-volatile writes only) — buffered
-        // in memory here; flushed on the next WAL sync. See sync_wal.
-        if !volatile {
+        // Append to the WAL for durability — buffered in memory here; flushed
+        // on the next WAL sync. See sync_wal. An update whose every key held
+        // its value stays out, as in handle_set; any other goes in as sent.
+        if unchanged.len() < updates.len() {
             self.wal_write_update(path_str, &updates);
         }
 
         // Broadcast the keys that changed to subscribers
-        if let Some(changed) = self.changed_updates(path_str, updates, unchanged, volatile) {
+        if let Some(changed) = self.changed_updates(path_str, updates, unchanged, false) {
             self.broadcast_mutation(
                 path_str,
                 "update",
                 None,
                 Some(changed),
-                volatile,
+                false,
                 Some(client_id),
             )
             .await;
         }
 
-        // Record for deduplication (skip volatile writes)
-        if !volatile {
-            self.record_processed_write(client_id, request_id);
-        }
+        // Record for deduplication
+        self.record_processed_write(client_id, request_id);
 
         // Record write metrics using raw payload size captured at parse time.
-        // Bucket by the same wire flag that gated WAL/broadcast above so the
-        // metric matches the path this write actually took.
-        if volatile {
-            self.metrics.record_volatile_write(msg.payload_size);
-        } else {
-            self.metrics.record_write(msg.payload_size);
-        }
+        self.metrics.record_write(msg.payload_size);
 
         // Return ack (only if the write has a request ID)
         (!request_id.is_empty()).then(|| ServerMessage::ack(request_id))
@@ -502,11 +501,12 @@ impl Database {
         &mut self,
         client_id: &str,
         msg: &ClientMessage,
-        volatile: bool,
     ) -> Option<ServerMessage> {
         let request_id = msg.request_id.as_deref().unwrap_or("");
         let path_str = msg.path.as_deref().unwrap_or("/");
         let path = Path::parse(path_str);
+        // The rules decide whether a path is volatile, as in handle_set.
+        let volatile = self.is_volatile_path(path_str);
 
         // Reject malformed remove paths before any work (same key invariant as
         // SET/UPDATE; a remove can't plant keys but still must not diverge between
@@ -555,36 +555,39 @@ impl Database {
             ));
         }
 
+        // A volatile path: fan the removal out in batches without storing it,
+        // as handle_set does.
+        if volatile {
+            self.view_manager
+                .buffer_volatile(path_str, Bytes::from_static(b"null"), client_id);
+            self.metrics.record_volatile_write(0);
+            return (!request_id.is_empty()).then(|| ServerMessage::ack(request_id));
+        }
+
         // Remove the value from tree (no need to pre-load from blob for delete)
         let changed = !self.tree.read().unwrap().holds(&path, None);
         self.tree.write().unwrap().remove(&path);
         // Clear sentinel tracking at and below the deleted path — those nodes are gone
         self.remove_sentinel_paths_below(path_str);
 
-        // Append to the WAL for durability (non-volatile writes only) — buffered
-        // in memory here; flushed on the next WAL sync. See sync_wal.
-        if !volatile {
+        // Append to the WAL for durability — buffered in memory here; flushed
+        // on the next WAL sync. See sync_wal. Removing what isn't there stays
+        // out, as in handle_set.
+        if changed {
             self.wal_write_delete(path_str);
         }
 
         // Broadcast deletion to subscribers
-        if self.needs_broadcast(path_str, changed, volatile) {
-            self.broadcast_mutation(path_str, "remove", None, None, volatile, Some(client_id))
+        if self.needs_broadcast(path_str, changed, false) {
+            self.broadcast_mutation(path_str, "remove", None, None, false, Some(client_id))
                 .await;
         }
 
-        // Record for deduplication (skip volatile writes)
-        if !volatile {
-            self.record_processed_write(client_id, request_id);
-        }
+        // Record for deduplication
+        self.record_processed_write(client_id, request_id);
 
-        // Record write metrics (remove is 0 bytes). Bucket by the same wire flag
-        // that gated WAL/broadcast above.
-        if volatile {
-            self.metrics.record_volatile_write(0);
-        } else {
-            self.metrics.record_write(0);
-        }
+        // Record write metrics (remove is 0 bytes).
+        self.metrics.record_write(0);
 
         // Return ack
         if !request_id.is_empty() {

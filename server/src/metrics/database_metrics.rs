@@ -67,6 +67,8 @@ pub struct DatabaseMetrics {
     current_ccu: AtomicU32,
     current_subscriptions: AtomicU32,
     data_size_bytes: AtomicU64,
+    held_wal_bytes: AtomicU64,
+    held_wal_entries: AtomicU64,
 }
 
 impl Default for DatabaseMetrics {
@@ -96,6 +98,8 @@ impl DatabaseMetrics {
             current_ccu: AtomicU32::new(0),
             current_subscriptions: AtomicU32::new(0),
             data_size_bytes: AtomicU64::new(0),
+            held_wal_bytes: AtomicU64::new(0),
+            held_wal_entries: AtomicU64::new(0),
         }
     }
 
@@ -211,6 +215,14 @@ impl DatabaseMetrics {
         self.data_size_bytes.store(bytes, Ordering::Relaxed);
     }
 
+    /// Update the WAL entries held in memory until compaction puts them in the
+    /// blob: their size in the WAL and their count.
+    #[inline]
+    pub fn set_held_wal(&self, bytes: u64, entries: u64) {
+        self.held_wal_bytes.store(bytes, Ordering::Relaxed);
+        self.held_wal_entries.store(entries, Ordering::Relaxed);
+    }
+
     /// Current on-disk data size in bytes. Refreshed periodically (every ~60s
     /// via `refresh_data_size`), so this is an approximate, slightly-stale view
     /// — fine for a coarse size cap, not for exact accounting.
@@ -263,6 +275,8 @@ impl DatabaseMetrics {
         let current_ccu = self.current_ccu.load(Ordering::Relaxed);
         let current_subscriptions = self.current_subscriptions.load(Ordering::Relaxed);
         let data_size_bytes = self.data_size_bytes.load(Ordering::Relaxed);
+        let held_wal_bytes = self.held_wal_bytes.load(Ordering::Relaxed);
+        let held_wal_entries = self.held_wal_entries.load(Ordering::Relaxed);
 
         Some(DatabaseMetricsSnapshot {
             writes,
@@ -285,6 +299,8 @@ impl DatabaseMetrics {
             current_ccu,
             current_subscriptions,
             data_size_bytes,
+            held_wal_bytes,
+            held_wal_entries,
         })
     }
 
@@ -322,6 +338,10 @@ pub struct DatabaseMetricsSnapshot {
     pub current_ccu: u32,
     pub current_subscriptions: u32,
     pub data_size_bytes: u64,
+    /// Size in the WAL of entries not yet compacted into the blob, which the
+    /// database holds in memory until then.
+    pub held_wal_bytes: u64,
+    pub held_wal_entries: u64,
 }
 
 impl DatabaseMetricsSnapshot {
@@ -335,7 +355,7 @@ impl DatabaseMetricsSnapshot {
             .unwrap_or(0);
 
         format!(
-            r#"{{"type":"db_metrics","ts":{},"server":"{}","core":{},"project":"{}","database":"{}","writes":{},"reads":{},"transactions":{},"write_bytes":{},"read_bytes":{},"volatile_writes":{},"volatile_bytes_in":{},"volatile_bytes_out":{},"events_sent":{},"ccu":{},"subscriptions":{},"data_size_bytes":{},"latency_avg_us":{},"latency_max_us":{},"permission_denials":{},"size_rejections":{}}}"#,
+            r#"{{"type":"db_metrics","ts":{},"server":"{}","core":{},"project":"{}","database":"{}","writes":{},"reads":{},"transactions":{},"write_bytes":{},"read_bytes":{},"volatile_writes":{},"volatile_bytes_in":{},"volatile_bytes_out":{},"events_sent":{},"ccu":{},"subscriptions":{},"data_size_bytes":{},"latency_avg_us":{},"latency_max_us":{},"permission_denials":{},"size_rejections":{},"held_wal_bytes":{},"held_wal_entries":{}}}"#,
             ts,
             server,
             core_id,
@@ -357,6 +377,8 @@ impl DatabaseMetricsSnapshot {
             self.latency_max_us,
             self.permission_denials,
             self.size_rejections,
+            self.held_wal_bytes,
+            self.held_wal_entries,
         )
     }
 }
@@ -542,6 +564,8 @@ mod tests {
             current_ccu: 25,
             current_subscriptions: 50,
             data_size_bytes: 10_000_000,
+            held_wal_bytes: 300_000,
+            held_wal_entries: 42,
         };
 
         let json = snapshot.to_json("acme-corp", "production", "lark-prod-1", 3);
@@ -553,5 +577,7 @@ mod tests {
         assert!(json.contains(r#""ccu":25"#));
         assert!(json.contains(r#""latency_avg_us":150"#));
         assert!(json.contains(r#""latency_max_us":500"#));
+        assert!(json.contains(r#""held_wal_bytes":300000"#));
+        assert!(json.contains(r#""held_wal_entries":42"#));
     }
 }

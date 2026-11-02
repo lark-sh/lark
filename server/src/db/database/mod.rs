@@ -28,7 +28,7 @@
 //!
 
 use indexmap::IndexSet;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
@@ -512,6 +512,10 @@ pub fn broadcast_views_per_batch() -> usize {
 /// Metrics emission interval (only for active databases)
 const METRICS_EMIT_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How long an idle database waits for the compaction it asked for before
+/// unloading anyway. See `ready_to_unload`.
+const UNLOAD_COMPACTION_WAIT: Duration = Duration::from_secs(30);
+
 /// Maximum number of retries when rules evaluation hits unloaded blob data.
 /// This handles rules that access many paths - each iteration
 /// loads one path from blob and retries evaluation.
@@ -808,7 +812,6 @@ pub struct CompactionComplete {
 pub struct InboxMessage {
     pub client_id: String,
     pub message: Option<ClientMessage>,
-    pub volatile: bool,
     pub disconnect: bool,
 
     // Client join
@@ -848,7 +851,6 @@ impl std::fmt::Debug for InboxMessage {
         f.debug_struct("InboxMessage")
             .field("client_id", &self.client_id)
             .field("message", &self.message)
-            .field("volatile", &self.volatile)
             .field("disconnect", &self.disconnect)
             .field("add_client", &self.add_client)
             .field("connection_id", &self.connection_id)
@@ -875,7 +877,6 @@ impl Default for InboxMessage {
         Self {
             client_id: String::new(),
             message: None,
-            volatile: false,
             disconnect: false,
             add_client: false,
             connection_id: String::new(),
@@ -930,6 +931,9 @@ pub struct Database {
     /// State
     state: DatabaseState,
     last_activity: Instant,
+    /// When an idle database asked for its WAL to be compacted before unloading.
+    /// Cleared when a client connects.
+    unload_compaction_started: Option<Instant>,
     /// Set to true when the Database encounters an unrecoverable error
     /// (e.g., failed to open a new blob after generation change).
     /// The main loop checks this and exits cleanly.
@@ -976,6 +980,10 @@ pub struct Database {
     /// On promotion (Sentinel → real data), we replay these entries on top of blob data.
     /// Trimmed when the storage worker compacts WAL into the blob and updates the sequence file.
     pending_wal_entries: Vec<WalEntry>,
+
+    /// Size in the WAL of pending_wal_entries, by WAL file sequence. Trimmed with
+    /// them; reported as `held_wal_bytes`.
+    held_wal_bytes: BTreeMap<i64, u64>,
 
     /// Path index over pending_wal_entries for O(depth+k) promotion lookups.
     wal_index: WalIndex,
@@ -1095,11 +1103,9 @@ impl DatabaseHandle {
             ts.stamp_db_inbox_push();
         }
 
-        let volatile = message.volatile.unwrap_or(false);
         let msg = InboxMessage {
             client_id,
             message: Some(message),
-            volatile,
             timestamps,
             ..Default::default()
         };

@@ -195,6 +195,12 @@ impl Database {
                             self.blob_sequence
                         );
 
+                        self.held_wal_bytes.clear();
+                        for entry in &entries {
+                            // One JSON line each, as WalWriter writes them.
+                            let bytes = serde_json::to_vec(entry).map_or(0, |v| v.len() + 1);
+                            *self.held_wal_bytes.entry(entry.sequence).or_default() += bytes as u64;
+                        }
                         self.pending_wal_entries = entries;
                         self.wal_index.rebuild(&self.pending_wal_entries);
                     }
@@ -326,6 +332,7 @@ impl Database {
         self.pending_wal_entries
             .retain(|e| e.sequence > new_sequence);
         let trimmed = before - self.pending_wal_entries.len();
+        self.held_wal_bytes = self.held_wal_bytes.split_off(&(new_sequence + 1));
         self.blob_sequence = new_sequence;
         if trimmed > 0 {
             self.wal_index.rebuild(&self.pending_wal_entries);
