@@ -1281,7 +1281,7 @@ impl ProxyHandler for CoreHandler {
     }
 
     fn on_auth_changed(&self, client: Rc<VirtualClient>, auth: ProxyAuthInfo) {
-        info!(
+        debug!(
             "Client auth changed: {} (uid={}, provider={}, is_admin={})",
             client.id, auth.uid, auth.provider, auth.is_admin
         );

@@ -105,7 +105,7 @@ impl Database {
     pub(super) fn emit_promotion_stats(&mut self) {
         let snap = self.promotion_stats.reset();
         if snap.count > 0 {
-            info!(
+            debug!(
                 db = %self.id,
                 promotions = snap.count,
                 total_ms = format!("{:.1}", snap.total_us as f64 / 1000.0),

@@ -76,7 +76,7 @@ impl Database {
         }
 
         if evicted_count > 0 {
-            info!(
+            debug!(
                 "[Eviction] {}: Evicted {} subtree(s) ({} idle path(s) processed)",
                 self.id,
                 evicted_count,
