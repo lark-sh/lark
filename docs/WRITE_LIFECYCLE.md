@@ -499,7 +499,7 @@ Every write site that introduces or removes Sentinels must keep `sentinel_paths`
 self.wal_write_set(path_str, &value);
 ```
 
-`handle_set` skips this call when the write leaves the data as it was, and `handle_update` leaves out the keys that held their value. Only data already in memory counts as unchanged (see `Tree::holds`), so a write to data that isn't loaded is always written. Replay is unaffected: each key was compared just before it was applied, so a key left out changed nothing.
+`handle_set` skips this call when the write leaves the data as it was, `handle_update` skips it when every key held its value, and `handle_remove` skips it when there was nothing to remove. An update with any changed key goes in as sent. Only data already in memory counts as unchanged (see `Tree::holds`), so a write to data that isn't loaded is always written. This relies on memory matching the blob plus the WAL, which is why a write the rules make volatile never touches the tree, and why the server ignores a client's own volatile flag.
 
 Implementation:
 1. **Canonicalize SET-to-null**: if `value.is_null()`, route to `wal_write_delete` instead. Without this, `WalEntry::set(path, Null)` serializes as `{"o":"s","v":null}`, which serde reads back as `value: None` on restart, so the SET arm of WAL replay would silently skip the entry. This canonicalization gives the WAL a single encoding for "delete" (`WalOp::Delete`, no `v` field) regardless of which wire shape produced it (Lark `remove()`, Firebase `set(null)`, transaction SET-with-null, on-disconnect SET-with-null).

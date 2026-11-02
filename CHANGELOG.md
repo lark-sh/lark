@@ -16,7 +16,8 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 
 - A write that leaves the data as it was no longer sends events, and an update sends only the keys that changed. The comparison uses data already in memory and never reads from disk, so listeners may still receive an unchanged write to data that isn't loaded. Clients keep receiving their ack.
 - A listener below an update's path no longer receives its whole value again when none of the update's keys reach it.
-- A write that leaves the data as it was stays out of the WAL, and an update writes only the keys that changed. As with events, only data already in memory counts as unchanged.
+- A write that leaves the data as it was stays out of the WAL: a set of the value already there, an update whose every key held its value, or a remove of something absent. An update with any changed key is written as sent. As with events, only data already in memory counts as unchanged.
+- Updates and removes follow the rules' `.volatile` as sets do: on a volatile path they go to listeners in batches without being stored, and elsewhere they are stored like any write. The server ignores the `x` volatile flag a client puts on a write. A flagged update or remove used to change the data in memory without saving it, and Firebase SDK merges to a volatile path were stored.
 - A database compacts its WAL into the blob before it unloads after 60 seconds without clients, so the next load has nothing to replay and holds no WAL in memory. Until now the WAL was only compacted at 5 MB, and carried over between sessions.
 - Subtree eviction, per-database promotion stats and client auth changes log at debug rather than info, since they repeat for every database and client. Auth change lines include the user's uid.
 - Compaction batches change existing blob bytes only during their flush, and the sidecar records those writes first, so a crash during a flush is finished on the next load.

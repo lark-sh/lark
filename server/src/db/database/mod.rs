@@ -812,7 +812,6 @@ pub struct CompactionComplete {
 pub struct InboxMessage {
     pub client_id: String,
     pub message: Option<ClientMessage>,
-    pub volatile: bool,
     pub disconnect: bool,
 
     // Client join
@@ -852,7 +851,6 @@ impl std::fmt::Debug for InboxMessage {
         f.debug_struct("InboxMessage")
             .field("client_id", &self.client_id)
             .field("message", &self.message)
-            .field("volatile", &self.volatile)
             .field("disconnect", &self.disconnect)
             .field("add_client", &self.add_client)
             .field("connection_id", &self.connection_id)
@@ -879,7 +877,6 @@ impl Default for InboxMessage {
         Self {
             client_id: String::new(),
             message: None,
-            volatile: false,
             disconnect: false,
             add_client: false,
             connection_id: String::new(),
@@ -1106,11 +1103,9 @@ impl DatabaseHandle {
             ts.stamp_db_inbox_push();
         }
 
-        let volatile = message.volatile.unwrap_or(false);
         let msg = InboxMessage {
             client_id,
             message: Some(message),
-            volatile,
             timestamps,
             ..Default::default()
         };

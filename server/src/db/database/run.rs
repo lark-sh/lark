@@ -445,8 +445,7 @@ impl Database {
 
         // Handle protocol message
         if let Some(ref protocol_msg) = msg.message {
-            let volatile = msg.volatile;
-            self.handle_protocol_message(&msg.client_id, protocol_msg.clone(), volatile)
+            self.handle_protocol_message(&msg.client_id, protocol_msg.clone())
                 .await;
 
             // Record end-to-end latency (TCP receive to processing complete)
@@ -455,17 +454,12 @@ impl Database {
         }
     }
 
-    async fn handle_protocol_message(
-        &mut self,
-        client_id: &str,
-        msg: ClientMessage,
-        volatile: bool,
-    ) {
+    async fn handle_protocol_message(&mut self, client_id: &str, msg: ClientMessage) {
         let response = match msg.op.as_str() {
             op::JOIN => self.handle_join(client_id, &msg),
-            op::SET => self.handle_set(client_id, &msg, volatile).await,
-            op::UPDATE => self.handle_update(client_id, &msg, volatile).await,
-            op::REMOVE => self.handle_remove(client_id, &msg, volatile).await,
+            op::SET => self.handle_set(client_id, &msg).await,
+            op::UPDATE => self.handle_update(client_id, &msg).await,
+            op::REMOVE => self.handle_remove(client_id, &msg).await,
             op::SUBSCRIBE => self.handle_subscribe(client_id, &msg).await,
             op::UNSUBSCRIBE => self.handle_unsubscribe(client_id, &msg),
             op::ONCE => self.handle_once(client_id, &msg).await,

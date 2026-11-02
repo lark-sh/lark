@@ -208,7 +208,7 @@ fn test_handle_set() {
             ..Default::default()
         };
 
-        let response = db.handle_set("client1", &msg, false).await;
+        let response = db.handle_set("client1", &msg).await;
         assert!(response.is_some());
 
         // Verify data was set
@@ -236,10 +236,7 @@ fn test_write_handlers_reject_invalid_paths_and_keys() {
             request_id: Some("r1".to_string()),
             ..Default::default()
         };
-        let resp = db
-            .handle_set("client1", &msg, false)
-            .await
-            .expect("response");
+        let resp = db.handle_set("client1", &msg).await.expect("response");
         assert_eq!(resp.error.as_deref(), Some(error::INVALID_DATA));
         assert!(resp.nack.is_some());
         assert_eq!(db.tree.read().unwrap().get_value_str("/users"), None);
@@ -252,10 +249,7 @@ fn test_write_handlers_reject_invalid_paths_and_keys() {
             request_id: Some("r2".to_string()),
             ..Default::default()
         };
-        let resp = db
-            .handle_set("client1", &msg, false)
-            .await
-            .expect("response");
+        let resp = db.handle_set("client1", &msg).await.expect("response");
         assert!(resp.nack.is_some());
         assert_eq!(db.tree.read().unwrap().get_value_str("/ok"), None);
 
@@ -267,10 +261,7 @@ fn test_write_handlers_reject_invalid_paths_and_keys() {
             request_id: Some("r3".to_string()),
             ..Default::default()
         };
-        let resp = db
-            .handle_update("client1", &msg, false)
-            .await
-            .expect("response");
+        let resp = db.handle_update("client1", &msg).await.expect("response");
         assert!(resp.nack.is_some());
 
         // A well-formed write still succeeds — no false positives.
@@ -281,10 +272,7 @@ fn test_write_handlers_reject_invalid_paths_and_keys() {
             request_id: Some("r4".to_string()),
             ..Default::default()
         };
-        let resp = db
-            .handle_set("client1", &msg, false)
-            .await
-            .expect("response");
+        let resp = db.handle_set("client1", &msg).await.expect("response");
         assert!(resp.nack.is_none(), "valid write must not be nacked");
         assert_eq!(
             db.tree.read().unwrap().get_value_str("/users/abc"),
@@ -324,7 +312,7 @@ fn test_set_rejects_total_depth_over_cap() {
             request_id: Some("r1".to_string()),
             ..Default::default()
         };
-        let resp = db.handle_set("client1", &msg, false).await.expect("resp");
+        let resp = db.handle_set("client1", &msg).await.expect("resp");
         assert_eq!(resp.error.as_deref(), Some(error::INVALID_DATA));
         assert_eq!(
             db.tree.read().unwrap().get_value_str("/deep"),
@@ -349,7 +337,7 @@ fn test_set_accepts_total_depth_at_cap() {
             request_id: Some("r1".to_string()),
             ..Default::default()
         };
-        let resp = db.handle_set("client1", &msg, false).await.expect("resp");
+        let resp = db.handle_set("client1", &msg).await.expect("resp");
         assert!(
             resp.nack.is_none(),
             "a write landing exactly at the depth cap must be accepted"
@@ -378,10 +366,7 @@ fn test_update_rejects_total_depth_over_cap() {
             request_id: Some("r1".to_string()),
             ..Default::default()
         };
-        let resp = db
-            .handle_update("client1", &msg, false)
-            .await
-            .expect("resp");
+        let resp = db.handle_update("client1", &msg).await.expect("resp");
         assert_eq!(resp.error.as_deref(), Some(error::INVALID_DATA));
         assert_eq!(db.tree.read().unwrap().get_value_str("/a/b"), None);
     })
@@ -905,7 +890,7 @@ fn test_wal_failed_flag_nacks_set() {
             request_id: Some("r1".to_string()),
             ..Default::default()
         };
-        let response = db.handle_set("client1", &msg, false).await;
+        let response = db.handle_set("client1", &msg).await;
 
         // Should get a NACK with "unavailable"
         let resp = response.expect("Expected a NACK response");
@@ -945,7 +930,7 @@ fn test_wal_failed_flag_nacks_update() {
             request_id: Some("r1".to_string()),
             ..Default::default()
         };
-        let response = db.handle_update("client1", &msg, false).await;
+        let response = db.handle_update("client1", &msg).await;
 
         let resp = response.expect("Expected a NACK response");
         assert!(resp.nack.is_some(), "Expected NACK, got: {:?}", resp);
@@ -984,7 +969,7 @@ fn test_wal_failed_flag_nacks_remove() {
             request_id: Some("r1".to_string()),
             ..Default::default()
         };
-        let response = db.handle_remove("client1", &msg, false).await;
+        let response = db.handle_remove("client1", &msg).await;
 
         let resp = response.expect("Expected a NACK response");
         assert!(resp.nack.is_some(), "Expected NACK, got: {:?}", resp);
@@ -1123,7 +1108,6 @@ fn test_database_size_cap_rejects_growth_allows_delete() {
                     request_id: Some("r1".to_string()),
                     ..Default::default()
                 },
-                false,
             )
             .await
             .expect("resp");
@@ -1140,7 +1124,6 @@ fn test_database_size_cap_rejects_growth_allows_delete() {
                     request_id: Some("r2".to_string()),
                     ..Default::default()
                 },
-                false,
             )
             .await
             .expect("resp");
@@ -1176,7 +1159,6 @@ fn test_database_size_cap_rejects_growth_allows_delete() {
                     request_id: Some("r4".to_string()),
                     ..Default::default()
                 },
-                false,
             )
             .await;
         if let Some(r) = resp {
@@ -1202,7 +1184,6 @@ fn test_database_size_cap_rejects_growth_allows_delete() {
                     volatile: Some(true),
                     ..Default::default()
                 },
-                true,
             )
             .await
             .expect("resp");
@@ -1235,7 +1216,7 @@ fn test_wal_failed_allows_volatile_writes() {
 
         // The write carries a request ID, so it gets an ack, not a NACK
         let response = db
-            .handle_set("client1", &msg, true)
+            .handle_set("client1", &msg)
             .await
             .expect("a volatile write with a request ID gets an answer");
         assert_eq!(
@@ -1284,7 +1265,7 @@ fn test_wal_recovery_clears_failed_flag() {
             request_id: Some("r1".to_string()),
             ..Default::default()
         };
-        let response = db.handle_set("client1", &msg, false).await;
+        let response = db.handle_set("client1", &msg).await;
 
         // Should get ACK, not NACK
         let resp = response.expect("Expected ACK response");
@@ -1571,7 +1552,7 @@ fn test_eviction_then_set() {
             request_id: Some("r1".to_string()),
             ..Default::default()
         };
-        let response = db.handle_set("client1", &msg, false).await;
+        let response = db.handle_set("client1", &msg).await;
         let resp = response.expect("Expected ACK");
         assert!(
             resp.nack.is_none(),
@@ -1625,7 +1606,7 @@ fn test_eviction_then_update() {
             request_id: Some("r1".to_string()),
             ..Default::default()
         };
-        let response = db.handle_update("client1", &msg, false).await;
+        let response = db.handle_update("client1", &msg).await;
         let resp = response.expect("Expected ACK");
         assert!(
             resp.nack.is_none(),
@@ -1674,7 +1655,7 @@ fn test_eviction_then_delete() {
             request_id: Some("r1".to_string()),
             ..Default::default()
         };
-        let response = db.handle_remove("client1", &msg, false).await;
+        let response = db.handle_remove("client1", &msg).await;
         let resp = response.expect("Expected ACK");
         assert!(
             resp.nack.is_none(),
@@ -1730,7 +1711,7 @@ fn test_eviction_subscription_receives_delta_event() {
             request_id: Some("r2".to_string()),
             ..Default::default()
         };
-        db.handle_set("client1", &set_msg, false).await;
+        db.handle_set("client1", &set_msg).await;
 
         // Events are sent directly during broadcast_mutation via try_send
         let msgs = messages.lock().unwrap();
@@ -1790,7 +1771,7 @@ fn test_eviction_query_view_recompute() {
             request_id: Some("r2".to_string()),
             ..Default::default()
         };
-        let response = db.handle_remove("client1", &del_msg, false).await;
+        let response = db.handle_remove("client1", &del_msg).await;
         assert!(
             response.is_none() || response.as_ref().unwrap().nack.is_none(),
             "DELETE should succeed: {:?}",
@@ -1826,7 +1807,7 @@ fn test_eviction_wal_replay_preserves_all_writes() {
             request_id: Some("r1".to_string()),
             ..Default::default()
         };
-        db.handle_set("client1", &msg, false).await;
+        db.handle_set("client1", &msg).await;
 
         // Evict /chat
         force_evict(&mut db, "/chat");
@@ -1839,7 +1820,7 @@ fn test_eviction_wal_replay_preserves_all_writes() {
             request_id: Some("r2".to_string()),
             ..Default::default()
         };
-        db.handle_set("client1", &msg2, false).await;
+        db.handle_set("client1", &msg2).await;
 
         // Now deep-read /chat — should promote from blob + replay ALL WAL entries
         db.promote_path_deep("/chat").await.unwrap();
@@ -1891,7 +1872,7 @@ fn test_eviction_orphaned_descendants_replaced_on_promote() {
             request_id: Some("r1".to_string()),
             ..Default::default()
         };
-        db.handle_set("client1", &msg, false).await;
+        db.handle_set("client1", &msg).await;
 
         // Verify msg2 exists in tree (it was set via set_lazy)
         let val = db
@@ -2070,7 +2051,7 @@ fn test_eviction_rules_evaluation_promotes() {
             request_id: Some("r2".to_string()),
             ..Default::default()
         };
-        let resp2 = db.handle_set("client1", &set_msg, false).await.unwrap();
+        let resp2 = db.handle_set("client1", &set_msg).await.unwrap();
         assert!(
             resp2.nack.is_none(),
             "Write should succeed — rules should re-promote /config via NeedsPromotion loop. Got: {:?}",
@@ -2569,7 +2550,7 @@ fn test_shallow_once_wal_adds_children() {
             request_id: Some("w1".to_string()),
             ..Default::default()
         };
-        db.handle_set("client1", &set_msg, false).await;
+        db.handle_set("client1", &set_msg).await;
 
         // Shallow read should include both blob key (alice) and WAL key (bob)
         let msg = shallow_once_msg("/characters", "r1");
@@ -2606,7 +2587,7 @@ fn test_shallow_once_wal_deletes_child() {
             request_id: Some("w1".to_string()),
             ..Default::default()
         };
-        db.handle_remove("client1", &del_msg, false).await;
+        db.handle_remove("client1", &del_msg).await;
 
         // Shallow read should only have alice
         let msg = shallow_once_msg("/characters", "r1");
@@ -2702,7 +2683,7 @@ fn test_shallow_once_wal_deep_descendant() {
             request_id: Some("w1".to_string()),
             ..Default::default()
         };
-        db.handle_set("client1", &set_msg, false).await;
+        db.handle_set("client1", &set_msg).await;
 
         let msg = shallow_once_msg("/data", "r1");
         let resp = db.handle_once("client1", &msg).await.unwrap();
@@ -2738,7 +2719,7 @@ fn test_shallow_once_wal_set_replaces_node() {
             request_id: Some("w1".to_string()),
             ..Default::default()
         };
-        db.handle_set("client1", &set_msg, false).await;
+        db.handle_set("client1", &set_msg).await;
 
         let msg = shallow_once_msg("/config", "r1");
         let resp = db.handle_once("client1", &msg).await.unwrap();
@@ -3677,7 +3658,7 @@ fn test_promoting_deleted_sentinel_child_removes_it() {
             request_id: Some("w1".to_string()),
             ..Default::default()
         };
-        db.handle_update("client1", &delete, false).await;
+        db.handle_update("client1", &delete).await;
 
         db.promote_path_deep("/root/branch").await.unwrap();
         let tree = db.tree.read().unwrap();
@@ -3733,7 +3714,7 @@ fn test_shallow_once_sees_pending_update_from_ancestor() {
         db.add_client_internal("client1", None, "conn1", conn);
 
         let update = root_update_msg(json!({"m/alpha": 1}));
-        db.handle_update("client1", &update, false).await;
+        db.handle_update("client1", &update).await;
 
         let resp = db
             .handle_once("client1", &shallow_once_msg("/m", "r1"))
@@ -3755,7 +3736,7 @@ fn test_shallow_once_skips_container_emptied_by_pending_delete() {
         db.add_client_internal("client1", None, "conn1", conn);
 
         let update = root_update_msg(json!({"root/emptied/x": null}));
-        db.handle_update("client1", &update, false).await;
+        db.handle_update("client1", &update).await;
 
         let resp = db
             .handle_once("client1", &shallow_once_msg("/root", "r1"))
@@ -3803,7 +3784,7 @@ fn test_path_holds_stored_data_finds_data_missing_from_tree() {
 
         // A pending delete counts, and a pending write counts.
         let update = root_update_msg(json!({"root/lost/deep": null, "root/new/leaf": 3}));
-        db.handle_update("client1", &update, false).await;
+        db.handle_update("client1", &update).await;
         assert!(!db.path_holds_stored_data("/root/lost/deep").await);
         assert!(db.path_holds_stored_data("/root/new/leaf").await);
     })
@@ -3829,7 +3810,7 @@ fn test_shallow_once_checks_pending_deletes_without_promoting() {
             "root/emptied/a/b": null,
             "root/partly/x": null
         }));
-        db.handle_update("client1", &update, false).await;
+        db.handle_update("client1", &update).await;
         let promoted_before = db.promoted_paths.len();
 
         let resp = db
@@ -3902,40 +3883,38 @@ fn test_unchanged_writes_stay_out_of_the_wal() {
         db.promote_path("/game").await.unwrap();
 
         // Same value as loaded: nothing to replay.
-        db.handle_set(
-            "client1",
-            &write_msg("s", "/game/a", Some(json!(1)), "r1"),
-            false,
-        )
-        .await;
+        db.handle_set("client1", &write_msg("s", "/game/a", Some(json!(1)), "r1"))
+            .await;
         assert!(db.pending_wal_entries.is_empty());
 
-        // Only the key that changed goes in.
+        // An update with a changed key goes in as sent.
         db.handle_update(
             "client1",
             &write_msg("u", "/game", Some(json!({"a": 1, "b": 2})), "r2"),
-            false,
         )
         .await;
         assert_eq!(db.pending_wal_entries.len(), 1);
-        assert_eq!(db.pending_wal_entries[0].value, Some(json!({"b": 2})));
+        assert_eq!(
+            db.pending_wal_entries[0].value,
+            Some(json!({"a": 1, "b": 2}))
+        );
 
-        // Removing what isn't there: nothing.
-        db.handle_remove(
+        // One where every key held its value stays out.
+        db.handle_update(
             "client1",
-            &write_msg("r", "/game/missing", None, "r3"),
-            false,
+            &write_msg("u", "/game", Some(json!({"a": 1, "b": 2})), "r2b"),
         )
         .await;
+        assert_eq!(db.pending_wal_entries.len(), 1);
+
+        // Removing what isn't there: nothing.
+        db.handle_remove("client1", &write_msg("r", "/game/missing", None, "r3"))
+            .await;
         assert_eq!(db.pending_wal_entries.len(), 1);
 
         // Data that isn't loaded can't be compared, so it's written.
-        db.handle_set(
-            "client1",
-            &write_msg("s", "/other/x", Some(json!(1)), "r4"),
-            false,
-        )
-        .await;
+        db.handle_set("client1", &write_msg("s", "/other/x", Some(json!(1)), "r4"))
+            .await;
         assert_eq!(db.pending_wal_entries.len(), 2);
 
         assert!(db.held_wal_bytes() > 0);
@@ -3953,12 +3932,8 @@ fn test_idle_database_compacts_its_wal_before_unloading() {
 
         let (conn, _messages) = MockConnection::new();
         db.add_client_internal("client1", None, "conn1", conn);
-        db.handle_set(
-            "client1",
-            &write_msg("s", "/game/b", Some(json!(2)), "r1"),
-            false,
-        )
-        .await;
+        db.handle_set("client1", &write_msg("s", "/game/b", Some(json!(2)), "r1"))
+            .await;
         db.sync_wal().await;
         assert_eq!(db.pending_wal_entries.len(), 1);
         let held = db.held_wal_bytes();
@@ -4005,16 +3980,62 @@ fn test_unload_waits_no_longer_than_its_cap() {
 
         let (conn, _messages) = MockConnection::new();
         db.add_client_internal("client1", None, "conn1", conn);
-        db.handle_set(
-            "client1",
-            &write_msg("s", "/game/b", Some(json!(2)), "r1"),
-            false,
-        )
-        .await;
+        db.handle_set("client1", &write_msg("s", "/game/b", Some(json!(2)), "r1"))
+            .await;
 
         assert!(!db.ready_to_unload().await);
         assert!(!db.ready_to_unload().await, "still waiting");
         db.unload_compaction_started = Some(Instant::now() - UNLOAD_COMPACTION_WAIT);
         assert!(db.ready_to_unload().await, "gives up after the cap");
+    })
+}
+
+#[test]
+fn test_client_volatile_flag_is_ignored() {
+    // A write flagged volatile by the client, on a path the rules don't make
+    // volatile, is stored like any other. Otherwise it would change data in
+    // memory without the WAL, and a later write of the same value would look
+    // unchanged and be lost on restart.
+    block_on(async {
+        let (mut db, _dir) = make_blob_backed_db(json!({"game": {"a": 1}})).await;
+        let (conn, _messages) = MockConnection::new();
+        db.add_client_internal("client1", None, "conn1", conn);
+        db.promote_path("/game").await.unwrap();
+
+        let mut flagged = write_msg("u", "/game", Some(json!({"a": 5})), "r1");
+        flagged.volatile = Some(true);
+        db.handle_update("client1", &flagged).await;
+        let mut flagged = write_msg("r", "/game/a", None, "r2");
+        flagged.volatile = Some(true);
+        db.handle_remove("client1", &flagged).await;
+
+        assert_eq!(db.pending_wal_entries.len(), 2);
+    })
+}
+
+#[test]
+fn test_volatile_update_and_remove_are_not_stored() {
+    block_on(async {
+        let (mut db, _dir) = make_blob_backed_db(json!({"game": {"a": 1}})).await;
+        db.set_volatile_paths(vec!["cursors".to_string()]);
+        let (conn, _messages) = MockConnection::new();
+        db.add_client_internal("client1", None, "conn1", conn);
+
+        let ack = db
+            .handle_update(
+                "client1",
+                &write_msg("u", "/cursors", Some(json!({"p1": {"x": 1}})), "r1"),
+            )
+            .await
+            .expect("answer");
+        assert_eq!(ack.ack.as_deref(), Some("r1"));
+        let ack = db
+            .handle_remove("client1", &write_msg("r", "/cursors/p1", None, "r2"))
+            .await
+            .expect("answer");
+        assert_eq!(ack.ack.as_deref(), Some("r2"));
+
+        assert!(db.pending_wal_entries.is_empty());
+        assert_eq!(db.tree.read().unwrap().get_value_str("/cursors/p1"), None);
     })
 }
