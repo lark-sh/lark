@@ -120,7 +120,10 @@ impl<IO: BlobIO> CachedIO<IO> {
         CachedIO {
             inner,
             regions: Rc::new(RefCell::new(BTreeMap::new())),
-            lru_order: Rc::new(RefCell::new(LruCache::new(cap))),
+            // `sparse`: the table grows with the cache instead of being sized
+            // for MAX_CACHED_REGIONS when the cache opens, which cost every open
+            // blob a few megabytes before it read anything.
+            lru_order: Rc::new(RefCell::new(LruCache::sparse(cap))),
             pread_count: Rc::new(Cell::new(0)),
             bytes_read: Rc::new(Cell::new(0)),
             cache_hits: Rc::new(Cell::new(0)),

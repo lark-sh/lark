@@ -808,7 +808,9 @@ pub struct CompactionComplete {
     pub cached_io: Option<CachedIO<GlommioBlobIO>>,
 }
 
-/// Message sent to the database inbox.
+/// Message sent to the database inbox. The inbox carries each one boxed (see
+/// `Inbox`): the struct is over a kilobyte, and a bounded channel reserves room
+/// for every slot when it's created.
 pub struct InboxMessage {
     pub client_id: String,
     pub message: Option<ClientMessage>,
@@ -914,10 +916,10 @@ pub struct Database {
     pub ephemeral: bool,
 
     /// Inbox channel receiver (sender is held by DatabaseHandle)
-    inbox: LocalReceiver<InboxMessage>,
+    inbox: LocalReceiver<Inbox>,
 
     /// Inbox sender for creating handles (wrapped in Rc for cloning)
-    inbox_sender: Rc<LocalSender<InboxMessage>>,
+    inbox_sender: Rc<LocalSender<Inbox>>,
 
     /// Client management
     clients: HashMap<String, ClientInfo>,
@@ -1055,14 +1057,14 @@ pub struct Database {
 pub struct DatabaseHandle {
     pub id: String,
     /// Inbox sender - wrapped in Rc for cloning (LocalSender is !Clone)
-    pub inbox: Rc<LocalSender<InboxMessage>>,
+    pub inbox: Rc<LocalSender<Inbox>>,
 }
 
 impl DatabaseHandle {
     /// Send a message to the database (non-blocking).
     /// Returns true if sent, false if channel is full (should be rare with proper sizing).
     pub fn send(&self, msg: InboxMessage) -> bool {
-        self.inbox.try_send(msg).is_ok()
+        self.inbox.try_send(Box::new(msg)).is_ok()
     }
 
     /// Add a client to the database.
@@ -1082,7 +1084,7 @@ impl DatabaseHandle {
             auth_info: auth,
             ..Default::default()
         };
-        let _ = self.inbox.try_send(msg);
+        let _ = self.inbox.try_send(Box::new(msg));
     }
 
     /// Send a protocol message from a client.
@@ -1109,7 +1111,7 @@ impl DatabaseHandle {
             timestamps,
             ..Default::default()
         };
-        let _ = self.inbox.try_send(msg);
+        let _ = self.inbox.try_send(Box::new(msg));
     }
 
     /// Notify that a client disconnected.
@@ -1120,7 +1122,7 @@ impl DatabaseHandle {
             disconnect: true,
             ..Default::default()
         };
-        let _ = self.inbox.try_send(msg);
+        let _ = self.inbox.try_send(Box::new(msg));
     }
 
     /// Force-evict all promoted paths (for testing eviction/re-promotion).
@@ -1129,7 +1131,7 @@ impl DatabaseHandle {
             force_evict_all: true,
             ..Default::default()
         };
-        let _ = self.inbox.try_send(msg);
+        let _ = self.inbox.try_send(Box::new(msg));
     }
 
     /// Update a client's authentication state.
@@ -1141,7 +1143,7 @@ impl DatabaseHandle {
             has_auth: true,
             ..Default::default()
         };
-        let _ = self.inbox.try_send(msg);
+        let _ = self.inbox.try_send(Box::new(msg));
     }
 
     /// Hot-reload the rules evaluator (called on CONFIG_PUSH).
@@ -1153,12 +1155,17 @@ impl DatabaseHandle {
             evaluator_update: evaluator,
             ..Default::default()
         };
-        let _ = self.inbox.try_send(msg);
+        let _ = self.inbox.try_send(Box::new(msg));
     }
 }
 
 /// Default inbox channel size - large enough to buffer burst traffic
 const INBOX_CHANNEL_SIZE: usize = 16384;
+
+/// What a database's inbox carries. Boxed so the channel's slots are a pointer
+/// each: it reserves all INBOX_CHANNEL_SIZE of them up front, for every loaded
+/// database, and an unboxed InboxMessage would make that about 25 MB.
+pub type Inbox = Box<InboxMessage>;
 
 /// Maximum number of write request IDs to track per connection for deduplication.
 /// After this limit, oldest entries are evicted.
