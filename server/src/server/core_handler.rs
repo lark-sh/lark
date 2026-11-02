@@ -351,6 +351,8 @@ impl CoreHandler {
                 }
             }
 
+            self_clone.forget_unused_project_config(&project_id_owned);
+
             // Note: We no longer create segmentation markers on eviction.
             // On next startup, the database will lazy-load from NAS (manifest + hot.json)
             // and replay the small WAL file (< rotation limit).
@@ -364,6 +366,39 @@ impl CoreHandler {
         );
 
         (handle, true)
+    }
+
+    /// Whether anything on this core uses the project's config: a loaded
+    /// database, one still stopping after an eviction, or a connect waiting
+    /// for the config.
+    fn project_in_use(&self, project_id: &str) -> bool {
+        self.databases
+            .borrow()
+            .keys()
+            .chain(self.evicted_databases.borrow().iter())
+            .any(|id| parse_project_id(id) == project_id)
+            || self.pending_configs.borrow().contains_key(project_id)
+    }
+
+    /// Drops a project's cached config once nothing on this core uses it, so
+    /// the next database to load fetches the current one. The proxy pushes
+    /// config changes only to cores with one of the project's databases
+    /// loaded; a config kept here after the last one stopped would miss them.
+    fn forget_unused_project_config(&self, project_id: &str) {
+        if self.config.emulator || self.project_in_use(project_id) {
+            return;
+        }
+        if self
+            .project_configs
+            .borrow_mut()
+            .remove(project_id)
+            .is_some()
+        {
+            debug!(
+                "Dropped config for project {} on core {}: no databases loaded",
+                project_id, self.config.core_id
+            );
+        }
     }
 
     /// Handle a config push from the proxy.
@@ -380,6 +415,17 @@ impl CoreHandler {
             trace!(
                 "Skipping CONFIG_PUSH for {}: incoming version {} <= cached {}",
                 project_id, config.config_version, cached.config_version
+            );
+            return;
+        }
+
+        // Keep a project's config only while this core uses it. The proxy
+        // pushes changes only to cores with one of the project's databases
+        // loaded, so a config stored here without one would miss them.
+        if !self.config.emulator && !self.project_in_use(project_id) {
+            trace!(
+                "Skipping CONFIG_PUSH for {}: no database or connect uses it on this core",
+                project_id
             );
             return;
         }
@@ -896,6 +942,27 @@ impl CoreHandler {
             );
             if let Ok(data) =
                 ServerMessage::nack("", error::PROJECT_DISABLED, "project is disabled").encode()
+            {
+                let _ = client.try_send(data.into(), false);
+            }
+            client.close();
+            return None;
+        }
+
+        // Never start a database without its project's config: it would run
+        // with no rules. A client that gets here without one reconnects and
+        // waits for the config like any first connect.
+        if !self.config.emulator
+            && !project_id.is_empty()
+            && !self.has_project_config(&project_id)
+            && !self.databases.borrow().contains_key(&database_id)
+        {
+            warn!(
+                "Rejecting client {} - no config for project {}",
+                client.id, project_id
+            );
+            if let Ok(data) =
+                ServerMessage::nack("", error::UNAVAILABLE, "project config not loaded").encode()
             {
                 let _ = client.try_send(data.into(), false);
             }
@@ -1574,13 +1641,17 @@ mod tests {
     }
 
     fn make_test_handler() -> Rc<CoreHandler> {
+        make_handler(true)
+    }
+
+    fn make_handler(emulator: bool) -> Rc<CoreHandler> {
         let (tx, _rx) = glommio::channels::local_channel::new_bounded(16);
         CoreHandler::new(
             CoreHandlerConfig {
                 core_id: 0,
                 nr_cores: 1,
                 port: 7779,
-                emulator: true,
+                emulator,
                 data_dir: None,
                 template_path: None,
             },
@@ -2015,6 +2086,129 @@ mod tests {
             glommio::timer::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("{id} never stopped");
+    }
+
+    fn rules_config(version: u64) -> ProjectConfig {
+        ProjectConfig {
+            rules: Some(r#"{"rules": {".read": true, ".write": true}}"#.to_string()),
+            config_version: version,
+            ..Default::default()
+        }
+    }
+
+    /// Connects a client outside emulator mode, answering its config request.
+    fn connect_with_config(handler: &Rc<CoreHandler>, client: Rc<VirtualClient>, version: u64) {
+        let project_id = client.project_id.clone();
+        let result = ProxyHandler::on_connect(handler, client);
+        if result.needs_config {
+            handler.handle_config_push(&project_id, rules_config(version));
+        }
+    }
+
+    #[test]
+    fn test_config_push_for_unused_project_is_ignored() {
+        let handler = make_handler(false);
+        handler.handle_config_push("idle-project", rules_config(1));
+        assert!(
+            !handler.has_project_config("idle-project"),
+            "a core with no database for the project must not keep its config"
+        );
+    }
+
+    #[test]
+    fn test_config_dropped_when_last_database_stops() {
+        glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+            .spawn(|| async {
+                let handler = make_handler(false);
+                let client = Rc::new(VirtualClient::new_for_test(1, "rules-project", "db"));
+                connect_with_config(&handler, client, 1);
+                assert!(handler.databases.borrow().contains_key("rules-project/db"));
+                assert!(handler.has_project_config("rules-project"));
+
+                handler.handle_evict_database("rules-project", "db", 0);
+                wait_until_stopped(&handler, "rules-project/db").await;
+
+                assert!(
+                    !handler.has_project_config("rules-project"),
+                    "config should be dropped once no database uses it"
+                );
+
+                // The next connect asks for the current config again.
+                let next = Rc::new(VirtualClient::new_for_test(2, "rules-project", "db"));
+                let result = ProxyHandler::on_connect(&handler, next);
+                assert!(result.needs_config);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_config_kept_while_another_database_is_loaded() {
+        glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+            .spawn(|| async {
+                let handler = make_handler(false);
+                connect_with_config(
+                    &handler,
+                    Rc::new(VirtualClient::new_for_test(1, "two-project", "a")),
+                    1,
+                );
+                connect_with_config(
+                    &handler,
+                    Rc::new(VirtualClient::new_for_test(2, "two-project", "b")),
+                    1,
+                );
+
+                handler.handle_evict_database("two-project", "a", 0);
+                wait_until_stopped(&handler, "two-project/a").await;
+
+                assert!(handler.has_project_config("two-project"));
+
+                // And pushes still reach it.
+                handler.handle_config_push("two-project", rules_config(2));
+                assert_eq!(
+                    handler
+                        .project_configs
+                        .borrow()
+                        .get("two-project")
+                        .unwrap()
+                        .config_version,
+                    2
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_client_waiting_for_eviction_reconnects_with_config() {
+        glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+            .spawn(|| async {
+                let handler = make_handler(false);
+                let id = "wait-project/db";
+                connect_with_config(
+                    &handler,
+                    Rc::new(VirtualClient::new_for_test(1, "wait-project", "db")),
+                    1,
+                );
+
+                handler.handle_evict_database("wait-project", "db", 0);
+                let second = Rc::new(VirtualClient::new_for_test(2, "wait-project", "db"));
+                ProxyHandler::on_connect(&handler, second.clone());
+
+                wait_until_stopped(&handler, id).await;
+
+                assert!(handler.databases.borrow().contains_key(id));
+                assert!(handler.client_databases.borrow().contains_key(&second.id));
+                assert!(
+                    handler.has_project_config("wait-project"),
+                    "the reconnected database still uses the config"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
