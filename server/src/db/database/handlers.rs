@@ -235,7 +235,12 @@ impl Database {
 
         // Append to the WAL for durability — buffered in memory here; flushed
         // (and fdatasync'd, if enabled) on the next WAL sync. See sync_wal.
-        self.wal_write_set(path_str, &value);
+        // A write that leaves the data as it was has nothing to replay and
+        // stays out. It only counts as unchanged against data in memory (see
+        // Tree::holds), never data that hasn't been loaded.
+        if changed {
+            self.wal_write_set(path_str, &value);
+        }
 
         // Broadcast to subscribers via ViewManager
         if self.needs_broadcast(path_str, changed, is_volatile) {
@@ -462,9 +467,20 @@ impl Database {
         };
 
         // Append to the WAL for durability (non-volatile writes only) — buffered
-        // in memory here; flushed on the next WAL sync. See sync_wal.
+        // in memory here; flushed on the next WAL sync. See sync_wal. Keys
+        // that held their value stay out, as in handle_set: each was compared
+        // just before it was applied, so dropping it leaves replay unchanged.
         if !volatile {
-            self.wal_write_update(path_str, &updates);
+            if unchanged.is_empty() {
+                self.wal_write_update(path_str, &updates);
+            } else if unchanged.len() < updates.len() {
+                let changed: serde_json::Map<String, Value> = updates
+                    .iter()
+                    .filter(|(key, _)| !unchanged.contains(key))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                self.wal_write_update(path_str, &changed);
+            }
         }
 
         // Broadcast the keys that changed to subscribers
@@ -562,8 +578,9 @@ impl Database {
         self.remove_sentinel_paths_below(path_str);
 
         // Append to the WAL for durability (non-volatile writes only) — buffered
-        // in memory here; flushed on the next WAL sync. See sync_wal.
-        if !volatile {
+        // in memory here; flushed on the next WAL sync. See sync_wal. Removing
+        // what isn't there stays out, as in handle_set.
+        if !volatile && changed {
             self.wal_write_delete(path_str);
         }
 

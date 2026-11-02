@@ -3874,3 +3874,147 @@ fn test_shallow_once_unloaded_primitive_child_keeps_its_value() {
         assert_is_size_marker(&val["box"], "box");
     })
 }
+
+// =========================================================================
+// WAL: unchanged writes and compaction before unloading
+// =========================================================================
+
+fn write_msg(op: &str, path: &str, value: Option<Value>, request_id: &str) -> ClientMessage {
+    ClientMessage {
+        op: op.to_string(),
+        path: Some(path.to_string()),
+        value,
+        request_id: Some(request_id.to_string()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_unchanged_writes_stay_out_of_the_wal() {
+    block_on(async {
+        let (mut db, _dir) = make_blob_backed_db(json!({
+            "game": {"a": 1},
+            "other": {"x": 1}
+        }))
+        .await;
+        let (conn, _messages) = MockConnection::new();
+        db.add_client_internal("client1", None, "conn1", conn);
+        db.promote_path("/game").await.unwrap();
+
+        // Same value as loaded: nothing to replay.
+        db.handle_set(
+            "client1",
+            &write_msg("s", "/game/a", Some(json!(1)), "r1"),
+            false,
+        )
+        .await;
+        assert!(db.pending_wal_entries.is_empty());
+
+        // Only the key that changed goes in.
+        db.handle_update(
+            "client1",
+            &write_msg("u", "/game", Some(json!({"a": 1, "b": 2})), "r2"),
+            false,
+        )
+        .await;
+        assert_eq!(db.pending_wal_entries.len(), 1);
+        assert_eq!(db.pending_wal_entries[0].value, Some(json!({"b": 2})));
+
+        // Removing what isn't there: nothing.
+        db.handle_remove(
+            "client1",
+            &write_msg("r", "/game/missing", None, "r3"),
+            false,
+        )
+        .await;
+        assert_eq!(db.pending_wal_entries.len(), 1);
+
+        // Data that isn't loaded can't be compared, so it's written.
+        db.handle_set(
+            "client1",
+            &write_msg("s", "/other/x", Some(json!(1)), "r4"),
+            false,
+        )
+        .await;
+        assert_eq!(db.pending_wal_entries.len(), 2);
+
+        assert!(db.held_wal_bytes() > 0);
+    })
+}
+
+#[test]
+fn test_idle_database_compacts_its_wal_before_unloading() {
+    block_on(async {
+        let (mut db, dir) = make_blob_backed_db(json!({"game": {"a": 1}})).await;
+        let (tx, rx) = glommio::channels::local_channel::new_bounded(16);
+        glommio::spawn_local(async move { crate::storage::StorageWorker::new(rx).run().await })
+            .detach();
+        db.set_compaction_tx(Rc::new(tx));
+
+        let (conn, _messages) = MockConnection::new();
+        db.add_client_internal("client1", None, "conn1", conn);
+        db.handle_set(
+            "client1",
+            &write_msg("s", "/game/b", Some(json!(2)), "r1"),
+            false,
+        )
+        .await;
+        db.sync_wal().await;
+        assert_eq!(db.pending_wal_entries.len(), 1);
+        let held = db.held_wal_bytes();
+        assert!(held > 0);
+
+        // First call asks for the compaction and keeps the database running.
+        assert!(!db.ready_to_unload().await);
+
+        let mut msg =
+            glommio::timer::timeout(Duration::from_secs(10), async { Ok(db.inbox.recv().await) })
+                .await
+                .expect("the storage worker should answer")
+                .expect("compaction answer");
+        let done = msg.compaction_complete.take().expect("compaction complete");
+        db.handle_compaction_complete(done).await;
+
+        assert!(db.pending_wal_entries.is_empty());
+        assert_eq!(db.held_wal_bytes(), 0);
+        assert!(db.ready_to_unload().await);
+
+        // The write is in the blob: a fresh load has no WAL to replay.
+        let mut reloaded = Database::new_with_persistence(
+            "test/evict".to_string(),
+            "test".to_string(),
+            dir.path().to_path_buf(),
+        );
+        reloaded.load_from_disk().await.unwrap();
+        assert!(reloaded.pending_wal_entries.is_empty());
+        reloaded.promote_path("/game").await.unwrap();
+        assert_eq!(
+            reloaded.tree.read().unwrap().get_value_str("/game"),
+            Some(json!({"a": 1, "b": 2}))
+        );
+    })
+}
+
+#[test]
+fn test_unload_waits_no_longer_than_its_cap() {
+    block_on(async {
+        let (mut db, _dir) = make_blob_backed_db(json!({"game": {"a": 1}})).await;
+        // A channel nobody reads: the compaction never answers.
+        let (tx, _rx) = glommio::channels::local_channel::new_bounded(16);
+        db.set_compaction_tx(Rc::new(tx));
+
+        let (conn, _messages) = MockConnection::new();
+        db.add_client_internal("client1", None, "conn1", conn);
+        db.handle_set(
+            "client1",
+            &write_msg("s", "/game/b", Some(json!(2)), "r1"),
+            false,
+        )
+        .await;
+
+        assert!(!db.ready_to_unload().await);
+        assert!(!db.ready_to_unload().await, "still waiting");
+        db.unload_compaction_started = Some(Instant::now() - UNLOAD_COMPACTION_WAIT);
+        assert!(db.ready_to_unload().await, "gives up after the cap");
+    })
+}

@@ -316,8 +316,11 @@ impl Database {
                     self.view_manager.view_count()
                 );
 
-                // Check for idle shutdown
-                if self.clients.is_empty() && self.last_activity.elapsed() > Duration::from_secs(60)
+                // Check for idle shutdown, compacting the WAL first
+                if !self.clients.is_empty() {
+                    self.unload_compaction_started = None;
+                } else if self.last_activity.elapsed() > Duration::from_secs(60)
+                    && self.ready_to_unload().await
                 {
                     debug!("Database {} idle, shutting down", self.id);
                     break;
@@ -327,6 +330,8 @@ impl Database {
             // Emit metrics to stdout (60s, only if active)
             if now.duration_since(last_metrics_emit) >= METRICS_EMIT_INTERVAL {
                 self.refresh_data_size().await;
+                self.metrics
+                    .set_held_wal(self.held_wal_bytes(), self.pending_wal_entries.len() as u64);
                 self.emit_metrics();
                 last_metrics_emit = now;
             }
@@ -372,13 +377,14 @@ impl Database {
     }
 
     async fn dispatch_message(&mut self, msg: &mut InboxMessage) {
-        self.last_activity = Instant::now();
-
-        // Handle compaction complete from StorageWorker
+        // Handle compaction complete from StorageWorker. Not client activity, so
+        // it doesn't hold off an idle unload.
         if let Some(cc) = msg.compaction_complete.take() {
             self.handle_compaction_complete(cc).await;
             return;
         }
+
+        self.last_activity = Instant::now();
 
         // Handle force eviction (for testing)
         if msg.force_evict_all {

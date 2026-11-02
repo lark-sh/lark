@@ -187,6 +187,24 @@ impl WalWriter {
         self.open_file(sync_dir).await
     }
 
+    /// Starts a new WAL file if the current one holds anything, so the storage
+    /// worker can compact it: it only compacts files below the newest. Returns
+    /// whether it rotated. Call after `sync`, with nothing left in the buffer.
+    pub async fn rotate_if_not_empty(&mut self, sync_dir: bool) -> io::Result<bool> {
+        if !self.buffer.is_empty() {
+            return Err(io::Error::other("WAL buffer not flushed before rotating"));
+        }
+        if self
+            .current_file
+            .as_ref()
+            .is_none_or(|file| file.size() == 0)
+        {
+            return Ok(false);
+        }
+        self.rotate(sync_dir).await?;
+        Ok(true)
+    }
+
     /// Returns the current WAL sequence number.
     pub fn sequence(&self) -> i64 {
         self.sequence
