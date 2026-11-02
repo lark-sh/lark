@@ -1,13 +1,16 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/bytedance/sonic"
 
+	"github.com/lark-sh/lark/edge/auth"
 	"github.com/lark-sh/lark/edge/backend"
+	"github.com/lark-sh/lark/edge/db"
 	"github.com/lark-sh/lark/edge/testutil"
 )
 
@@ -771,5 +774,75 @@ func TestClientDuplicateAuthBeforeProjectReady(t *testing.T) {
 			client.OnMessage(tc.authMsg(), true)
 			client.waitForAuth()
 		})
+	}
+}
+
+// A token sent after routing (a client switching users) that fails validation
+// is answered with an auth error carrying that request's ID, not the ID of the
+// connection's first auth, so the client can match it to its request.
+func TestLarkLateAuthErrorAnswersItsOwnRequest(t *testing.T) {
+	server := &Server{authValidator: auth.NewMultiValidator(nil), ctx: context.Background()}
+	server.projectCache.Store("proj", &projectCacheEntry{
+		project:   &db.Project{ID: "proj", SecretKey: "secret", AdminSecretKey: "admin-secret"},
+		fetchedAt: time.Now(),
+	})
+	transport := NewMockTransport(backend.ProtocolWebSocket)
+	client := newTestClient(1, transport, ProtocolLark)
+	client.server = server
+	client.projectID = "proj"
+
+	client.handleLateAuth([]byte(`{"o":"au","r":"7","t":"not-a-real-token"}`))
+
+	if transport.MessageCount() != 1 {
+		t.Fatalf("should have sent 1 message, got %d", transport.MessageCount())
+	}
+	lastMsg, _ := transport.LastMessage()
+	var response map[string]interface{}
+	if err := sonic.Unmarshal(lastMsg, &response); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if response["ae"] != "7" {
+		t.Errorf("auth error request ID: got %v, want 7", response["ae"])
+	}
+	if response["err"] == "" || response["err"] == nil {
+		t.Error("auth error should say why the token was rejected")
+	}
+}
+
+// A client that authenticates again before its first read or write (signing in
+// right after connecting) gets an answer to each auth, under each request's ID.
+func TestLarkAuthBeforeRoutingAnswersEachRequest(t *testing.T) {
+	server := &Server{authValidator: auth.NewMultiValidator(nil), ctx: context.Background()}
+	transport := NewMockTransport(backend.ProtocolWebSocket)
+	client := newTestClient(1, transport, ProtocolLark)
+	client.server = server
+	client.projectConfig = &db.Project{ID: "proj", SecretKey: "secret", AdminSecretKey: "admin-secret"}
+	client.projectReady = make(chan struct{})
+	close(client.projectReady)
+
+	answers := func() []map[string]interface{} {
+		var out []map[string]interface{}
+		for _, sent := range transport.SentMessages() {
+			var m map[string]interface{}
+			if sonic.Unmarshal(sent.data, &m) == nil {
+				out = append(out, m)
+			}
+		}
+		return out
+	}
+
+	client.OnMessage([]byte(`{"o":"au","r":"1","t":""}`), true)
+	client.waitForAuth()
+	client.OnMessage([]byte(`{"o":"au","r":"2","t":"not-a-real-token"}`), true)
+	client.waitForAuth()
+	client.OnMessage([]byte(`{"o":"au","r":"3","t":""}`), true)
+	client.waitForAuth()
+
+	got := answers()
+	if len(got) != 3 {
+		t.Fatalf("should have answered 3 auth requests, got %d: %v", len(got), got)
+	}
+	if got[0]["ac"] != "1" || got[1]["ae"] != "2" || got[2]["ac"] != "3" {
+		t.Errorf("answers should match their requests in order, got %v", got)
 	}
 }
