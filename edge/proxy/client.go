@@ -199,6 +199,12 @@ type ClientConn struct {
 	bufferMu sync.Mutex
 	buffer   [][]byte
 
+	// A Firebase message being reassembled before routing: the frames still to
+	// come, those received and their total size. Read goroutine only.
+	fbFramesLeft int
+	fbFrames     [][]byte
+	fbFrameBytes int
+
 	// Firebase state
 	firebaseState *FirebaseState
 
@@ -777,16 +783,76 @@ func (c *ClientConn) markAuthResponseSent(requestID string) bool {
 // handleFirebaseMessage handles Firebase protocol messages
 func (c *ClientConn) handleFirebaseMessage(data []byte) {
 	// Handle keepalive locally (connection-level, not forwarded)
-	if string(data) == "0" {
+	if string(data) == "0" && c.fbFramesLeft == 0 {
 		c.sendDirect([]byte("0"), true)
 		return
 	}
 
-	// Buffer ALL messages - proxy is transparent, but we forward everything
+	// Buffer ALL messages - proxy is transparent, but we forward everything.
+	// The frames of a chunked message are buffered as they arrive; the backend
+	// reassembles them itself.
 	c.bufferMu.Lock()
 	c.buffer = append(c.buffer, data)
 	c.bufferMu.Unlock()
 
+	// A message over 16 KB arrives as a frame count, then that many frames
+	// whose concatenation is the message. Look at it once the last one is in.
+	if c.fbFramesLeft > 0 {
+		c.fbFrameBytes += len(data)
+		if len(data) > firebaseMaxInboundFrameBytes || c.fbFrameBytes > firebaseMaxMessageBytes {
+			logger.Warn("Firebase client sent an oversized chunked message", "client_id", c.id, "bytes", c.fbFrameBytes)
+			c.Close()
+			return
+		}
+		c.fbFrames = append(c.fbFrames, data)
+		c.fbFramesLeft--
+		if c.fbFramesLeft > 0 {
+			return
+		}
+		data = bytes.Join(c.fbFrames, nil)
+		c.fbFrames = nil
+		c.fbFrameBytes = 0
+		c.peekFirebaseMessage(data)
+		return
+	}
+	if count, ok := firebaseFrameCount(data); ok {
+		if count > firebaseMaxFrames {
+			logger.Warn("Firebase client sent too many frames", "client_id", c.id, "frames", count)
+			c.Close()
+			return
+		}
+		c.fbFramesLeft = count
+		return
+	}
+
+	c.peekFirebaseMessage(data)
+}
+
+// Limits on a chunked Firebase message, matching the backend's: the SDK sends
+// frames of 16384 UTF-16 code units (up to three bytes each), and a message is
+// at most 16 MB.
+const (
+	firebaseMaxFrames            = 1024
+	firebaseMaxInboundFrameBytes = 3 * 16384
+	firebaseMaxMessageBytes      = firebaseMaxFrames * 16384
+)
+
+// firebaseFrameCount reports whether data is the frame count that starts a
+// chunked message: a positive number of at most six digits.
+func firebaseFrameCount(data []byte) (int, bool) {
+	if len(data) == 0 || len(data) > 6 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(string(data))
+	if err != nil || n < 1 {
+		return 0, false
+	}
+	return n, true
+}
+
+// peekFirebaseMessage looks at a whole Firebase message (already buffered) for
+// routing information, and answers what the proxy handles itself.
+func (c *ClientConn) peekFirebaseMessage(data []byte) {
 	// Parse JSON to peek for routing info and handle protocol flow
 	var msg map[string]interface{}
 	if err := sonic.Unmarshal(data, &msg); err != nil {

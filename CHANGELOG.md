@@ -33,6 +33,7 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 - A set to null inside a transaction deletes the value. It used to be skipped, and the transaction was still acknowledged.
 - A native client that authenticates again, as when switching users, gets an answer under that request's ID. Before its first read or write it got no answer, and afterwards the answer carried the first auth's ID, so the client timed out either way. A rejected token there now gets an auth error.
 - A set to a path the rules mark `.volatile` gets an ack when it carries a request ID, as every Firebase SDK write does, and a NACK when it is over the volatile size limit. Firebase SDK clients used to wait forever for an answer. Native clients send volatile writes without a request ID and are unaffected.
+- A Firebase SDK connection whose first operation is over 16 KB, such as a large `set()` before any read, connects normally. The edge looked for the database path in each 16 KB piece on its own, found none, and the connection never got past routing.
 
 ## [0.4.0] — 2026-10-31
 
