@@ -89,6 +89,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -181,16 +182,15 @@ type ClientConn struct {
 	backend    *backend.Backend
 
 	// Auth state
-	authToken     string     // Pending token (extracted before routing complete)
-	authInfo      *auth.Info // Validated auth info (after routing complete)
-	authRequestID string     // Request ID for pending auth (to send response)
+	authToken string     // Pending token (extracted before routing complete)
+	authInfo  *auth.Info // Validated auth info (after routing complete)
 
 	// Async auth handler state. The read loop spawns handleAuthMessage, and
 	// startRouting waits on it, so these are touched from several goroutines.
-	authMu           sync.Mutex
-	authResponseSent bool          // True if we've already sent auth response (avoid double-send)
-	authProcessing   bool          // True while a handleAuthMessage goroutine is running
-	authDone         chan struct{} // Closed when the most recent auth handler completes
+	authMu         sync.Mutex
+	authAnswered   string        // Request ID of the last auth answered before routing (to answer each once)
+	authProcessing bool          // True while a handleAuthMessage goroutine is running
+	authDone       chan struct{} // Closed when the most recent auth handler completes
 
 	// Lark protocol state
 	joinRequestID string // Request ID from join message (to send JoinAck)
@@ -724,9 +724,6 @@ func (c *ClientConn) handleLarkAuthMessage(msg map[string]interface{}, data []by
 	if token, ok := msg["t"].(string); ok {
 		c.authToken = token
 	}
-	if reqID, ok := msg["r"].(string); ok {
-		c.authRequestID = reqID
-	}
 
 	// Validate and send response (async - waits for project config)
 	c.startAuth(data)
@@ -763,15 +760,17 @@ func (c *ClientConn) waitForAuth() {
 	}
 }
 
-// markAuthResponseSent records that the pre-routing auth response has been
-// sent. Returns false if it had already been sent (caller should not send again).
-func (c *ClientConn) markAuthResponseSent() bool {
+// markAuthResponseSent records that the auth request with this ID has been
+// answered. Returns false if it already was (caller should not send again).
+// A later auth request, such as a client switching users before its first
+// read or write, has its own ID and gets its own answer.
+func (c *ClientConn) markAuthResponseSent(requestID string) bool {
 	c.authMu.Lock()
 	defer c.authMu.Unlock()
-	if c.authResponseSent {
+	if c.authAnswered == requestID {
 		return false
 	}
-	c.authResponseSent = true
+	c.authAnswered = requestID
 	return true
 }
 
@@ -1198,30 +1197,38 @@ func (c *ClientConn) handleAuthMessage(data []byte, done chan struct{}) {
 	// Store project config
 	c.projectConfig = project
 
-	// Parse request ID for response (needed for both success and error)
+	// Parse this message's request ID for the response (needed for both
+	// success and error).
 	var requestID int
-	if c.protocol == ProtocolFirebase {
-		var msg map[string]interface{}
-		if sonic.Unmarshal(data, &msg) == nil {
+	var larkRequestID string
+	var msg map[string]interface{}
+	if sonic.Unmarshal(data, &msg) == nil {
+		if c.protocol == ProtocolFirebase {
 			if d, ok := msg["d"].(map[string]interface{}); ok {
 				if r, ok := d["r"].(float64); ok {
 					requestID = int(r)
 				}
 			}
+		} else {
+			larkRequestID, _ = msg["r"].(string)
 		}
+	}
+	answerID := larkRequestID
+	if c.protocol == ProtocolFirebase {
+		answerID = strconv.Itoa(requestID)
 	}
 
 	// Validate auth
 	authPayload, err := c.validateAuth(project)
 	if err != nil {
 		// Check if already sent (avoid double-send)
-		if !c.markAuthResponseSent() {
+		if !c.markAuthResponseSent(answerID) {
 			return
 		}
 
 		// Send error response
 		if c.protocol == ProtocolLark {
-			c.sendLarkAuthError(auth.UserFriendlyError(err))
+			c.sendLarkAuthError(larkRequestID, auth.UserFriendlyError(err))
 		} else if requestID > 0 {
 			c.sendFirebaseAuthError(requestID, auth.UserFriendlyError(err))
 		}
@@ -1229,13 +1236,13 @@ func (c *ClientConn) handleAuthMessage(data []byte, done chan struct{}) {
 	}
 
 	// Check if already sent (avoid double-send)
-	if !c.markAuthResponseSent() {
+	if !c.markAuthResponseSent(answerID) {
 		return
 	}
 
 	// Send success response based on protocol
 	if c.protocol == ProtocolLark {
-		c.sendLarkAuthAck(authPayload)
+		c.sendLarkAuthAck(larkRequestID, authPayload)
 	} else if requestID > 0 {
 		c.sendFirebaseOK(requestID, map[string]interface{}{
 			"auth": map[string]interface{}{"uid": authPayload.UID},
@@ -1259,13 +1266,13 @@ func (c *ClientConn) handleAuthMessage(data []byte, done chan struct{}) {
 
 // sendLarkAuthAck sends the Lark AuthAck response
 // Format: {"ac": "requestId", "au": "userId"}
-func (c *ClientConn) sendLarkAuthAck(authPayload *backend.AuthPayload) {
+func (c *ClientConn) sendLarkAuthAck(requestID string, authPayload *backend.AuthPayload) {
 	uid := ""
 	if authPayload != nil {
 		uid = authPayload.UID
 	}
 	response := map[string]interface{}{
-		"ac": c.authRequestID,
+		"ac": requestID,
 		"au": uid,
 	}
 	data, _ := sonic.Marshal(response)
@@ -1274,9 +1281,9 @@ func (c *ClientConn) sendLarkAuthAck(authPayload *backend.AuthPayload) {
 
 // sendLarkAuthError sends a Lark auth error response
 // Format: {"ae": "requestId", "err": "error message"}
-func (c *ClientConn) sendLarkAuthError(errMsg string) {
+func (c *ClientConn) sendLarkAuthError(requestID, errMsg string) {
 	response := map[string]interface{}{
-		"ae":  c.authRequestID,
+		"ae":  requestID,
 		"err": errMsg,
 	}
 	data, _ := sonic.Marshal(response)
@@ -1345,14 +1352,12 @@ func (c *ClientConn) handleLateAuth(data []byte) {
 	// Extract token from message
 	var token string
 	var requestID int
+	var larkRequestID string
 
 	if c.protocol == ProtocolLark {
 		// Lark auth: {"o": "au", "t": "<token>", "r": "<requestId>"}
 		token, _ = msg["t"].(string)
-		if rid, ok := msg["r"].(string); ok {
-			// Request ID is a string in Lark protocol
-			_ = rid // Will send response with same format
-		}
+		larkRequestID, _ = msg["r"].(string)
 	} else {
 		// Firebase auth: {"t": "d", "d": {"r": 1, "a": "auth", "b": {"cred": "<token>"}}}
 		d, _ := msg["d"].(map[string]interface{})
@@ -1398,6 +1403,8 @@ func (c *ClientConn) handleLateAuth(data []byte) {
 			// Send error response to client
 			if c.protocol == ProtocolFirebase && requestID > 0 {
 				c.sendFirebaseAuthError(requestID, auth.UserFriendlyError(err))
+			} else if c.protocol == ProtocolLark && larkRequestID != "" {
+				c.sendLarkAuthError(larkRequestID, auth.UserFriendlyError(err))
 			}
 			return
 		}
@@ -1434,9 +1441,9 @@ func (c *ClientConn) handleLateAuth(data []byte) {
 		c.sendFirebaseOK(requestID, map[string]interface{}{
 			"auth": map[string]interface{}{"uid": authPayload.UID},
 		})
-	} else if c.protocol == ProtocolLark && c.authRequestID != "" {
-		// Send Lark AuthAck from proxy
-		c.sendLarkAuthAck(authPayload)
+	} else if c.protocol == ProtocolLark && larkRequestID != "" {
+		// Send Lark AuthAck from proxy, answering this request rather than the first auth
+		c.sendLarkAuthAck(larkRequestID, authPayload)
 	}
 	// Note: message is already forwarded to backend before this function is called
 }
