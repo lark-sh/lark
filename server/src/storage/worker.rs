@@ -303,7 +303,7 @@ impl StorageWorker {
             .await
             .map_err(|e| format!("writing sequence file: {}", e))?;
 
-        // 10. Notify the Database that compaction is complete — it can trim pending_wal_entries.
+        // 10. Notify the Database that compaction is complete — it can trim its held WAL.
         //     Include the blob generation so the Database can switch if it's on a different blob
         //     (e.g., after an external full compaction by lark-compact).
         //     On generation change, send our CachedIO so the Database can share our cache

@@ -28,7 +28,7 @@
 //!
 
 use indexmap::IndexSet;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
@@ -222,7 +222,7 @@ struct PromotionSnapshot {
     cache_header_misses: u64,
 }
 
-/// Canonical form for path-keyed maps inside `Database` (`WalIndex.by_path`,
+/// Canonical form for path-keyed maps inside `Database` (the held WAL index,
 /// `Database.promoted_paths`, `Database.sentinel_paths`, and any future map
 /// keyed by tree path).
 ///
@@ -241,7 +241,7 @@ struct PromotionSnapshot {
 /// side) but a lookup with `paths/.../pathA` (reader side) misses — exact
 /// match fails, and the descendant range scan also misses because
 /// lexicographic order puts `/paths/...` before `paths/...`. The bug surfaced
-/// in `WalIndex` first (correctness regression: WAL replay on promotion
+/// in the WAL index first (correctness regression: WAL replay on promotion
 /// silently dropped pending writes for the just-created path), and
 /// `promoted_paths` had the same shape (a path could end up tracked under
 /// both forms — only a perf regression, but worth keeping clean).
@@ -264,101 +264,6 @@ fn normalize_path_key(path: &str) -> String {
         "/".to_string()
     } else {
         format!("/{}", trimmed)
-    }
-}
-
-/// Index over pending_wal_entries for fast path-based lookups.
-/// Replaces O(n) linear scan with O(depth + k) where k = matching entries.
-struct WalIndex {
-    /// Path → indices into pending_wal_entries. BTreeMap for range scans (descendants).
-    by_path: std::collections::BTreeMap<String, Vec<usize>>,
-}
-
-impl WalIndex {
-    fn new() -> Self {
-        Self {
-            by_path: std::collections::BTreeMap::new(),
-        }
-    }
-
-    /// Add a single entry at the given index.
-    fn add(&mut self, path: &str, index: usize) {
-        self.by_path
-            .entry(normalize_path_key(path))
-            .or_default()
-            .push(index);
-    }
-
-    /// Rebuild the entire index from scratch (after compaction trim).
-    fn rebuild(&mut self, entries: &[WalEntry]) {
-        self.by_path.clear();
-        for (i, entry) in entries.iter().enumerate() {
-            self.by_path
-                .entry(normalize_path_key(&entry.path))
-                .or_default()
-                .push(i);
-        }
-    }
-
-    /// Find all entry indices that affect a given promotion path.
-    /// Returns indices sorted in insertion order (ascending).
-    fn find_affecting(&self, path: &str) -> Vec<usize> {
-        let path_owned = normalize_path_key(path);
-        let path = path_owned.as_str();
-        let mut indices = Vec::new();
-
-        if path == "/" {
-            // Root promotion — everything matches
-            for idxs in self.by_path.values() {
-                indices.extend(idxs);
-            }
-            indices.sort_unstable();
-            return indices;
-        }
-
-        // 1. Exact match
-        if let Some(idxs) = self.by_path.get(path) {
-            indices.extend(idxs);
-        }
-
-        // 2. Root entries (affect everything)
-        if let Some(idxs) = self.by_path.get("/") {
-            indices.extend(idxs);
-        }
-
-        // 3. Ancestors: walk up the path
-        let mut current = path;
-        loop {
-            match current.rfind('/') {
-                None => break,
-                Some(0) => break, // we already checked "/"
-                Some(pos) => {
-                    current = &path[..pos];
-                    if let Some(idxs) = self.by_path.get(current) {
-                        indices.extend(idxs);
-                    }
-                }
-            }
-        }
-
-        // 4. Descendants: BTreeMap range scan starting just past "{path}",
-        //    breaking when keys no longer start with "{path}/". Zero allocations.
-        use std::ops::Bound;
-        for (key, idxs) in self
-            .by_path
-            .range::<str, _>((Bound::Excluded(path), Bound::Unbounded))
-        {
-            if !(key.len() > path.len()
-                && key.starts_with(path)
-                && key.as_bytes()[path.len()] == b'/')
-            {
-                break;
-            }
-            indices.extend(idxs);
-        }
-
-        indices.sort_unstable();
-        indices
     }
 }
 
@@ -511,10 +416,6 @@ pub fn broadcast_views_per_batch() -> usize {
 
 /// Metrics emission interval (only for active databases)
 const METRICS_EMIT_INTERVAL: Duration = Duration::from_secs(60);
-
-/// How long an idle database waits for the compaction it asked for before
-/// unloading anyway. See `ready_to_unload`.
-const UNLOAD_COMPACTION_WAIT: Duration = Duration::from_secs(30);
 
 /// Maximum number of retries when rules evaluation hits unloaded blob data.
 /// This handles rules that access many paths - each iteration
@@ -834,7 +735,7 @@ pub struct InboxMessage {
     /// Compaction complete notification from the StorageWorker.
     /// Contains the new blob sequence and the blob generation the worker applied to.
     /// Entries with sequence <= this value are now baked into the blob and can be
-    /// dropped from pending_wal_entries. If the blob generation differs from the
+    /// dropped from the held WAL. If the blob generation differs from the
     /// Database's current generation, the Database must switch to the new blob first.
     pub compaction_complete: Option<CompactionComplete>,
 
@@ -933,9 +834,6 @@ pub struct Database {
     /// State
     state: DatabaseState,
     last_activity: Instant,
-    /// When an idle database asked for its WAL to be compacted before unloading.
-    /// Cleared when a client connects.
-    unload_compaction_started: Option<Instant>,
     /// Set to true when the Database encounters an unrecoverable error
     /// (e.g., failed to open a new blob after generation change).
     /// The main loop checks this and exits cleanly.
@@ -978,17 +876,11 @@ pub struct Database {
     /// has created a higher-numbered blob file.
     blob_generation: u64,
 
-    /// In-memory WAL entries not yet compacted into the blob.
-    /// On promotion (Sentinel → real data), we replay these entries on top of blob data.
-    /// Trimmed when the storage worker compacts WAL into the blob and updates the sequence file.
-    pending_wal_entries: Vec<WalEntry>,
-
-    /// Size in the WAL of pending_wal_entries, by WAL file sequence. Trimmed with
-    /// them; reported as `held_wal_bytes`.
-    held_wal_bytes: BTreeMap<i64, u64>,
-
-    /// Path index over pending_wal_entries for O(depth+k) promotion lookups.
-    wal_index: WalIndex,
+    /// WAL entries not yet compacted into the blob, held as their JSON lines
+    /// with a path index. On promotion (Sentinel → real data), the entries that
+    /// affect the path are replayed on top of blob data. Trimmed when the
+    /// storage worker compacts WAL into the blob and updates the sequence file.
+    held_wal: held_wal::HeldWal,
 
     /// WAL sequence number through which the blob is up to date.
     /// Read from {data_dir}/sequence on startup. Default 0 if file missing.
@@ -1176,6 +1068,7 @@ mod broadcast;
 mod connection;
 mod eviction;
 mod handlers;
+mod held_wal;
 mod housekeeping;
 mod lifecycle;
 mod persistence;

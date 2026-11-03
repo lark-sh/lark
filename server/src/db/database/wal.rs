@@ -114,16 +114,40 @@ impl Database {
         }
     }
 
-    /// Records an entry just appended to the WAL buffer: it stays in
-    /// pending_wal_entries until compaction puts it in the blob.
-    fn hold_wal_entry(&mut self, entry: WalEntry, bytes: u64) {
+    /// Appends an entry to the WAL buffer (in memory, no I/O) and holds it
+    /// until compaction puts it in the blob. The line is serialized once, from
+    /// borrowed parts, and the same bytes are written and held. Returns false
+    /// if serialization failed (caller should NACK).
+    fn append_wal<V: serde::Serialize>(
+        &mut self,
+        op: WalOp,
+        path: &str,
+        value: Option<&V>,
+        may_delete: bool,
+    ) -> bool {
+        if self.wal_writer.is_none() {
+            return true; // No WAL writer (ephemeral) - always succeeds
+        }
+        let line = match held_wal::wal_line(&op, path, value) {
+            Ok(line) => line,
+            Err(e) => {
+                self.set_wal_failed();
+                error!(
+                    "[STORAGE INTEGRITY] {}: WAL write failed for {:?} {}: {}",
+                    self.id, op, path, e
+                );
+                return false;
+            }
+        };
+        let writer = self.wal_writer.as_mut().expect("checked above");
+        let sequence = writer.sequence();
+        writer.append_line(&line);
+        let bytes = line.len() as u64 + 1;
         self.wal_dirty = true;
         self.wal_pending_entries += 1;
         self.wal_pending_bytes += bytes;
-        *self.held_wal_bytes.entry(entry.sequence).or_default() += bytes;
-        let idx = self.pending_wal_entries.len();
-        self.wal_index.add(&entry.path, idx);
-        self.pending_wal_entries.push(entry);
+        self.held_wal.push(sequence, path, &line, may_delete);
+        true
     }
 
     /// Write a SET operation to the WAL (in-memory buffer only, no I/O).
@@ -137,27 +161,8 @@ impl Database {
         if value.is_null() {
             return self.wal_write_delete(path);
         }
-        if let Some(ref mut writer) = self.wal_writer {
-            let mut entry = WalEntry::set(path, value.clone());
-            entry.sequence = writer.sequence();
-            match writer.append_one(&entry) {
-                Ok(_) => {
-                    let bytes = writer.bytes_written_last_append();
-                    self.hold_wal_entry(entry, bytes);
-                    true
-                }
-                Err(e) => {
-                    self.set_wal_failed();
-                    error!(
-                        "[STORAGE INTEGRITY] {}: WAL write failed for SET {}: {}",
-                        self.id, path, e
-                    );
-                    false
-                }
-            }
-        } else {
-            true // No WAL writer (ephemeral) - always succeeds
-        }
+        let may_delete = held_wal::may_delete(&WalOp::Set, Some(value));
+        self.append_wal(WalOp::Set, path, Some(value), may_delete)
     }
 
     /// Write an UPDATE operation to the WAL (in-memory buffer only, no I/O).
@@ -167,53 +172,14 @@ impl Database {
         path: &str,
         updates: &serde_json::Map<String, Value>,
     ) -> bool {
-        if let Some(ref mut writer) = self.wal_writer {
-            let mut entry = WalEntry::update(path, Value::Object(updates.clone()));
-            entry.sequence = writer.sequence();
-            match writer.append_one(&entry) {
-                Ok(_) => {
-                    let bytes = writer.bytes_written_last_append();
-                    self.hold_wal_entry(entry, bytes);
-                    true
-                }
-                Err(e) => {
-                    self.set_wal_failed();
-                    error!(
-                        "[STORAGE INTEGRITY] {}: WAL write failed for UPDATE {}: {}",
-                        self.id, path, e
-                    );
-                    false
-                }
-            }
-        } else {
-            true // No WAL writer (ephemeral) - always succeeds
-        }
+        let may_delete = updates.values().any(subscribe::stores_nothing);
+        self.append_wal(WalOp::Update, path, Some(updates), may_delete)
     }
 
     /// Write a DELETE operation to the WAL (in-memory buffer only, no I/O).
     /// Returns false if serialization failed (caller should NACK).
     pub(super) fn wal_write_delete(&mut self, path: &str) -> bool {
-        if let Some(ref mut writer) = self.wal_writer {
-            let mut entry = WalEntry::delete(path);
-            entry.sequence = writer.sequence();
-            match writer.append_one(&entry) {
-                Ok(_) => {
-                    let bytes = writer.bytes_written_last_append();
-                    self.hold_wal_entry(entry, bytes);
-                    true
-                }
-                Err(e) => {
-                    self.set_wal_failed();
-                    error!(
-                        "[STORAGE INTEGRITY] {}: WAL write failed for DELETE {}: {}",
-                        self.id, path, e
-                    );
-                    false
-                }
-            }
-        } else {
-            true // No WAL writer (ephemeral) - always succeeds
-        }
+        self.append_wal::<Value>(WalOp::Delete, path, None, true)
     }
 
     /// Flush the buffered WAL entries to the WAL file (async).
@@ -259,45 +225,9 @@ impl Database {
         }
     }
 
-    /// Gets an idle database ready to unload by compacting its WAL into the
-    /// blob first, so the next load has nothing to replay and none of it is
-    /// held in memory. The first call rotates the WAL and asks the storage
-    /// worker to compact it, and the database keeps running meanwhile. Returns
-    /// true once nothing is held, or once the compaction has had
-    /// UNLOAD_COMPACTION_WAIT (it may be skipped, as while lark-compact holds
-    /// the storage lock; the WAL is then replayed on the next load as before).
-    pub(super) async fn ready_to_unload(&mut self) -> bool {
-        if self.pending_wal_entries.is_empty() || self.compaction_tx.is_none() || self.wal_failed {
-            return true;
-        }
-        if let Some(started) = self.unload_compaction_started {
-            return started.elapsed() >= UNLOAD_COMPACTION_WAIT;
-        }
-        self.unload_compaction_started = Some(Instant::now());
-
-        self.sync_wal().await;
-        let Some(writer) = self.wal_writer.as_mut() else {
-            return true;
-        };
-        if let Err(e) = writer.rotate_if_not_empty(fsync_on_wal_flush()).await {
-            warn!(
-                "[Persistence] {}: rotating the WAL before unloading failed: {}",
-                self.id, e
-            );
-            return true;
-        }
-        debug!(
-            "[Persistence] {}: idle, compacting {} held WAL entries before unloading",
-            self.id,
-            self.pending_wal_entries.len()
-        );
-        self.notify_compaction().await;
-        false
-    }
-
     /// Total size in the WAL of entries not yet compacted into the blob.
     pub(super) fn held_wal_bytes(&self) -> u64 {
-        self.held_wal_bytes.values().sum()
+        self.held_wal.bytes()
     }
 
     /// Write a .compaction-queue marker so lark-compact knows to sync this DB's WAL files.

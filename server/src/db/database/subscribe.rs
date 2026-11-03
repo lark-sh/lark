@@ -2,7 +2,7 @@ use super::*;
 
 /// True if writing `value` stores nothing and so deletes what was there: null, or
 /// containers that hold only such values.
-fn stores_nothing(value: &Value) -> bool {
+pub(super) fn stores_nothing(value: &Value) -> bool {
     match value {
         Value::Null => true,
         Value::Object(map) => map.values().all(stores_nothing),
@@ -614,8 +614,14 @@ impl Database {
     /// True if a pending WAL entry deletes something at or below `path`.
     fn has_pending_delete_within(&self, path: &str) -> bool {
         let within = |target: &str| target == path || is_below(target, path);
-        self.wal_index.find_affecting(path).iter().any(|&idx| {
-            let entry = &self.pending_wal_entries[idx];
+        self.held_wal.find_affecting(path).into_iter().any(|pos| {
+            // Only entries flagged when held can delete, so most are never parsed.
+            if !self.held_wal.may_delete_at(pos) {
+                return false;
+            }
+            let Some(entry) = self.held_wal.get(pos) else {
+                return false;
+            };
             let entry_path = normalize_path_key(&entry.path);
             match (&entry.op, &entry.value) {
                 (WalOp::Delete, _) => within(&entry_path),

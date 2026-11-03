@@ -117,6 +117,14 @@ impl WalWriter {
         Ok(false)
     }
 
+    /// Append one entry's JSON line (without its newline) to the in-memory
+    /// buffer, for a caller that serialized it already.
+    pub fn append_line(&mut self, line: &[u8]) {
+        self.buffer.extend_from_slice(line);
+        self.buffer.push(b'\n');
+        self.last_append_bytes = line.len() as u64 + 1;
+    }
+
     /// Append a single entry to the in-memory buffer.
     pub fn append_one(&mut self, entry: &WalEntry) -> io::Result<bool> {
         self.append(std::slice::from_ref(entry))
@@ -185,24 +193,6 @@ impl WalWriter {
         self.sequence += 1;
 
         self.open_file(sync_dir).await
-    }
-
-    /// Starts a new WAL file if the current one holds anything, so the storage
-    /// worker can compact it: it only compacts files below the newest. Returns
-    /// whether it rotated. Call after `sync`, with nothing left in the buffer.
-    pub async fn rotate_if_not_empty(&mut self, sync_dir: bool) -> io::Result<bool> {
-        if !self.buffer.is_empty() {
-            return Err(io::Error::other("WAL buffer not flushed before rotating"));
-        }
-        if self
-            .current_file
-            .as_ref()
-            .is_none_or(|file| file.size() == 0)
-        {
-            return Ok(false);
-        }
-        self.rotate(sync_dir).await?;
-        Ok(true)
     }
 
     /// Returns the current WAL sequence number.
