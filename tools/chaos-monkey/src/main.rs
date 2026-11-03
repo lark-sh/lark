@@ -29,11 +29,12 @@ use clap::Parser;
 use config::{ChaosConfig, CliArgs, Durability, RulesMode};
 use ground_truth::{GroundTruth, WriteOp};
 use operations::{OpType, OperationGenerator, TxOpKind};
-use process::{create_server_process, wait_for_server};
+use process::{create_server_process, wait_for_server, EVICTION_IDLE_SECS};
 use protocol::client::{ProxyClient, ServerEvent};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use report::{ChaosReport, CycleReport};
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 /// Shared secret for the edge↔server proxy handshake. chaos-monkey plays the role
@@ -48,6 +49,10 @@ use tracing::{debug, error, info, warn};
 /// ~5% — frequent enough to exercise the NACK path, rare enough not to
 /// dominate cycle output.
 const DENY_OP_PROBABILITY: f64 = 0.05;
+
+/// Leaves carried from earlier cycles that each verification pass checks, at
+/// most. All of the current cycle's leaves are checked.
+const CARRIED_SAMPLE: usize = 2000;
 
 /// Returns the rules JSON to push for the configured rules mode.
 ///
@@ -116,6 +121,8 @@ async fn main() -> anyhow::Result<()> {
     let server_addr = format!("127.0.0.1:{}", config.proxy_port);
     let mut report = ChaosReport::new();
     let mut cycle_number = 0;
+    // State earlier cycles left that's still known; see GroundTruth::carry_forward.
+    let mut baseline: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     let start = Instant::now();
 
     // Main chaos loop
@@ -124,7 +131,12 @@ async fn main() -> anyhow::Result<()> {
         info!("========== CYCLE {} ==========", cycle_number);
 
         let cycle_start = Instant::now();
-        let mut ground_truth = GroundTruth::new();
+        let mut ground_truth =
+            GroundTruth::with_baseline(baseline.clone(), cycle_number as u64, CARRIED_SAMPLE);
+        info!(
+            "Carrying {} leaves from earlier cycles",
+            ground_truth.baseline_len()
+        );
         let mut op_gen = OperationGenerator::new();
 
         // Step 1: Start server (compaction runs in-process)
@@ -445,6 +457,26 @@ async fn main() -> anyhow::Result<()> {
             committed, rejected, pending, sent
         );
 
+        // Step 7c0: Stop writing for long enough that every path loaded from
+        // the blob goes idle and is evicted, so the pre-kill reads load it
+        // again: blob data plus the WAL entries the server holds in memory.
+        // Data that was only written, never read from the blob, stays loaded.
+        // ACKs are handled as in the grace period: trusted only when strict.
+        let settle = Duration::from_secs(EVICTION_IDLE_SECS + 6);
+        info!("Waiting {:?} for idle paths to be evicted...", settle);
+        let settle_deadline = tokio::time::Instant::now() + settle;
+        while tokio::time::Instant::now() < settle_deadline {
+            match client.recv_event(Duration::from_millis(200)).await {
+                Some(event) if strict => {
+                    handle_event(&event, &mut ground_truth, &mut client).await;
+                }
+                Some(ServerEvent::Heartbeat) => {
+                    let _ = client.send_heartbeat_ack().await;
+                }
+                _ => {}
+            }
+        }
+
         // Step 7c: Pre-kill verification — verify committed data is correct
         // while the server is still running (before any kill/restart).
         info!("Pre-kill verification...");
@@ -459,6 +491,7 @@ async fn main() -> anyhow::Result<()> {
         .await;
         let pre_kill_violations = pre_kill_result.violation_count();
         let pre_kill_paths_checked = pre_kill_result.paths_checked;
+        let mut violated: Vec<String> = pre_kill_result.violated_paths();
 
         // Step 8: Kill strategy
         let kill_strategy = pick_kill_strategy(
@@ -545,6 +578,10 @@ async fn main() -> anyhow::Result<()> {
             }
             _ => unreachable!(),
         }
+
+        // If this cycle ends before verifying, the next one still starts from
+        // what the server should hold.
+        baseline = ground_truth.carry_forward(&violated);
 
         // Step 9: Wait before restarting
         let restart_delay = Duration::from_secs(rng.gen_range(1..=3));
@@ -641,6 +678,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .await;
 
+        // Paths that failed are reported once, then left out of what carries.
+        violated.extend(verification.violated_paths());
+        baseline = ground_truth.carry_forward(&violated);
+
         // Step 12: Record cycle results
         let cycle_report = CycleReport {
             cycle_number,
@@ -661,9 +702,9 @@ async fn main() -> anyhow::Result<()> {
         drop(verify_client);
         server.kill().await?;
 
-        // Every 10 cycles, wipe the data directory to prevent unbounded disk growth.
-        // This is safe: each cycle has its own ground truth and doesn't depend on prior data.
-        // It also exercises cold-start (empty data dir) regularly.
+        // Every 10 cycles, wipe the data directory to prevent unbounded disk growth,
+        // and start the carried state over with it. This also exercises cold start
+        // (empty data dir) regularly.
         if cycle_number % 10 == 0 {
             info!(
                 "Wiping data directory to prevent disk growth (cycle {})",
@@ -673,6 +714,7 @@ async fn main() -> anyhow::Result<()> {
                 warn!("Failed to wipe data dir: {} (may not exist yet)", e);
             }
             tokio::fs::create_dir_all(&config.data_dir).await?;
+            baseline.clear();
         }
 
         // Brief pause between cycles
