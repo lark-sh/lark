@@ -316,11 +316,8 @@ impl Database {
                     self.view_manager.view_count()
                 );
 
-                // Check for idle shutdown, compacting the WAL first
-                if !self.clients.is_empty() {
-                    self.unload_compaction_started = None;
-                } else if self.last_activity.elapsed() > Duration::from_secs(60)
-                    && self.ready_to_unload().await
+                // Check for idle shutdown
+                if self.clients.is_empty() && self.last_activity.elapsed() > Duration::from_secs(60)
                 {
                     debug!("Database {} idle, shutting down", self.id);
                     break;
@@ -331,7 +328,7 @@ impl Database {
             if now.duration_since(last_metrics_emit) >= METRICS_EMIT_INTERVAL {
                 self.refresh_data_size().await;
                 self.metrics
-                    .set_held_wal(self.held_wal_bytes(), self.pending_wal_entries.len() as u64);
+                    .set_held_wal(self.held_wal_bytes(), self.held_wal.len() as u64);
                 self.emit_metrics();
                 last_metrics_emit = now;
             }

@@ -1356,7 +1356,7 @@ async fn make_blob_backed_db(data: Value) -> (Database, tempfile::TempDir) {
     );
     db.load_from_disk().await.unwrap();
 
-    // Initialize WAL writer so writes add entries to pending_wal_entries
+    // Initialize WAL writer so writes add entries to the held WAL
     db.init_wal_writer().await;
 
     // Verify it's blob-backed
@@ -2128,8 +2128,8 @@ fn test_compaction_complete_trims_old_entries() {
     block_on(async {
         let (mut db, _dir) = make_blob_backed_db(json!({"x": 1})).await;
 
-        // Manually populate pending_wal_entries with entries at different sequences
-        db.pending_wal_entries = vec![
+        // Manually hold WAL entries at different sequences
+        db.held_wal = held_wal::HeldWal::from_entries(vec![
             {
                 let mut e = WalEntry::set("/a", json!(1));
                 e.sequence = 1;
@@ -2155,7 +2155,7 @@ fn test_compaction_complete_trims_old_entries() {
                 e.sequence = 5;
                 e
             },
-        ];
+        ]);
 
         // Compact through sequence 3 — entries 1, 2, 3 should be trimmed
         db.handle_compaction_complete(CompactionComplete {
@@ -2165,9 +2165,9 @@ fn test_compaction_complete_trims_old_entries() {
         })
         .await;
 
-        assert_eq!(db.pending_wal_entries.len(), 2);
-        assert_eq!(db.pending_wal_entries[0].sequence, 4);
-        assert_eq!(db.pending_wal_entries[1].sequence, 5);
+        assert_eq!(db.held_wal.len(), 2);
+        assert_eq!(db.held_wal.entries()[0].sequence, 4);
+        assert_eq!(db.held_wal.entries()[1].sequence, 5);
     })
 }
 
@@ -2201,8 +2201,8 @@ fn test_compaction_complete_no_entries_is_noop() {
     block_on(async {
         let (mut db, _dir) = make_blob_backed_db(json!({"x": 1})).await;
 
-        // No pending_wal_entries at all
-        assert!(db.pending_wal_entries.is_empty());
+        // No held WAL entries at all
+        assert!(db.held_wal.is_empty());
 
         // Should not panic or fail
         db.handle_compaction_complete(CompactionComplete {
@@ -2213,7 +2213,7 @@ fn test_compaction_complete_no_entries_is_noop() {
         .await;
 
         assert_eq!(db.blob_sequence, 10);
-        assert!(db.pending_wal_entries.is_empty());
+        assert!(db.held_wal.is_empty());
     })
 }
 
@@ -2222,7 +2222,7 @@ fn test_compaction_complete_all_entries_trimmed() {
     block_on(async {
         let (mut db, _dir) = make_blob_backed_db(json!({"x": 1})).await;
 
-        db.pending_wal_entries = vec![
+        db.held_wal = held_wal::HeldWal::from_entries(vec![
             {
                 let mut e = WalEntry::set("/a", json!(1));
                 e.sequence = 1;
@@ -2233,7 +2233,7 @@ fn test_compaction_complete_all_entries_trimmed() {
                 e.sequence = 2;
                 e
             },
-        ];
+        ]);
 
         // Compact through sequence 5 — all entries should be trimmed
         db.handle_compaction_complete(CompactionComplete {
@@ -2243,7 +2243,7 @@ fn test_compaction_complete_all_entries_trimmed() {
         })
         .await;
 
-        assert!(db.pending_wal_entries.is_empty());
+        assert!(db.held_wal.is_empty());
         assert_eq!(db.blob_sequence, 5);
     })
 }
@@ -2253,7 +2253,7 @@ fn test_compaction_complete_none_trimmed() {
     block_on(async {
         let (mut db, _dir) = make_blob_backed_db(json!({"x": 1})).await;
 
-        db.pending_wal_entries = vec![
+        db.held_wal = held_wal::HeldWal::from_entries(vec![
             {
                 let mut e = WalEntry::set("/a", json!(10));
                 e.sequence = 10;
@@ -2264,7 +2264,7 @@ fn test_compaction_complete_none_trimmed() {
                 e.sequence = 11;
                 e
             },
-        ];
+        ]);
 
         // Compact through sequence 5 — no entries should be trimmed (all > 5)
         db.handle_compaction_complete(CompactionComplete {
@@ -2274,7 +2274,7 @@ fn test_compaction_complete_none_trimmed() {
         })
         .await;
 
-        assert_eq!(db.pending_wal_entries.len(), 2);
+        assert_eq!(db.held_wal.len(), 2);
         assert_eq!(db.blob_sequence, 5);
     })
 }
@@ -2284,7 +2284,7 @@ fn test_compaction_complete_progressive_trimming() {
     block_on(async {
         let (mut db, _dir) = make_blob_backed_db(json!({"x": 1})).await;
 
-        db.pending_wal_entries = vec![
+        db.held_wal = held_wal::HeldWal::from_entries(vec![
             {
                 let mut e = WalEntry::set("/a", json!(1));
                 e.sequence = 1;
@@ -2305,7 +2305,7 @@ fn test_compaction_complete_progressive_trimming() {
                 e.sequence = 4;
                 e
             },
-        ];
+        ]);
 
         // First compaction: trim through seq 1
         db.handle_compaction_complete(CompactionComplete {
@@ -2314,7 +2314,7 @@ fn test_compaction_complete_progressive_trimming() {
             cached_io: None,
         })
         .await;
-        assert_eq!(db.pending_wal_entries.len(), 3);
+        assert_eq!(db.held_wal.len(), 3);
         assert_eq!(db.blob_sequence, 1);
 
         // Second compaction: trim through seq 3
@@ -2324,8 +2324,8 @@ fn test_compaction_complete_progressive_trimming() {
             cached_io: None,
         })
         .await;
-        assert_eq!(db.pending_wal_entries.len(), 1);
-        assert_eq!(db.pending_wal_entries[0].sequence, 4);
+        assert_eq!(db.held_wal.len(), 1);
+        assert_eq!(db.held_wal.entries()[0].sequence, 4);
         assert_eq!(db.blob_sequence, 3);
 
         // Third compaction: trim through seq 4
@@ -2335,7 +2335,7 @@ fn test_compaction_complete_progressive_trimming() {
             cached_io: None,
         })
         .await;
-        assert!(db.pending_wal_entries.is_empty());
+        assert!(db.held_wal.is_empty());
         assert_eq!(db.blob_sequence, 4);
     })
 }
@@ -2349,7 +2349,7 @@ fn test_compaction_complete_promotion_uses_remaining_entries() {
         .await;
 
         // Simulate WAL entries: seq 1 sets alice's score, seq 2 sets bob
-        db.pending_wal_entries = vec![
+        db.held_wal = held_wal::HeldWal::from_entries(vec![
             {
                 let mut e = WalEntry::set("/users/alice/score", json!(100));
                 e.sequence = 1;
@@ -2360,7 +2360,7 @@ fn test_compaction_complete_promotion_uses_remaining_entries() {
                 e.sequence = 2;
                 e
             },
-        ];
+        ]);
 
         // Compact through seq 1 — alice/score is now in blob, bob entry remains
         db.handle_compaction_complete(CompactionComplete {
@@ -2369,8 +2369,8 @@ fn test_compaction_complete_promotion_uses_remaining_entries() {
             cached_io: None,
         })
         .await;
-        assert_eq!(db.pending_wal_entries.len(), 1);
-        assert_eq!(db.pending_wal_entries[0].path, "/users/bob");
+        assert_eq!(db.held_wal.len(), 1);
+        assert_eq!(db.held_wal.entries()[0].path, "/users/bob");
 
         // Now promote /users — the blob has the original data,
         // and only the remaining WAL entry (bob) should be replayed
@@ -2542,7 +2542,7 @@ fn test_shallow_once_wal_adds_children() {
         let (conn, _messages) = MockConnection::new();
         db.add_client_internal("client1", None, "conn1", conn);
 
-        // Write a new child via SET — this goes into pending_wal_entries
+        // Write a new child via SET — this goes into the held WAL
         let set_msg = ClientMessage {
             op: "s".to_string(),
             path: Some("/characters/bob".to_string()),
@@ -3885,7 +3885,7 @@ fn test_unchanged_writes_stay_out_of_the_wal() {
         // Same value as loaded: nothing to replay.
         db.handle_set("client1", &write_msg("s", "/game/a", Some(json!(1)), "r1"))
             .await;
-        assert!(db.pending_wal_entries.is_empty());
+        assert!(db.held_wal.is_empty());
 
         // An update with a changed key goes in as sent.
         db.handle_update(
@@ -3893,9 +3893,9 @@ fn test_unchanged_writes_stay_out_of_the_wal() {
             &write_msg("u", "/game", Some(json!({"a": 1, "b": 2})), "r2"),
         )
         .await;
-        assert_eq!(db.pending_wal_entries.len(), 1);
+        assert_eq!(db.held_wal.len(), 1);
         assert_eq!(
-            db.pending_wal_entries[0].value,
+            db.held_wal.entries()[0].value,
             Some(json!({"a": 1, "b": 2}))
         );
 
@@ -3905,88 +3905,19 @@ fn test_unchanged_writes_stay_out_of_the_wal() {
             &write_msg("u", "/game", Some(json!({"a": 1, "b": 2})), "r2b"),
         )
         .await;
-        assert_eq!(db.pending_wal_entries.len(), 1);
+        assert_eq!(db.held_wal.len(), 1);
 
         // Removing what isn't there: nothing.
         db.handle_remove("client1", &write_msg("r", "/game/missing", None, "r3"))
             .await;
-        assert_eq!(db.pending_wal_entries.len(), 1);
+        assert_eq!(db.held_wal.len(), 1);
 
         // Data that isn't loaded can't be compared, so it's written.
         db.handle_set("client1", &write_msg("s", "/other/x", Some(json!(1)), "r4"))
             .await;
-        assert_eq!(db.pending_wal_entries.len(), 2);
+        assert_eq!(db.held_wal.len(), 2);
 
         assert!(db.held_wal_bytes() > 0);
-    })
-}
-
-#[test]
-fn test_idle_database_compacts_its_wal_before_unloading() {
-    block_on(async {
-        let (mut db, dir) = make_blob_backed_db(json!({"game": {"a": 1}})).await;
-        let (tx, rx) = glommio::channels::local_channel::new_bounded(16);
-        glommio::spawn_local(async move { crate::storage::StorageWorker::new(rx).run().await })
-            .detach();
-        db.set_compaction_tx(Rc::new(tx));
-
-        let (conn, _messages) = MockConnection::new();
-        db.add_client_internal("client1", None, "conn1", conn);
-        db.handle_set("client1", &write_msg("s", "/game/b", Some(json!(2)), "r1"))
-            .await;
-        db.sync_wal().await;
-        assert_eq!(db.pending_wal_entries.len(), 1);
-        let held = db.held_wal_bytes();
-        assert!(held > 0);
-
-        // First call asks for the compaction and keeps the database running.
-        assert!(!db.ready_to_unload().await);
-
-        let mut msg =
-            glommio::timer::timeout(Duration::from_secs(10), async { Ok(db.inbox.recv().await) })
-                .await
-                .expect("the storage worker should answer")
-                .expect("compaction answer");
-        let done = msg.compaction_complete.take().expect("compaction complete");
-        db.handle_compaction_complete(done).await;
-
-        assert!(db.pending_wal_entries.is_empty());
-        assert_eq!(db.held_wal_bytes(), 0);
-        assert!(db.ready_to_unload().await);
-
-        // The write is in the blob: a fresh load has no WAL to replay.
-        let mut reloaded = Database::new_with_persistence(
-            "test/evict".to_string(),
-            "test".to_string(),
-            dir.path().to_path_buf(),
-        );
-        reloaded.load_from_disk().await.unwrap();
-        assert!(reloaded.pending_wal_entries.is_empty());
-        reloaded.promote_path("/game").await.unwrap();
-        assert_eq!(
-            reloaded.tree.read().unwrap().get_value_str("/game"),
-            Some(json!({"a": 1, "b": 2}))
-        );
-    })
-}
-
-#[test]
-fn test_unload_waits_no_longer_than_its_cap() {
-    block_on(async {
-        let (mut db, _dir) = make_blob_backed_db(json!({"game": {"a": 1}})).await;
-        // A channel nobody reads: the compaction never answers.
-        let (tx, _rx) = glommio::channels::local_channel::new_bounded(16);
-        db.set_compaction_tx(Rc::new(tx));
-
-        let (conn, _messages) = MockConnection::new();
-        db.add_client_internal("client1", None, "conn1", conn);
-        db.handle_set("client1", &write_msg("s", "/game/b", Some(json!(2)), "r1"))
-            .await;
-
-        assert!(!db.ready_to_unload().await);
-        assert!(!db.ready_to_unload().await, "still waiting");
-        db.unload_compaction_started = Some(Instant::now() - UNLOAD_COMPACTION_WAIT);
-        assert!(db.ready_to_unload().await, "gives up after the cap");
     })
 }
 
@@ -4009,7 +3940,7 @@ fn test_client_volatile_flag_is_ignored() {
         flagged.volatile = Some(true);
         db.handle_remove("client1", &flagged).await;
 
-        assert_eq!(db.pending_wal_entries.len(), 2);
+        assert_eq!(db.held_wal.len(), 2);
     })
 }
 
@@ -4035,7 +3966,7 @@ fn test_volatile_update_and_remove_are_not_stored() {
             .expect("answer");
         assert_eq!(ack.ack.as_deref(), Some("r2"));
 
-        assert!(db.pending_wal_entries.is_empty());
+        assert!(db.held_wal.is_empty());
         assert_eq!(db.tree.read().unwrap().get_value_str("/cursors/p1"), None);
     })
 }

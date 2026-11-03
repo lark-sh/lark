@@ -162,10 +162,10 @@ impl Database {
         Ok(())
     }
 
-    /// Load uncompacted WAL entries from disk into pending_wal_entries.
+    /// Load uncompacted WAL entries from disk into `held_wal`.
     ///
-    /// WAL entries are NOT replayed into the tree here. They are stored in
-    /// `pending_wal_entries` and replayed on top of blob data when a path is
+    /// WAL entries are NOT replayed into the tree here. They are held in
+    /// `held_wal` and replayed on top of blob data when a path is
     /// promoted via `promote_path()`. This ensures correct ordering — blob data
     /// is read first, then all WAL entries (SET, UPDATE, DELETE) are applied.
     async fn load_wal_entries(&mut self) -> std::io::Result<()> {
@@ -195,14 +195,8 @@ impl Database {
                             self.blob_sequence
                         );
 
-                        self.held_wal_bytes.clear();
-                        for entry in &entries {
-                            // One JSON line each, as WalWriter writes them.
-                            let bytes = serde_json::to_vec(entry).map_or(0, |v| v.len() + 1);
-                            *self.held_wal_bytes.entry(entry.sequence).or_default() += bytes as u64;
-                        }
-                        self.pending_wal_entries = entries;
-                        self.wal_index.rebuild(&self.pending_wal_entries);
+                        // Parsed (and so validated) by the reader; held as lines.
+                        self.held_wal = held_wal::HeldWal::from_entries(entries);
                     }
 
                     // If many small WAL files have accumulated, request compaction
@@ -230,7 +224,7 @@ impl Database {
     // =========================================================================
     /// Handle a compaction complete notification from the StorageWorker.
     ///
-    /// Trims pending_wal_entries to drop entries already baked into the blob,
+    /// Trims held WAL entries already baked into the blob,
     /// and updates blob_sequence so future promotions skip those entries.
     pub(super) async fn handle_compaction_complete(&mut self, cc: CompactionComplete) {
         let new_sequence = cc.sequence;
@@ -328,20 +322,15 @@ impl Database {
             }
         }
 
-        let before = self.pending_wal_entries.len();
-        self.pending_wal_entries
-            .retain(|e| e.sequence > new_sequence);
-        let trimmed = before - self.pending_wal_entries.len();
-        self.held_wal_bytes = self.held_wal_bytes.split_off(&(new_sequence + 1));
+        let trimmed = self.held_wal.trim_through(new_sequence);
         self.blob_sequence = new_sequence;
         if trimmed > 0 {
-            self.wal_index.rebuild(&self.pending_wal_entries);
             debug!(
                 "[Compaction] {}: Trimmed {} WAL entries (blob now at seq {}), {} remaining",
                 self.id,
                 trimmed,
                 new_sequence,
-                self.pending_wal_entries.len()
+                self.held_wal.len()
             );
         }
     }

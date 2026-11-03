@@ -121,7 +121,7 @@ impl Database {
                 cache_hits = snap.cache_hits,
                 cache_hit_bytes = snap.cache_hit_bytes,
                 cache_header_misses = snap.cache_header_misses,
-                pending_wal = self.pending_wal_entries.len(),
+                pending_wal = self.held_wal.len(),
                 promoted_paths = self.promoted_paths.len(),
                 "Promotion stats"
             );

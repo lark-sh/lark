@@ -503,9 +503,9 @@ self.wal_write_set(path_str, &value);
 
 Implementation:
 1. **Canonicalize SET-to-null**: if `value.is_null()`, route to `wal_write_delete` instead. Without this, `WalEntry::set(path, Null)` serializes as `{"o":"s","v":null}`, which serde reads back as `value: None` on restart, so the SET arm of WAL replay would silently skip the entry. This canonicalization gives the WAL a single encoding for "delete" (`WalOp::Delete`, no `v` field) regardless of which wire shape produced it (Lark `remove()`, Firebase `set(null)`, transaction SET-with-null, on-disconnect SET-with-null).
-2. Create `WalEntry::Set { path, value }`
-3. Append to WAL buffer (JSONL format)
-4. Also append to in-memory `pending_wal_entries` (for replay during future promotions)
+2. Serialize the entry's JSON line once, from the borrowed path and value
+3. Append the line to the WAL buffer (JSONL format)
+4. Hold the same line in `held_wal` (for replay during future promotions)
 5. Check rotation threshold (5MB)
 6. Mark `wal_dirty = true` for next sync
 
@@ -531,7 +531,7 @@ Setting both gives strict per-write durability at the cost of write latency.
 
 On WAL rotation, a `CompactionRequest` is sent to the per-core StorageWorker via `LocalChannel`. Rotation doesn't wait for the finished file to reach the device: the StorageWorker syncs it before compacting it.
 
-Entries stay in `pending_wal_entries`, in memory, until compaction puts them in the blob. A database that has had no clients for 60 seconds compacts before it unloads (`ready_to_unload`): it rotates the WAL if the current file holds anything, asks for a compaction and keeps running. It unloads once nothing is held, or after 30 seconds if the compaction was skipped, as when `lark-compact` holds the storage lock. A client that connects meanwhile is served as usual. The next load then has no WAL to replay. The `held_wal_bytes` and `held_wal_entries` metrics report what each database holds.
+Entries stay in `held_wal` (`server/src/db/database/held_wal.rs`), in memory, until compaction puts them in the blob. Each is held as its JSON line, with a path index; parsed values took about four times the space. A line is parsed only when a promotion replays it, or when `has_pending_delete_within` checks an entry that was flagged as possibly deleting when it was held. Both go through the path index, so they only parse entries that affect the path in question. A database's held entries carry over when it unloads and are read back on its next load. The `held_wal_bytes` and `held_wal_entries` metrics report what each database holds.
 
 #### Record Processed
 
@@ -729,7 +729,7 @@ fn flush_volatile_slow(&mut self) {
    - Rules eval consumes `newData` via `LazyUpdateSnapshot`. If a rule reads `data.*` or `root.*` and the path isn't loaded, the engine returns `NeedsPromotion` and the retry loop calls `load_from_blob` for that specific path. For a rule that only references `auth.*` / `newData.*`, no tree access happens at all.
    - Rule passes → continue
 6. **Tree mutation** `tree.set_lazy(["players", "alice", "score"], 100)`: Sentinel intermediates created for any unloaded ancestor; `track_sentinels_after_write("/players/alice/score")` records them
-7. **WAL append** `{"o":"s","p":"/players/alice/score","v":100}` + stored in `pending_wal_entries`
+7. **WAL append** `{"o":"s","p":"/players/alice/score","v":100}` + the same line held in `held_wal`
 8. **Record processed** `processed_writes["client-1"].insert("req-1")`
 9. **Broadcast** finds affected views:
     - `/players` → 3 subscribers

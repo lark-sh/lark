@@ -206,16 +206,17 @@ impl Database {
         let mut temp_tree = Tree::new();
         temp_tree.set_arc_uncleaned(&path_obj, base);
 
-        let matching_indices = self.wal_index.find_affecting(path);
-        for &idx in &matching_indices {
-            let entry = &self.pending_wal_entries[idx];
+        for pos in self.held_wal.find_affecting(path) {
+            let Some(entry) = self.held_wal.get(pos) else {
+                continue;
+            };
             let entry_path = Path::parse(&entry.path);
             match entry.op {
                 WalOp::Set => {
                     // See note in `promote_path_unchecked`: SET with None
                     // is the historical SET-to-null form. `set_lazy` cleans
                     // Null to a delete via `from_value_cleaned`.
-                    let value = entry.value.clone().unwrap_or(Value::Null);
+                    let value = entry.value.unwrap_or(Value::Null);
                     temp_tree.set_lazy(&entry_path, value);
                 }
                 WalOp::Update => {
@@ -289,10 +290,12 @@ impl Database {
         let mut temp_tree = Tree::new();
         temp_tree.set_arc_uncleaned(&path_obj, blob_value);
 
-        // Use the indexed lookup instead of scanning all entries
-        let matching_indices = self.wal_index.find_affecting(path);
-        for &idx in &matching_indices {
-            let entry = &self.pending_wal_entries[idx];
+        // Use the indexed lookup instead of scanning all entries, and parse
+        // only the entries it returns.
+        for pos in self.held_wal.find_affecting(path) {
+            let Some(entry) = self.held_wal.get(pos) else {
+                continue;
+            };
             let entry_path = Path::parse(&entry.path);
             match entry.op {
                 WalOp::Set => {
@@ -301,7 +304,7 @@ impl Database {
                     // this to `WalOp::Delete` in `wal_write_set`, but old WAL
                     // entries on disk may still have the SET-with-null form;
                     // map None → Null so `tree.set` cleans it to a delete.
-                    let value = entry.value.clone().unwrap_or(Value::Null);
+                    let value = entry.value.unwrap_or(Value::Null);
                     temp_tree.set(&entry_path, value);
                 }
                 WalOp::Update => {
