@@ -145,8 +145,6 @@ run_chaos_monkey() {
         --privileged \
         --security-opt seccomp=unconfined \
         -e RUST_LOG="$log_level" \
-        -e LARK_COLD_TIMEOUT_SECS=5 \
-        -e LARK_COLD_STORE_IDLE_SECS=10 \
         "${DOCKER_CACHE_MOUNTS[@]}" \
         -w /work \
         "$DEV_IMAGE" \

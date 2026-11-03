@@ -47,6 +47,15 @@ impl VerificationResult {
             || self.disk.has_violations()
     }
 
+    /// Paths that failed verification.
+    pub fn violated_paths(&self) -> Vec<String> {
+        self.missing_committed
+            .iter()
+            .chain(&self.wrong_values)
+            .map(|v| v.path.clone())
+            .collect()
+    }
+
     pub fn violation_count(&self) -> usize {
         self.missing_committed.len()
             + self.wrong_values.len()
@@ -57,6 +66,15 @@ impl VerificationResult {
             } else {
                 0
             }
+    }
+}
+
+/// When a violated path's write was acknowledged, or that it was written in an
+/// earlier cycle (no ACK time this cycle).
+fn ack_note(ack_age_secs: Option<f64>) -> String {
+    match ack_age_secs {
+        Some(secs) => format!("ACK {:.1}s before kill", secs),
+        None => "carried from an earlier cycle".to_string(),
     }
 }
 
@@ -346,11 +364,11 @@ pub async fn verify_after_restart(
                             let ack_age_secs =
                                 committed_at.map(|t| kill_time.duration_since(t).as_secs_f64());
                             error!(
-                                "VIOLATION: {} — expected {}, got {} (ACK {:.1}s before kill)",
+                                "VIOLATION: {} — expected {}, got {} ({})",
                                 path,
                                 value_type_summary(&expected),
                                 value_type_summary(&value),
-                                ack_age_secs.unwrap_or(-1.0),
+                                ack_note(ack_age_secs),
                             );
                             result.wrong_values.push(ViolationInfo {
                                 path,
@@ -377,9 +395,9 @@ pub async fn verify_after_restart(
         for (_, (path, expected, committed_at)) in pending_reads.drain() {
             let ack_age_secs = committed_at.map(|t| kill_time.duration_since(t).as_secs_f64());
             warn!(
-                "ONCE read timed out for committed path: {} (ACK {:.1}s before kill)",
+                "ONCE read timed out for committed path: {} ({})",
                 path,
-                ack_age_secs.unwrap_or(-1.0),
+                ack_note(ack_age_secs),
             );
             result.missing_committed.push(ViolationInfo {
                 path,

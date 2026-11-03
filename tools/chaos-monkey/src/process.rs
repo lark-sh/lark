@@ -104,10 +104,13 @@ impl ManagedProcess {
 
 /// Create a ManagedProcess for the Lark server.
 ///
-/// Sets `--eviction-idle-secs=20` so promoted paths get evicted aggressively
-/// during chaos runs — this exercises the lazy-tree promote/evict code paths
-/// that prod hits but the default 5-minute timeout would never fire in a short
-/// chaos session.
+/// Seconds a promoted path stays idle before the chaos server evicts it.
+pub const EVICTION_IDLE_SECS: u64 = 5;
+
+/// Sets `--eviction-idle-secs` to `EVICTION_IDLE_SECS` so promoted paths get
+/// evicted aggressively during chaos runs — this exercises the lazy-tree
+/// promote/evict code paths that prod hits but the default 5-minute timeout
+/// would never fire in a short chaos session.
 ///
 /// In `strict` durability mode, also passes `--wal-sync-interval-ms=0
 /// --fsync-on-wal-flush=true` so every write is flushed (and fdatasync'd) before
@@ -126,7 +129,7 @@ pub fn create_server_process(
         "--emulator".to_string(),
         format!("--data-dir={}", data_dir.display()),
         "--nr-cores=1".to_string(),
-        "--eviction-idle-secs=20".to_string(),
+        format!("--eviction-idle-secs={}", EVICTION_IDLE_SECS),
     ];
     if durability == Durability::Strict {
         args.push("--wal-sync-interval-ms=0".to_string());

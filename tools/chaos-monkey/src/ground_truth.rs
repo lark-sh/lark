@@ -5,10 +5,17 @@
 //!
 //! After a crash, the expected state is reconstructed from committed writes only.
 //! Pending writes may or may not appear — both outcomes are acceptable.
+//!
+//! State carries across cycles: each cycle starts from a baseline, the state
+//! the previous cycles left that's still known (see `carry_forward`), so data
+//! written cycles ago is checked again after later restarts and compactions.
 
 use crate::operations::{TxOp, TxOpKind};
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 use tracing::{debug, trace};
 
@@ -54,14 +61,74 @@ pub struct GroundTruth {
     writes: HashMap<String, WriteRecord>,
     /// Monotonically increasing sequence counter
     next_sequence: u64,
+    /// Leaves known from earlier cycles, before this cycle's writes.
+    baseline: BTreeMap<String, Value>,
+    /// At most this many leaves carried from earlier cycles are verified per
+    /// pass, picked at random with `sample_seed`. This cycle's leaves are all
+    /// verified.
+    carried_sample: usize,
+    sample_seed: u64,
 }
 
 impl GroundTruth {
     pub fn new() -> Self {
+        Self::with_baseline(BTreeMap::new(), 0, usize::MAX)
+    }
+
+    /// Ground truth for a cycle that starts from `baseline`, verifying up to
+    /// `carried_sample` of its leaves, chosen with `sample_seed`.
+    pub fn with_baseline(
+        baseline: BTreeMap<String, Value>,
+        sample_seed: u64,
+        carried_sample: usize,
+    ) -> Self {
         Self {
             writes: HashMap::new(),
             next_sequence: 1,
+            baseline,
+            carried_sample,
+            sample_seed,
         }
+    }
+
+    /// Leaves carried from earlier cycles.
+    pub fn baseline_len(&self) -> usize {
+        self.baseline.len()
+    }
+
+    /// The state to start the next cycle from: this cycle's expected state
+    /// minus anything not known for sure. That's whatever a pending
+    /// (unacknowledged) write could have changed, since it may or may not
+    /// have landed, and the paths in `drop`, which failed verification and
+    /// were reported already.
+    pub fn carry_forward(&self, drop: &[String]) -> BTreeMap<String, Value> {
+        let mut state = self.build_state();
+        let pending = self
+            .writes
+            .values()
+            .filter(|w| matches!(w.state, WriteState::Sent));
+        for record in pending {
+            // `replaced_roots` leaves out the root; a pending write that may
+            // have replaced it leaves nothing known.
+            let replaces_root = match &record.operation {
+                WriteOp::Set(_) => normalize_path(&record.path) == "/",
+                WriteOp::Update(_) => false,
+                WriteOp::Transaction(subs) => subs.iter().any(|s| {
+                    matches!(s.kind, TxOpKind::Set | TxOpKind::Delete)
+                        && normalize_path(&s.path) == "/"
+                }),
+            };
+            if replaces_root {
+                return BTreeMap::new();
+            }
+            for root in replaced_roots(record) {
+                forget(&mut state, &root);
+            }
+        }
+        for path in drop {
+            forget(&mut state, path);
+        }
+        state
     }
 
     /// Record a write that was sent to the server.
@@ -119,6 +186,10 @@ impl GroundTruth {
     /// Build the expected tree state from committed writes, replayed in sequence order.
     /// Returns a nested JSON value representing the expected state at each path.
     pub fn build_expected_state(&self) -> HashMap<String, Value> {
+        self.build_state().into_iter().collect()
+    }
+
+    fn build_state(&self) -> BTreeMap<String, Value> {
         let mut committed: Vec<&WriteRecord> = self
             .writes
             .values()
@@ -128,15 +199,13 @@ impl GroundTruth {
         // Sort by sequence to replay in order
         committed.sort_by_key(|w| w.sequence);
 
-        let mut state: HashMap<String, Value> = HashMap::new();
+        let mut state = self.baseline.clone();
 
         for record in committed {
             match &record.operation {
                 WriteOp::Set(value) => {
                     // Remove existing path and ALL children first (SET replaces the whole subtree)
-                    state.remove(&record.path);
-                    let prefix = format!("{}/", record.path);
-                    state.retain(|k, _| !k.starts_with(&prefix));
+                    remove_subtree(&mut state, &record.path);
 
                     if !value.is_null() {
                         // SET: replace value at path
@@ -149,9 +218,7 @@ impl GroundTruth {
                         for (key, val) in obj {
                             let child_path = format!("{}/{}", record.path, key);
                             // Clear existing subtree for this child key
-                            state.remove(&child_path);
-                            let child_prefix = format!("{}/", child_path);
-                            state.retain(|k, _| !k.starts_with(&child_prefix));
+                            remove_subtree(&mut state, &child_path);
 
                             if !val.is_null() {
                                 flatten_value(&child_path, val, &mut state);
@@ -166,9 +233,7 @@ impl GroundTruth {
                     for sub in tx_ops {
                         match &sub.kind {
                             TxOpKind::Set => {
-                                state.remove(&sub.path);
-                                let prefix = format!("{}/", sub.path);
-                                state.retain(|k, _| !k.starts_with(&prefix));
+                                remove_subtree(&mut state, &sub.path);
                                 if let Some(v) = &sub.value {
                                     if !v.is_null() {
                                         flatten_value(&sub.path, v, &mut state);
@@ -179,9 +244,7 @@ impl GroundTruth {
                                 if let Some(Value::Object(obj)) = &sub.value {
                                     for (key, val) in obj {
                                         let child_path = format!("{}/{}", sub.path, key);
-                                        state.remove(&child_path);
-                                        let child_prefix = format!("{}/", child_path);
-                                        state.retain(|k, _| !k.starts_with(&child_prefix));
+                                        remove_subtree(&mut state, &child_path);
                                         if !val.is_null() {
                                             flatten_value(&child_path, val, &mut state);
                                         }
@@ -189,9 +252,7 @@ impl GroundTruth {
                                 }
                             }
                             TxOpKind::Delete => {
-                                state.remove(&sub.path);
-                                let prefix = format!("{}/", sub.path);
-                                state.retain(|k, _| !k.starts_with(&prefix));
+                                remove_subtree(&mut state, &sub.path);
                             }
                         }
                     }
@@ -239,17 +300,22 @@ impl GroundTruth {
             }
         }
 
-        let state = self.build_expected_state();
+        let state = self.build_state();
         let mut out: Vec<(String, HashMap<String, Value>)> = outermost
             .into_iter()
             .filter(|root| !pending_roots.iter().any(|p| paths_overlap(p, root)))
             .map(|root| {
                 let prefix = format!("{}/", root);
-                let leaves = state
-                    .iter()
-                    .filter(|(k, _)| **k == root || k.starts_with(&prefix))
-                    .map(|(k, v)| (k.clone(), v.clone()))
+                let mut leaves: HashMap<String, Value> = subtree_keys(&state, &prefix)
+                    .into_iter()
+                    .map(|k| {
+                        let v = state[&k].clone();
+                        (k, v)
+                    })
                     .collect();
+                if let Some(v) = state.get(&root) {
+                    leaves.insert(root.clone(), v.clone());
+                }
                 (root, leaves)
             })
             .collect();
@@ -280,9 +346,11 @@ impl GroundTruth {
     }
 
     /// Like get_verification_paths, but also returns the committed_at timestamp
-    /// for each path (from the write that last set it).
+    /// for each path (from the write that last set it). A leaf carried from
+    /// an earlier cycle, and not rewritten in this one, has no timestamp; at
+    /// most `carried_sample` of those are returned, picked at random.
     pub fn get_verification_paths_with_timing(&self) -> Vec<(String, Value, Option<Instant>)> {
-        let state = self.build_expected_state();
+        let state = self.build_state();
 
         // Collect committed writes sorted by sequence (latest last)
         let mut committed: Vec<&WriteRecord> = self
@@ -292,18 +360,27 @@ impl GroundTruth {
             .collect();
         committed.sort_by_key(|w| w.sequence);
 
-        state
-            .into_iter()
-            .map(|(path, value)| {
-                // Find the latest committed write that covers this path
-                let committed_at = committed
-                    .iter()
-                    .rev()
-                    .find(|w| path == w.path || path.starts_with(&format!("{}/", w.path)))
-                    .and_then(|w| w.committed_at);
-                (path, value, committed_at)
-            })
-            .collect()
+        let mut current = Vec::new();
+        let mut carried = Vec::new();
+        for (path, value) in state {
+            if self.baseline.get(&path) == Some(&value) {
+                carried.push((path, value, None));
+                continue;
+            }
+            // Find the latest committed write that covers this path
+            let committed_at = committed
+                .iter()
+                .rev()
+                .find(|w| path == w.path || path.starts_with(&format!("{}/", w.path)))
+                .and_then(|w| w.committed_at);
+            current.push((path, value, committed_at));
+        }
+        if carried.len() > self.carried_sample {
+            carried.shuffle(&mut StdRng::seed_from_u64(self.sample_seed));
+            carried.truncate(self.carried_sample);
+        }
+        current.extend(carried);
+        current
     }
 
     /// Get all paths from rejected writes (should NOT exist from those writes).
@@ -650,11 +727,39 @@ fn paths_overlap(a: &str, b: &str) -> bool {
     a == b || a.starts_with(&format!("{}/", b)) || b.starts_with(&format!("{}/", a))
 }
 
+/// Keys strictly below `prefix` (which ends in "/"), in order.
+fn subtree_keys(state: &BTreeMap<String, Value>, prefix: &str) -> Vec<String> {
+    state
+        .range::<str, _>((
+            std::ops::Bound::Included(prefix),
+            std::ops::Bound::Unbounded,
+        ))
+        .take_while(|(k, _)| k.starts_with(prefix))
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
+/// Remove `path` and everything below it.
+fn remove_subtree(state: &mut BTreeMap<String, Value>, path: &str) {
+    state.remove(path);
+    for key in subtree_keys(state, &format!("{}/", path)) {
+        state.remove(&key);
+    }
+}
+
+/// Forget everything a write at `path` could have changed: the path, what's
+/// below it, and any primitive ancestor it would turn into a container.
+fn forget(state: &mut BTreeMap<String, Value>, path: &str) {
+    let path = normalize_path(path);
+    remove_subtree(state, &path);
+    clear_ancestor_leaves(state, &path);
+}
+
 /// Flatten a JSON value into leaf paths.
 /// For {"a": {"b": 1, "c": 2}} at path "/x", produces:
 ///   "/x/a/b" -> 1
 ///   "/x/a/c" -> 2
-fn flatten_value(path: &str, value: &Value, state: &mut HashMap<String, Value>) {
+fn flatten_value(path: &str, value: &Value, state: &mut BTreeMap<String, Value>) {
     match value {
         // A null anywhere in a written value is absent, never stored.
         Value::Null => {}
@@ -693,7 +798,7 @@ fn flatten_value(path: &str, value: &Value, state: &mut HashMap<String, Value>) 
 /// Remove any state entry whose key is a strict prefix of `path` (an ancestor).
 /// Mirrors `set_path_mut`'s behavior on the server, which clobbers a primitive
 /// ancestor into a container when a child path is set under it.
-fn clear_ancestor_leaves(state: &mut HashMap<String, Value>, path: &str) {
+fn clear_ancestor_leaves(state: &mut BTreeMap<String, Value>, path: &str) {
     let mut cur = path;
     while let Some(idx) = cur.rfind('/') {
         if idx == 0 {
@@ -708,6 +813,129 @@ fn clear_ancestor_leaves(state: &mut HashMap<String, Value>, path: &str) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn committed(gt: &mut GroundTruth, id: &str, path: &str, op: WriteOp) {
+        gt.record_sent(id, 1, path, op);
+        gt.mark_committed(id);
+    }
+
+    #[test]
+    fn baseline_carries_into_the_next_cycle() {
+        let mut first = GroundTruth::new();
+        committed(
+            &mut first,
+            "r1",
+            "/a",
+            WriteOp::Set(json!({"x": 1, "y": 2})),
+        );
+        committed(&mut first, "r2", "/b", WriteOp::Set(json!(3)));
+
+        let mut second = GroundTruth::with_baseline(first.carry_forward(&[]), 1, usize::MAX);
+        committed(&mut second, "r1", "/a", WriteOp::Update(json!({"y": 5})));
+        let state = second.build_expected_state();
+        assert_eq!(state.get("/a/x"), Some(&json!(1)));
+        assert_eq!(state.get("/a/y"), Some(&json!(5)));
+        assert_eq!(state.get("/b"), Some(&json!(3)));
+    }
+
+    #[test]
+    fn a_set_replaces_carried_leaves() {
+        let mut first = GroundTruth::new();
+        committed(
+            &mut first,
+            "r1",
+            "/a",
+            WriteOp::Set(json!({"x": 1, "y": 2})),
+        );
+        let mut second = GroundTruth::with_baseline(first.carry_forward(&[]), 1, usize::MAX);
+        committed(&mut second, "r1", "/a", WriteOp::Set(json!({"z": 3})));
+        let state = second.build_expected_state();
+        assert_eq!(state.get("/a/x"), None);
+        assert_eq!(state.get("/a/z"), Some(&json!(3)));
+    }
+
+    #[test]
+    fn carry_forward_forgets_what_a_pending_write_could_change() {
+        let mut gt = GroundTruth::new();
+        committed(&mut gt, "r1", "/a", WriteOp::Set(json!({"x": 1, "y": 2})));
+        committed(&mut gt, "r2", "/b", WriteOp::Set(json!(7)));
+        committed(&mut gt, "r3", "/c", WriteOp::Set(json!({"k": 1})));
+        // Pending: may or may not have landed.
+        gt.record_sent("p1", 1, "/a", WriteOp::Update(json!({"y": null})));
+        gt.record_sent("p2", 1, "/b/deeper", WriteOp::Set(json!(1)));
+
+        let carried = gt.carry_forward(&[]);
+        assert_eq!(
+            carried.get("/a/x"),
+            Some(&json!(1)),
+            "untouched sibling stays"
+        );
+        assert_eq!(
+            carried.get("/a/y"),
+            None,
+            "a pending update's key is unknown"
+        );
+        assert_eq!(
+            carried.get("/b"),
+            None,
+            "a primitive the pending write could replace"
+        );
+        assert_eq!(carried.get("/c/k"), Some(&json!(1)));
+    }
+
+    #[test]
+    fn carry_forward_drops_violated_paths() {
+        let mut gt = GroundTruth::new();
+        committed(&mut gt, "r1", "/a", WriteOp::Set(json!({"x": 1, "y": 2})));
+        let carried = gt.carry_forward(&["/a/x".to_string()]);
+        assert_eq!(carried.get("/a/x"), None);
+        assert_eq!(carried.get("/a/y"), Some(&json!(2)));
+    }
+
+    #[test]
+    fn a_pending_root_set_forgets_everything() {
+        let mut gt = GroundTruth::new();
+        committed(&mut gt, "r1", "/a", WriteOp::Set(json!(1)));
+        committed(&mut gt, "r2", "/b", WriteOp::Set(json!(1)));
+        gt.record_sent("p1", 1, "/", WriteOp::Set(json!({"a": 2})));
+        assert!(gt.carry_forward(&[]).is_empty());
+
+        // A pending update at the root only touches its keys.
+        let mut gt = GroundTruth::new();
+        committed(&mut gt, "r1", "/a", WriteOp::Set(json!(1)));
+        committed(&mut gt, "r2", "/b", WriteOp::Set(json!(1)));
+        gt.record_sent("p1", 1, "", WriteOp::Update(json!({"a": 2})));
+        let carried = gt.carry_forward(&[]);
+        assert!(!carried.contains_key("/a"));
+        assert_eq!(carried.get("/b"), Some(&json!(1)));
+    }
+
+    #[test]
+    fn carried_leaves_are_sampled_and_current_ones_are_not() {
+        let mut first = GroundTruth::new();
+        let many: serde_json::Map<String, Value> =
+            (0..50).map(|i| (format!("k{i}"), json!(i))).collect();
+        committed(&mut first, "r1", "/old", WriteOp::Set(Value::Object(many)));
+
+        let mut second = GroundTruth::with_baseline(first.carry_forward(&[]), 7, 10);
+        committed(
+            &mut second,
+            "r1",
+            "/new",
+            WriteOp::Set(json!({"a": 1, "b": 2})),
+        );
+        let paths = second.get_verification_paths_with_timing();
+        let carried = paths
+            .iter()
+            .filter(|(p, _, _)| p.starts_with("/old/"))
+            .count();
+        let current = paths
+            .iter()
+            .filter(|(p, _, _)| p.starts_with("/new/"))
+            .count();
+        assert_eq!(carried, 10);
+        assert_eq!(current, 2);
+    }
 
     #[test]
     fn test_basic_set_and_verify() {
