@@ -919,3 +919,66 @@ fn test_flush_volatile_encode_once() {
     let total: usize = conns.iter().map(|c| c.count()).sum();
     assert_eq!(total, 100);
 }
+
+fn update_event(path: &str, updates: Value) -> MutationEvent {
+    MutationEvent {
+        mutation_type: "update".to_string(),
+        path: path.to_string(),
+        old_value: None,
+        new_value: None,
+        updates: updates.as_object().cloned(),
+        volatile: false,
+        writer_client_id: None,
+    }
+}
+
+#[test]
+fn test_patch_below_rebases_keys_onto_the_view() {
+    let event = update_event("/", json!({"a/b/c": 1, "a/d": 2, "x/y": 3}));
+    assert!(!event.replaces_view_below("/a"));
+    assert_eq!(
+        event.patch_below("/a"),
+        Some(json!({"/b/c": 1, "/d": 2}).as_object().unwrap().clone())
+    );
+    assert_eq!(
+        event.patch_below("/a/b"),
+        Some(json!({"/c": 1}).as_object().unwrap().clone())
+    );
+
+    let event = update_event("/game", json!({"sheet/stats/str": 11}));
+    assert_eq!(
+        event.patch_below("/game/sheet"),
+        Some(json!({"/stats/str": 11}).as_object().unwrap().clone())
+    );
+}
+
+#[test]
+fn test_patch_below_is_none_when_a_key_replaces_the_view() {
+    // A key at the view, or above it.
+    let event = update_event("/", json!({"a": {"b": 1}, "x": 2}));
+    assert!(event.replaces_view_below("/a"));
+    assert_eq!(event.patch_below("/a"), None);
+    assert!(event.replaces_view_below("/a/b"));
+    assert_eq!(event.patch_below("/a/b"), None);
+    // One key below the view doesn't help if another replaces it.
+    let event = update_event("/", json!({"a": {}, "a/b": 1}));
+    assert_eq!(event.patch_below("/a"), None);
+
+    // Not an update.
+    let set = MutationEvent {
+        mutation_type: "set".to_string(),
+        path: "/".to_string(),
+        old_value: None,
+        new_value: Some(json!({"a": {"b": 1}})),
+        updates: None,
+        volatile: false,
+        writer_client_id: None,
+    };
+    assert!(set.replaces_view_below("/a"));
+    assert_eq!(set.patch_below("/a"), None);
+
+    // A view at or above the update's path isn't below it.
+    let event = update_event("/a", json!({"b": 1}));
+    assert_eq!(event.patch_below("/a"), None);
+    assert_eq!(event.patch_below("/"), None);
+}

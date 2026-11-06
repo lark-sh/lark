@@ -56,6 +56,8 @@ When a client performs a write (set/update/delete), the server responds with:
 
 The ACK always comes, but data events don't. A write that leaves the data as it was has nothing to send, and nobody receives an event for it, the writer included. An update drops the keys that didn't change, comparing each key's whole value. Comparison only uses data the server has in memory, so an unchanged write to unloaded data is still sent. Volatile paths are always sent.
 
+A subscriber below an update's path receives the keys that write below its path as a `patch`, the same event it would get had the update been sent at its path. If a key writes at or above its path, replacing its whole value, it receives a `put` of the new value instead.
+
 ## Compare-and-Swap (CAS) Writes
 
 A SET can carry an optional compare-and-swap hash. Three shapes:

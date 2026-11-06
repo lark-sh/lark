@@ -212,10 +212,17 @@ impl ViewManager {
 
         // Determine event type, relative path, and value
         let (event_type, relative_path, value): (&str, String, Value) = if view_len > mutation_len {
-            // View is below the mutation path (view is a descendant)
-            let view_path_obj = Path::parse(view_path);
-            let value = tree.get_value(&view_path_obj).unwrap_or(Value::Null);
-            ("put", "/".to_string(), value)
+            // View is below the mutation path (view is a descendant). An update
+            // whose keys all write below the view is a patch to it. Anything
+            // else replaces the view's whole value, which is read from the tree.
+            match event.patch_below(view_path) {
+                Some(patch) => ("patch", "/".to_string(), Value::Object(patch)),
+                None => {
+                    let view_path_obj = Path::parse(view_path);
+                    let value = tree.get_value(&view_path_obj).unwrap_or(Value::Null);
+                    ("put", "/".to_string(), value)
+                }
+            }
         } else {
             // Check if view path is prefix of mutation path
             let is_prefix = view_len == 0
