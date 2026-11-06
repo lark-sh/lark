@@ -16,7 +16,8 @@ use lark_blob::{ArcValue, StdBlobIO, write_blob};
 use lark_server::protocol::{ClientMessage, TransactionOp, op};
 use proptest::prelude::*;
 use serde_json::{Map, Value, json};
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const ROOT: &str = "m";
@@ -364,16 +365,32 @@ async fn drain_events(subscriber: &TestClient, view: &str, mirror: &mut Value) {
     }
 }
 
-/// Writes past the WAL rotation size, then waits for the storage worker.
-async fn compact(client: &TestClient) {
-    let chunk = "x".repeat(600_000);
+/// Writes past the WAL rotation size, then waits until the storage worker has
+/// compacted the finished file into the blob. Each call writes new values: a
+/// write that leaves the data as it was stays out of the WAL, so repeating the
+/// last call's values wouldn't rotate it.
+async fn compact(client: &TestClient, db_dir: &str) {
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
+    let sequence = || {
+        std::fs::read_to_string(format!("{db_dir}/sequence"))
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+    };
+    let before = sequence();
+    let chunk = format!("{call}:{}", "x".repeat(600_000));
     for i in 0..10 {
         client
             .set(&format!("/bulk/item_{i}"), json!(&chunk))
             .await
             .unwrap();
     }
-    glommio::timer::sleep(Duration::from_millis(3500)).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while sequence() <= before {
+        assert!(Instant::now() < deadline, "the WAL wasn't compacted");
+        glommio::timer::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn check_step(client: &TestClient, model: &Value, step: &Step) {
@@ -466,12 +483,12 @@ async fn run_script(initial: Value, steps: Vec<Step>, mode: Mode) {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = temp_dir.path().to_str().unwrap().to_string();
     let db_id = "test-project/model".to_string();
+    let db_dir = format!("{data_dir}/{db_id}");
 
     let mut model = Value::Null;
     if !mode.ephemeral {
         let initial = clean(&initial);
         model_write(&mut model, &[], &initial);
-        let db_dir = format!("{data_dir}/{db_id}");
         std::fs::create_dir_all(&db_dir).unwrap();
         let blob_path = format!("{db_dir}/blob.lark");
         let io = StdBlobIO::create(std::path::Path::new(&blob_path)).unwrap();
@@ -516,7 +533,7 @@ async fn run_script(initial: Value, steps: Vec<Step>, mode: Mode) {
     for step in &steps {
         match step {
             Step::Evict => client.force_evict_all().await,
-            Step::Compact => compact(&client).await,
+            Step::Compact => compact(&client, &db_dir).await,
             Step::Restart => {
                 // Default durability acks before the WAL sync; let it land first.
                 glommio::timer::sleep(WAL_SYNC_WAIT).await;
