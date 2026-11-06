@@ -123,7 +123,7 @@ impl Database {
         op: WalOp,
         path: &str,
         value: Option<&V>,
-        may_delete: bool,
+        targets: &[held_wal::Target],
     ) -> bool {
         if self.wal_writer.is_none() {
             return true; // No WAL writer (ephemeral) - always succeeds
@@ -146,7 +146,7 @@ impl Database {
         self.wal_dirty = true;
         self.wal_pending_entries += 1;
         self.wal_pending_bytes += bytes;
-        self.held_wal.push(sequence, path, &line, may_delete);
+        self.held_wal.push(sequence, targets, &line);
         true
     }
 
@@ -161,8 +161,8 @@ impl Database {
         if value.is_null() {
             return self.wal_write_delete(path);
         }
-        let may_delete = held_wal::may_delete(&WalOp::Set, Some(value));
-        self.append_wal(WalOp::Set, path, Some(value), may_delete)
+        let target = held_wal::set_target(path, Some(value));
+        self.append_wal(WalOp::Set, path, Some(value), &[target])
     }
 
     /// Write an UPDATE operation to the WAL (in-memory buffer only, no I/O).
@@ -172,14 +172,14 @@ impl Database {
         path: &str,
         updates: &serde_json::Map<String, Value>,
     ) -> bool {
-        let may_delete = updates.values().any(subscribe::stores_nothing);
-        self.append_wal(WalOp::Update, path, Some(updates), may_delete)
+        let targets = held_wal::update_targets(path, updates);
+        self.append_wal(WalOp::Update, path, Some(updates), &targets)
     }
 
     /// Write a DELETE operation to the WAL (in-memory buffer only, no I/O).
     /// Returns false if serialization failed (caller should NACK).
     pub(super) fn wal_write_delete(&mut self, path: &str) -> bool {
-        self.append_wal::<Value>(WalOp::Delete, path, None, true)
+        self.append_wal::<Value>(WalOp::Delete, path, None, &[held_wal::delete_target(path)])
     }
 
     /// Flush the buffered WAL entries to the WAL file (async).

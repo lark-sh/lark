@@ -220,8 +220,9 @@ impl Database {
                     temp_tree.set_lazy(&entry_path, value);
                 }
                 WalOp::Update => {
-                    if let Some(Value::Object(ref updates)) = entry.value {
-                        temp_tree.update_lazy(&entry_path, updates);
+                    if let Some(Value::Object(updates)) = entry.value {
+                        let updates = keys_reaching(&entry.path, updates, path);
+                        temp_tree.update_lazy(&entry_path, &updates);
                     }
                 }
                 WalOp::Delete => {
@@ -308,8 +309,9 @@ impl Database {
                     temp_tree.set(&entry_path, value);
                 }
                 WalOp::Update => {
-                    if let Some(Value::Object(ref updates)) = entry.value {
-                        temp_tree.update(&entry_path, updates);
+                    if let Some(Value::Object(updates)) = entry.value {
+                        let updates = keys_reaching(&entry.path, updates, path);
+                        temp_tree.update(&entry_path, &updates);
                     }
                 }
                 WalOp::Delete => {
@@ -544,4 +546,23 @@ impl Database {
     pub(super) async fn load_from_blob(&mut self, path: &str) -> Result<bool, String> {
         self.promote_path(path).await
     }
+}
+
+/// The keys of an update at `base` that write at, above or below `path`, in
+/// their order. The others write elsewhere and can't change what's at `path`,
+/// so replaying them would only build nodes that are thrown away.
+fn keys_reaching(
+    base: &str,
+    updates: serde_json::Map<String, Value>,
+    path: &str,
+) -> serde_json::Map<String, Value> {
+    let path = normalize_path_key(path);
+    let base = base.trim_end_matches('/');
+    updates
+        .into_iter()
+        .filter(|(key, _)| {
+            let target = normalize_path_key(&format!("{base}/{key}"));
+            target == path || is_below(&target, &path) || is_below(&path, &target)
+        })
+        .collect()
 }
