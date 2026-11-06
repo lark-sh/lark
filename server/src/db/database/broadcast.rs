@@ -237,11 +237,13 @@ impl Database {
 
         // 2. Deep promote the views that read their whole value from the tree, which
         //    must be Sentinel-free for it. A query view recomputes from all its
-        //    children. A view below the mutation path is sent as a full put.
+        //    children. A view below the mutation path is sent as a full put,
+        //    unless the event is an update whose keys all write below the view,
+        //    which is sent as a patch from the update itself.
         for info in &view_infos {
-            if (info.has_query || is_below(&info.path, &event.path))
-                && let Err(e) = self.promote_path_deep(&info.path).await
-            {
+            let reads_tree = info.has_query
+                || (is_below(&info.path, &event.path) && event.replaces_view_below(&info.path));
+            if reads_tree && let Err(e) = self.promote_path_deep(&info.path).await {
                 warn!(
                     "{}: failed to load view {} for broadcast: {}",
                     self.id, info.path, e

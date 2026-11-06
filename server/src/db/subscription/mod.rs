@@ -570,6 +570,43 @@ pub struct MutationEvent {
     pub writer_client_id: Option<String>,
 }
 
+impl MutationEvent {
+    /// True if this event replaces the whole value of a view below its path:
+    /// it isn't an update, or a key writes at or above the view. Both paths
+    /// must be normalized.
+    pub fn replaces_view_below(&self, view_path: &str) -> bool {
+        let Some(updates) = self
+            .updates
+            .as_ref()
+            .filter(|_| self.mutation_type == "update")
+        else {
+            return true;
+        };
+        updates.keys().any(|key| {
+            let target = normalize_path(&format!("{}/{}", self.path, key));
+            target == view_path || is_below(view_path, &target)
+        })
+    }
+
+    /// For an update above `view_path` whose keys all write below the view or
+    /// elsewhere, the keys that write below it, as a patch relative to it: the
+    /// patch the view would get had the update been sent at its path. None
+    /// otherwise. Both paths must be normalized.
+    pub fn patch_below(&self, view_path: &str) -> Option<Map<String, Value>> {
+        if !is_below(view_path, &self.path) || self.replaces_view_below(view_path) {
+            return None;
+        }
+        let mut patch = Map::new();
+        for (key, value) in self.updates.as_ref()? {
+            let target = normalize_path(&format!("{}/{}", self.path, key));
+            if is_below(&target, view_path) {
+                patch.insert(target[view_path.len()..].to_string(), value.clone());
+            }
+        }
+        Some(patch)
+    }
+}
+
 /// Boundary item for limited queries - tracks the edge of the view window.
 /// For limitToFirst: this is the LAST item (highest sort value in view).
 /// For limitToLast: this is the FIRST item (lowest sort value in view).
