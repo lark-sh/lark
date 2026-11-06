@@ -190,4 +190,60 @@ describe('Lark: root-level multi-path update echoes to writer\'s own query subsc
     userPostsRef.off('child_added', userPostsAddedCb);
     userPostsRef.off('child_removed', userPostsRemovedCb);
   });
+  it('the same update sent at the database root, with leading-slash keys, as the quickstart sends it', async () => {
+    // The tests above write below a random node. The quickstart writes at the
+    // database root, where the base path is `/` and each key starts with a
+    // slash. The node's key goes into the paths so the test stays isolated.
+    //
+    // On the ack the SDK rebuilds a listener's view from the server data it
+    // holds, wherever that data is complete. A plain listener's is, so a post
+    // the server never sent it disappears. A limited query's isn't complete
+    // for a child it hasn't seen, so it keeps the post either way. Both kinds
+    // are checked.
+    const node = getRandomNode() as Reference;
+    const dbRoot = node.root;
+    const listeners = {
+      'posts limitToLast(100)': node.child('posts').limitToLast(100),
+      'posts': node.child('posts'),
+      'user-posts/user1': node.child('user-posts/user1'),
+    };
+
+    const events: Array<{ listener: string; event: string; key: string | null }> = [];
+    const values: Record<string, unknown> = {};
+    const offs: Array<() => void> = [];
+    for (const [listener, query] of Object.entries(listeners)) {
+      for (const event of ['child_added', 'child_removed'] as const) {
+        const cb = query.on(event, snap => {
+          events.push({ listener, event, key: snap.key });
+        });
+        offs.push(() => query.off(event, cb));
+      }
+      const onValue = query.on('value', snap => {
+        values[listener] = snap.val();
+      });
+      offs.push(() => query.off('value', onValue));
+    }
+    await pause(100);
+
+    const post = { author: 'Alice', uid: 'user1', title: 'Hello', starCount: 0 };
+    await dbRoot.update({
+      [`/${node.key}/posts/post1`]: post,
+      [`/${node.key}/user-posts/user1/post1`]: post,
+    });
+    await pause(500);
+
+    expect(
+      events.filter(e => e.event === 'child_removed'),
+      `post1 was removed after the ack; events=${JSON.stringify(events)}`,
+    ).to.deep.equal([]);
+    for (const listener of Object.keys(listeners)) {
+      expect(
+        events.filter(e => e.listener === listener && e.event === 'child_added' && e.key === 'post1'),
+        `${listener}: ${JSON.stringify(events)}`,
+      ).to.have.length(1);
+      expect(values[listener], listener).to.deep.equal({ post1: post });
+    }
+
+    offs.forEach(off => off());
+  }).retries(0); // A removal is the failure, so don't let a retry hide one.
 });
