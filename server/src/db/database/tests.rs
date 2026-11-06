@@ -3970,3 +3970,67 @@ fn test_volatile_update_and_remove_are_not_stored() {
         assert_eq!(db.tree.read().unwrap().get_value_str("/cursors/p1"), None);
     })
 }
+
+// A multi-path update above a view whose keys write below it reaches the view
+// as a patch, without loading the view. A key at the view replaces it, so the
+// view is loaded and sent whole.
+#[test]
+fn test_update_above_view_patches_without_loading_it() {
+    block_on(async {
+        let (mut db, _dir) = make_blob_backed_db(json!({
+            "chars": {"c": {"hp": 1, "name": "x"}},
+            "other": {"k": 1}
+        }))
+        .await;
+        let (conn, messages) = MockConnection::new();
+        db.add_client_internal("client1", None, "conn1", conn);
+        let sub = ClientMessage {
+            op: "sb".to_string(),
+            path: Some("/chars/c".to_string()),
+            request_id: Some("s1".to_string()),
+            ..Default::default()
+        };
+        db.handle_subscribe("client1", &sub).await;
+        force_evict(&mut db, "/chars");
+        messages.lock().unwrap().clear();
+
+        let update = |value: Value, id: &str| ClientMessage {
+            op: "u".to_string(),
+            path: Some("/".to_string()),
+            value: Some(value),
+            request_id: Some(id.to_string()),
+            ..Default::default()
+        };
+        db.handle_update(
+            "client1",
+            &update(json!({"chars/c/hp": 9, "other/k": 2}), "w1"),
+        )
+        .await;
+        // The view wasn't loaded: its other data is still only in the blob.
+        let name = Path::parse("/chars/c/name");
+        assert!(db.tree.read().unwrap().get(&name).is_none());
+        let sent: Vec<Value> = messages
+            .lock()
+            .unwrap()
+            .drain(..)
+            .filter_map(|m| serde_json::from_slice::<Value>(&m).ok())
+            .filter(|m| m.get("ev").is_some())
+            .collect();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0]["ev"], json!("patch"));
+        assert_eq!(sent[0]["v"], json!({"/hp": 9}));
+
+        db.handle_update("client1", &update(json!({"chars/c": {"hp": 3}}), "w2"))
+            .await;
+        let sent: Vec<Value> = messages
+            .lock()
+            .unwrap()
+            .drain(..)
+            .filter_map(|m| serde_json::from_slice::<Value>(&m).ok())
+            .filter(|m| m.get("ev").is_some())
+            .collect();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0]["ev"], json!("put"));
+        assert_eq!(sent[0]["v"], json!({"hp": 3}));
+    })
+}
