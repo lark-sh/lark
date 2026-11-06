@@ -36,6 +36,7 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 
 ### Fixed
 
+- A multi-path update's keys may start or end with a slash below the root, as at it: `ref('app').update({'/posts/p1': post})` writes `/app/posts/p1`. Such an update was refused as an invalid path. Two keys that name the same path once trimmed, like `a` and `/a`, are refused.
 - A transaction's null condition passes on a path with no data on blob-backed databases. It used to fail on any path that had been read or checked, so a `transaction()` on an empty path retried until it gave up.
 - A set to null inside a transaction deletes the value. It used to be skipped, and the transaction was still acknowledged.
 - A native client that authenticates again, as when switching users, gets an answer under that request's ID. Before its first read or write it got no answer, and afterwards the answer carried the first auth's ID, so the client timed out either way. A rejected token there now gets an auth error.

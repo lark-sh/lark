@@ -710,11 +710,13 @@ impl FirebaseAdapter {
                 let mut ops = Vec::new();
 
                 for (key, value) in data {
-                    // Build full path
+                    // Build full path. The SDK sends keys as written, and a
+                    // key like `/posts/x` names the same path as `posts/x`.
+                    let key = key.trim_matches('/');
                     let full_path = if base_path == "/" {
                         format!("/{}", key)
                     } else {
-                        format!("{}/{}", base_path, key)
+                        format!("{}/{}", base_path.trim_end_matches('/'), key)
                     };
 
                     // Check if value is null (delete) or a real value (set)
@@ -2224,6 +2226,46 @@ mod tests {
         assert!(msg.operations.is_some());
         let ops = msg.operations.unwrap();
         assert_eq!(ops.len(), 3);
+    }
+
+    #[test]
+    fn test_translate_merge_with_slashed_path_keys_below_the_root() {
+        let adapter = FirebaseAdapter::new("test-db", "host");
+
+        // The SDK sends keys as written. A key with a leading or trailing slash
+        // names the same path as one without, below any base path.
+        let merge_msg = json!({
+            "t": "d",
+            "d": {
+                "r": 13,
+                "a": "m",
+                "b": {
+                    "p": "/app",
+                    "d": {
+                        "/posts/p1": {"title": "Hi"},
+                        "/user-posts/u1/p1/": true,
+                        "/gone": null
+                    }
+                }
+            }
+        });
+
+        let (msg, _) = adapter
+            .translate_incoming(serde_json::to_vec(&merge_msg).unwrap().as_slice())
+            .unwrap();
+
+        let mut paths: Vec<String> = msg
+            .unwrap()
+            .operations
+            .unwrap()
+            .into_iter()
+            .map(|op| op.path)
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["/app/gone", "/app/posts/p1", "/app/user-posts/u1/p1"]
+        );
     }
 
     #[test]

@@ -223,6 +223,29 @@ pub fn normalize_path(path: &str) -> String {
     format!("/{}", trimmed)
 }
 
+/// Trims slashes from both ends of each key of a multi-path update, so a key
+/// like `/a/b` lands at `<path>/a/b` whatever path the update is sent to. A key
+/// keeps any slash inside it, which names a deeper path. Returns false, leaving
+/// the map as it was, if two keys name the same path once trimmed.
+pub fn trim_update_keys(updates: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+    if !updates
+        .keys()
+        .any(|k| k.starts_with('/') || k.ends_with('/'))
+    {
+        return true;
+    }
+    let mut trimmed = serde_json::Map::new();
+    for (key, value) in updates.iter() {
+        let key = key.trim_matches('/').to_string();
+        if trimmed.contains_key(&key) {
+            return false;
+        }
+        trimmed.insert(key, value.clone());
+    }
+    *updates = trimmed;
+    true
+}
+
 /// True if `path` is a strict descendant of `ancestor`. Both must be normalized.
 pub fn is_below(path: &str, ancestor: &str) -> bool {
     match ancestor {
@@ -892,5 +915,29 @@ mod tests {
     fn test_path_from_str() {
         let path: Path = "/users/abc".into();
         assert_eq!(path.to_string(), "/users/abc");
+    }
+
+    #[test]
+    fn trim_update_keys_trims_both_ends_and_keeps_inner_slashes() {
+        let mut updates = serde_json::json!({"/a/b": 1, "c/": 2, "d": 3, "/e/f/": 4})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(trim_update_keys(&mut updates));
+        let mut keys: Vec<&str> = updates.keys().map(|k| k.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["a/b", "c", "d", "e/f"]);
+        assert_eq!(updates["a/b"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn trim_update_keys_refuses_keys_that_name_the_same_path() {
+        let mut updates = serde_json::json!({"a": 1, "/a": 2})
+            .as_object()
+            .unwrap()
+            .clone();
+        let before = updates.clone();
+        assert!(!trim_update_keys(&mut updates));
+        assert_eq!(updates, before);
     }
 }
