@@ -78,7 +78,7 @@ The two **private** rows are the critical firewall boundary: `lark-server`'s `27
 Both server-to-server channels are also **authenticated** with the shared `SERVER_SECRET`, so network isolation isn't the only line of defense:
 
 - The `lark-server` proxy port (`2727`) requires a gateway to prove knowledge of the secret via an HMAC over a per-connection nonce during the HELLO handshake; a stray connection is rejected rather than trusted.
-- `lark-edge`'s internal HTTP endpoints (`/internal/register`, `/internal/metrics`) require an `Authorization: Bearer <SERVER_SECRET>` header; without it they return `401`, so a caller that reaches the internal port still can't register a rogue backend or poison metrics.
+- `lark-edge`'s internal HTTP endpoints (`/internal/register`, `/internal/deregister`, `/internal/metrics`) require an `Authorization: Bearer <SERVER_SECRET>` header; without it they return `401`, so a caller that reaches the internal port still can't register a rogue backend or poison metrics.
 
 ### DNS: clients connect to a per-database hostname
 
@@ -172,7 +172,7 @@ At this tier, `lark-server` and `lark-edge` are best run **directly on the host 
 
 1. Put all nodes on a private network: VLAN, VPC, WireGuard, Tailscale, whatever you already run.
 2. Give the `lark-server` a `--private-ip` on that network. It registers with the coordinator as `private_ip:proxy_port`, so the coordinator (and only the coordinator) can reach it on `2727`.
-3. Point the `lark-server` at a coordinator's **internal** endpoint via `--coordinator` / `LARK_COORDINATOR_URL` (e.g. `http://10.0.0.20:8080`). Registration and heartbeats are persisted to the shared Postgres, so **every** `lark-edge` learns about the server from the database. You only need to point it at one gateway's internal endpoint (or an internal load balancer across them).
+3. Point the `lark-server` at a coordinator's **internal** endpoint via `--coordinator` / `LARK_COORDINATOR_URL` (e.g. `http://10.0.0.20:8080`). Registration and heartbeats are persisted to the shared Postgres, so **every** `lark-edge` learns about the server from the database. You only need to point it at one gateway's internal endpoint (or an internal load balancer across them). On a graceful shutdown (SIGTERM or SIGINT), the server deregisters there too, so the gateways stop routing clients to it without waiting for its heartbeat to time out.
 4. Firewall rules:
    - **Public, on `lark-edge` only:** `HTTPS_LISTEN_ADDR` (TCP) and `WT_LISTEN_ADDR` (+ `WT_PORTS`, UDP).
    - **Private only:** `lark-server` `2727`, and every `lark-edge`'s `INTERNAL_LISTEN_ADDR`.

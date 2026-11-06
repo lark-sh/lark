@@ -280,6 +280,51 @@ func TestSqlite_RegisterServer_UpsertsAndClearsAssignments(t *testing.T) {
 	}
 }
 
+// A server that deregistered stays out of routing while proxies still send
+// heartbeats for it, until it registers again.
+func TestSqlite_StoppedServerStaysOutOfRoutingUntilItRegisters(t *testing.T) {
+	ctx := context.Background()
+	db := openMemorySqlite(t)
+	seedSqliteProject(t, db, "p1", false)
+	const timeoutSecs = 30
+
+	if err := db.RegisterServer(ctx, "s1", "10.0.0.1", 7779, 4); err != nil {
+		t.Fatalf("RegisterServer: %v", err)
+	}
+	if err := db.UpdateServerHeartbeatFromProxy(ctx, "s1", 0, 0, 0); err != nil {
+		t.Fatalf("UpdateServerHeartbeatFromProxy: %v", err)
+	}
+	server, err := db.AssignDatabase(ctx, "p1", "d1", false, timeoutSecs)
+	if err != nil || server != "s1" {
+		t.Fatalf("AssignDatabase before stop: got %q, %v; want s1", server, err)
+	}
+
+	if err := db.SetServerStatus(ctx, "s1", ServerStatusStopped); err != nil {
+		t.Fatalf("SetServerStatus: %v", err)
+	}
+	if err := db.UpdateServerHeartbeatFromProxy(ctx, "s1", 0, 0, 0); err != nil {
+		t.Fatalf("UpdateServerHeartbeatFromProxy after stop: %v", err)
+	}
+	got, _ := db.GetServerByID(ctx, "s1")
+	if got.Status != ServerStatusStopped {
+		t.Fatalf("a proxy heartbeat changed a stopped server to %q", got.Status)
+	}
+	if server, err := db.AssignDatabase(ctx, "p1", "d1", false, timeoutSecs); err != nil || server != "" {
+		t.Fatalf("AssignDatabase after stop: got %q, %v; want no server", server, err)
+	}
+
+	if err := db.RegisterServer(ctx, "s1", "10.0.0.1", 7779, 4); err != nil {
+		t.Fatalf("RegisterServer again: %v", err)
+	}
+	if err := db.UpdateServerHeartbeatFromProxy(ctx, "s1", 0, 0, 0); err != nil {
+		t.Fatalf("UpdateServerHeartbeatFromProxy after register: %v", err)
+	}
+	server, err = db.AssignDatabase(ctx, "p1", "d1", false, timeoutSecs)
+	if err != nil || server != "s1" {
+		t.Fatalf("AssignDatabase after register: got %q, %v; want s1", server, err)
+	}
+}
+
 func TestSqlite_Listen_Unsupported(t *testing.T) {
 	db := openMemorySqlite(t)
 	err := db.Listen(context.Background(), []string{"any"}, func(Notification) {})

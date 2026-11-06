@@ -14,6 +14,7 @@ Notable changes to Lark are documented here. The format is based on [Keep a Chan
 
 ### Changed
 
+- `lark-server` deregisters from the coordinator on a graceful shutdown, so clients are routed away from it right away instead of until its heartbeat times out, which took about a minute. Proxies no longer write a heartbeat for a server they have no open connection to, so a server that stops without deregistering drops out of routing once `HEARTBEAT_TIMEOUT` passes, not after up to twice that.
 - A write that leaves the data as it was no longer sends events, and an update sends only the keys that changed. The comparison uses data already in memory and never reads from disk, so listeners may still receive an unchanged write to data that isn't loaded. Clients keep receiving their ack.
 - A listener below an update's path no longer receives its whole value again when none of the update's keys reach it.
 - A listener below an update's path receives the keys that write below it as a patch, as if the update had been sent at its path. It used to receive its whole value again, and the server read that value back from the blob when it wasn't in memory. A listener still receives its whole value when a key writes at or above its path.

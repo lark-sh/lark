@@ -4,6 +4,7 @@
 //
 // Infrastructure (internal network only):
 //   - POST /internal/register  - Backend server registration on startup
+//   - POST /internal/deregister - Backend server deregistration on shutdown
 //   - POST /internal/metrics   - Metrics ingestion from the upstream shipper
 //
 // Health:
@@ -83,6 +84,7 @@ func (s *Server) registerRoutes() {
 	// network isolation isn't the only line of defense — an unauthenticated caller
 	// that reaches the internal port still can't register a rogue backend.
 	s.mux.HandleFunc("POST /internal/register", s.requireServerSecret(s.handleRegisterServer))
+	s.mux.HandleFunc("POST /internal/deregister", s.requireServerSecret(s.handleDeregisterServer))
 
 	if s.config.AdminAPIEnabled {
 		s.registerAdminRoutes()

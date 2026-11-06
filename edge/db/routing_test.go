@@ -301,3 +301,45 @@ func TestEnsureRoutingDataReactivatesInactiveDatabase(t *testing.T) {
 		t.Logf("Database status: %s (may be inactive if ActivateDatabase wasn't called)", data.Database.Status)
 	}
 }
+
+// A server that deregistered stays out of routing while proxies still send
+// heartbeats for it, until it registers again.
+func TestStoppedServerStaysOutOfRoutingUntilItRegisters(t *testing.T) {
+	database := setupTestDB(t)
+	cleanTestDB(t, database)
+	seedTestData(t, database)
+
+	ctx := context.Background()
+	heartbeatTimeout := int64(30)
+
+	if err := database.SetServerStatus(ctx, testServerID, ServerStatusStopped); err != nil {
+		t.Fatalf("SetServerStatus: %v", err)
+	}
+	if err := database.UpdateServerHeartbeatFromProxy(ctx, testServerID, 0, 0, 0); err != nil {
+		t.Fatalf("UpdateServerHeartbeatFromProxy: %v", err)
+	}
+	got, err := database.GetServerByID(ctx, testServerID)
+	if err != nil {
+		t.Fatalf("GetServerByID: %v", err)
+	}
+	if got.Status != ServerStatusStopped {
+		t.Fatalf("a proxy heartbeat changed a stopped server to %q", got.Status)
+	}
+	if _, _, err := database.EnsureRoutingData(ctx, testProjectID, testDatabaseID, heartbeatTimeout); err != ErrNoServersAvailable {
+		t.Fatalf("EnsureRoutingData after stop: got %v, want ErrNoServersAvailable", err)
+	}
+
+	if err := database.RegisterServer(ctx, testServerID, "127.0.0.1", 2727, 4); err != nil {
+		t.Fatalf("RegisterServer: %v", err)
+	}
+	if err := database.UpdateServerHeartbeatFromProxy(ctx, testServerID, 0, 0, 0); err != nil {
+		t.Fatalf("UpdateServerHeartbeatFromProxy after register: %v", err)
+	}
+	server, _, err := database.EnsureRoutingData(ctx, testProjectID, testDatabaseID, heartbeatTimeout)
+	if err != nil {
+		t.Fatalf("EnsureRoutingData after register: %v", err)
+	}
+	if server.ID != testServerID {
+		t.Errorf("Server.ID: got %q, want %q", server.ID, testServerID)
+	}
+}
