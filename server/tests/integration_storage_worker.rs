@@ -14,6 +14,7 @@ use common::{TestServer, run_test};
 use lark_blob::{ArcValue, BlobSession, StdBlobIO, full_compact, write_blob};
 use lark_server::db::{blob_path, read_blob_generation, sidecar_path};
 use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -109,10 +110,15 @@ const WAL_FLUSH_WAIT: Duration = Duration::from_millis(2500);
 
 /// Write bulk data to a connected client to trigger WAL rotation (>5MB),
 /// then wait for the storage worker to compact.
-async fn trigger_rotation_and_wait(client: &common::TestClient) {
+/// Returns the value written to each `/bulk/item_N`.
+async fn trigger_rotation_and_wait(client: &common::TestClient) -> String {
     // Use a small number of keys with large values to avoid filling the blob dictionary.
-    // 10 writes × 600KB ≈ 6MB, exceeding the 5MB WAL_MAX_FILE_SIZE.
-    let chunk = large_value(600_000);
+    // 10 writes × 600KB ≈ 6MB, exceeding the 5MB WAL_MAX_FILE_SIZE. Each call
+    // writes new values: a write that leaves the data as it was stays out of
+    // the WAL, so repeating the last call's values wouldn't rotate it.
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
+    let chunk = format!("{call}:{}", large_value(600_000));
     for i in 0..10 {
         client
             .set(&format!("/bulk/item_{}", i), json!(&chunk))
@@ -128,6 +134,7 @@ async fn trigger_rotation_and_wait(client: &common::TestClient) {
         glommio::yield_if_needed().await;
         glommio::timer::sleep(Duration::from_millis(100)).await;
     }
+    chunk
 }
 
 // =============================================================================
@@ -163,7 +170,7 @@ fn test_storage_worker_compacts_after_rotation() {
         assert_eq!(client.once("/initial").await.unwrap(), json!("data"));
 
         // Trigger WAL rotation and wait for compaction
-        trigger_rotation_and_wait(&client).await;
+        let chunk = trigger_rotation_and_wait(&client).await;
 
         // Verify: sequence file should be > 0 (compaction happened)
         let seq = read_sequence(data_dir, "test-project", "compact-db");
@@ -191,7 +198,6 @@ fn test_storage_worker_compacts_after_rotation() {
         );
 
         // Verify: blob should contain the written data
-        let chunk = large_value(600_000);
         let blob_val = read_blob_value(data_dir, "test-project", "compact-db", &["bulk", "item_0"]);
         assert_eq!(
             blob_val,
@@ -290,7 +296,7 @@ fn test_storage_worker_data_survives_restart() {
             .unwrap();
 
         // Trigger rotation and wait for compaction
-        trigger_rotation_and_wait(&client).await;
+        let chunk = trigger_rotation_and_wait(&client).await;
 
         // Verify compaction happened
         let seq = read_sequence(data_dir, "test-project", "restart-compact-db");
@@ -336,7 +342,6 @@ fn test_storage_worker_data_survives_restart() {
         );
 
         // Bulk data should be readable
-        let chunk = large_value(600_000);
         let item = client2.once("/bulk/item_0").await.unwrap();
         assert_eq!(
             item,
