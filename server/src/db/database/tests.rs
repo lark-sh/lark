@@ -3970,3 +3970,51 @@ fn test_volatile_update_and_remove_are_not_stored() {
         assert_eq!(db.tree.read().unwrap().get_value_str("/cursors/p1"), None);
     })
 }
+
+// Multi-path updates at the root are held under the paths their keys write to.
+// A read replays the keys that reach it, in order, and nothing else.
+#[test]
+fn test_root_updates_replay_only_the_keys_that_reach_a_read() {
+    block_on(async {
+        let (mut db, _dir) = make_blob_backed_db(json!({
+            "chars": {"c": {"hp": 1, "name": "x"}, "d": {"hp": 5}},
+            "accounts": {"a": {"c": {"level": 1}}},
+            "other": {"k": 1}
+        }))
+        .await;
+        let (conn, _messages) = MockConnection::new();
+        db.add_client_internal("client1", None, "conn1", conn);
+
+        for (i, value) in [
+            json!({"chars/c/hp": 2, "accounts/a/c/level": 2}),
+            json!({"chars/c": {"hp": 3}}),
+            json!({"chars/c/name": "y", "chars/d/hp": null}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let msg = write_msg("u", "/", Some(value), &format!("r{i}"));
+            db.handle_update("client1", &msg).await;
+        }
+        assert_eq!(db.held_wal.len(), 3);
+        assert!(db.held_wal.find_affecting("/other").is_empty());
+        assert_eq!(db.held_wal.find_affecting("/accounts"), vec![0]);
+        assert_eq!(db.held_wal.find_affecting("/chars/d"), vec![2]);
+        assert!(db.has_pending_delete_within("/chars/d"));
+        assert!(!db.has_pending_delete_within("/chars/c"));
+        assert!(!db.has_pending_delete_within("/accounts"));
+
+        force_evict(&mut db, "/chars");
+        force_evict(&mut db, "/accounts");
+        for path in ["/chars/c", "/chars/d", "/accounts/a/c", "/other"] {
+            db.promote_path(path).await.unwrap();
+        }
+        let tree = db.tree.read().unwrap();
+        let get = |p: &str| tree.get_value(&Path::parse(p));
+        assert_eq!(get("/chars/c"), Some(json!({"hp": 3, "name": "y"})));
+        // Below an unloaded parent, a path with no data stays as a Null marker.
+        assert_eq!(get("/chars/d").unwrap_or(Value::Null), Value::Null);
+        assert_eq!(get("/accounts/a/c"), Some(json!({"level": 2})));
+        assert_eq!(get("/other"), Some(json!({"k": 1})));
+    })
+}

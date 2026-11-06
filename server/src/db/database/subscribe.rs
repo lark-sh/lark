@@ -612,13 +612,10 @@ impl Database {
     }
 
     /// True if a pending WAL entry deletes something at or below `path`.
-    fn has_pending_delete_within(&self, path: &str) -> bool {
+    pub(super) fn has_pending_delete_within(&self, path: &str) -> bool {
         let within = |target: &str| target == path || is_below(target, path);
-        self.held_wal.find_affecting(path).into_iter().any(|pos| {
-            // Only entries flagged when held can delete, so most are never parsed.
-            if !self.held_wal.may_delete_at(pos) {
-                return false;
-            }
+        // Parses only entries with a key that stores nothing at, above or below `path`.
+        self.held_wal.find_deleting(path).into_iter().any(|pos| {
             let Some(entry) = self.held_wal.get(pos) else {
                 return false;
             };

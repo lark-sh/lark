@@ -5,6 +5,11 @@
 //! needs the entry: replaying writes over data read from the blob, or checking
 //! for a pending delete. Both go through the path index, so they parse only the
 //! entries that affect the path in question.
+//!
+//! The index lists an update under the path each of its keys lands on, not the
+//! path it was sent to. A multi-path update at the root that writes to
+//! `/accounts/a` and `/characters/c` affects only reads at, above or below
+//! those two paths, rather than every read in the database.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -43,14 +48,43 @@ pub(super) fn wal_line<V: Serialize>(
     serde_json::to_vec(&Line { op, path, value })
 }
 
-/// Whether replaying an entry could remove data at or below its path: a delete,
-/// a set of nothing, or an update with a key set to nothing.
-pub(super) fn may_delete(op: &WalOp, value: Option<&Value>) -> bool {
-    match (op, value) {
-        (WalOp::Delete, _) => true,
-        (WalOp::Set, value) => value.is_none_or(stores_nothing),
-        (WalOp::Update, Some(Value::Object(updates))) => updates.values().any(stores_nothing),
-        (WalOp::Update, _) => false,
+/// A path an entry writes to, in `normalize_path_key` form, and whether
+/// replaying the entry could remove data at or below it.
+pub(super) type Target = (String, bool);
+
+/// Where a set lands: its path. It may delete if it stores nothing.
+pub(super) fn set_target(path: &str, value: Option<&Value>) -> Target {
+    (normalize_path_key(path), value.is_none_or(stores_nothing))
+}
+
+/// Where a delete lands: its path.
+pub(super) fn delete_target(path: &str) -> Target {
+    (normalize_path_key(path), true)
+}
+
+/// Where an update lands: the path each key names below `path`. A key may
+/// delete if its value stores nothing.
+pub(super) fn update_targets(path: &str, updates: &serde_json::Map<String, Value>) -> Vec<Target> {
+    let base = path.trim_end_matches('/');
+    updates
+        .iter()
+        .map(|(key, value)| {
+            (
+                normalize_path_key(&format!("{base}/{key}")),
+                stores_nothing(value),
+            )
+        })
+        .collect()
+}
+
+/// Where a WAL entry lands. See `update_targets`.
+fn entry_targets(entry: &WalEntry) -> Vec<Target> {
+    match (&entry.op, &entry.value) {
+        (WalOp::Delete, _) => vec![delete_target(&entry.path)],
+        (WalOp::Set, value) => vec![set_target(&entry.path, value.as_ref())],
+        (WalOp::Update, Some(Value::Object(updates))) => update_targets(&entry.path, updates),
+        // Replay ignores an update without an object, so it changes nothing.
+        (WalOp::Update, _) => Vec::new(),
     }
 }
 
@@ -58,6 +92,13 @@ struct HeldEntry {
     block: u32,
     start: u32,
     len: u32,
+}
+
+/// An entry listed under one of the paths it writes to.
+#[derive(Clone, Copy)]
+struct Indexed {
+    pos: usize,
+    /// Whether replaying the entry could remove data at or below this path.
     may_delete: bool,
 }
 
@@ -92,9 +133,9 @@ pub(super) struct HeldWal {
     base: usize,
     /// Position the next entry gets.
     next: usize,
-    /// Path → positions of the entries at that path, ascending. A BTreeMap so
-    /// descendants can be found with a range scan.
-    index: BTreeMap<String, Vec<usize>>,
+    /// Path → the entries that write to that path, by ascending position. A
+    /// BTreeMap so descendants can be found with a range scan.
+    index: BTreeMap<String, Vec<Indexed>>,
 }
 
 impl HeldWal {
@@ -112,12 +153,7 @@ impl HeldWal {
         let mut held = Self::new();
         for entry in entries {
             match wal_line(&entry.op, &entry.path, entry.value.as_ref()) {
-                Ok(line) => held.push(
-                    entry.sequence,
-                    &entry.path,
-                    &line,
-                    may_delete(&entry.op, entry.value.as_ref()),
-                ),
+                Ok(line) => held.push(entry.sequence, &entry_targets(&entry), &line),
                 // A parsed Value always serializes.
                 Err(e) => error!("[STORAGE INTEGRITY] re-serializing a WAL entry failed: {e}"),
             }
@@ -140,8 +176,8 @@ impl HeldWal {
     }
 
     /// Holds an entry just appended to WAL file `sequence`. `line` is its JSON
-    /// without the newline.
-    pub(super) fn push(&mut self, sequence: i64, path: &str, line: &[u8], may_delete: bool) {
+    /// without the newline, and `targets` the paths it writes to.
+    pub(super) fn push(&mut self, sequence: i64, targets: &[Target], line: &[u8]) {
         if self.chunks.back().is_none_or(|c| c.sequence != sequence) {
             if let Some(previous) = self.chunks.back_mut() {
                 previous.finish();
@@ -175,14 +211,21 @@ impl HeldWal {
             block: block as u32,
             start: buf.len() as u32,
             len: line.len() as u32,
-            may_delete,
         });
         buf.extend_from_slice(line);
         chunk.bytes += line.len() as u64 + 1;
-        self.index
-            .entry(normalize_path_key(path))
-            .or_default()
-            .push(self.next);
+        let pos = self.next;
+        for (path, may_delete) in targets {
+            let listed = self.index.entry(path.clone()).or_default();
+            // Two keys of one update can name the same path.
+            match listed.last_mut() {
+                Some(last) if last.pos == pos => last.may_delete |= may_delete,
+                _ => listed.push(Indexed {
+                    pos,
+                    may_delete: *may_delete,
+                }),
+            }
+        }
         self.next += 1;
     }
 
@@ -216,10 +259,6 @@ impl HeldWal {
         }
     }
 
-    pub(super) fn may_delete_at(&self, pos: usize) -> bool {
-        self.locate(pos).is_some_and(|(_, held)| held.may_delete)
-    }
-
     /// Every held entry, parsed, oldest first.
     #[cfg(test)]
     pub(super) fn entries(&self) -> Vec<WalEntry> {
@@ -238,62 +277,79 @@ impl HeldWal {
         let trimmed = base - self.base;
         if trimmed > 0 {
             self.base = base;
-            self.index.retain(|_, positions| {
-                let gone = positions.partition_point(|&p| p < base);
-                positions.drain(..gone);
-                !positions.is_empty()
+            self.index.retain(|_, listed| {
+                let gone = listed.partition_point(|e| e.pos < base);
+                listed.drain(..gone);
+                !listed.is_empty()
             });
         }
         trimmed
     }
 
-    /// Positions of the entries that affect `path`: at it, above it or below
-    /// it. Ascending, so they replay in order.
+    /// Positions of the entries that affect `path`: those that write at it,
+    /// above it or below it. Ascending, so they replay in order.
     pub(super) fn find_affecting(&self, path: &str) -> Vec<usize> {
+        self.find(path, false)
+    }
+
+    /// Positions of the entries that could remove data at or below `path`,
+    /// judged by the paths they write to that affect it. Ascending.
+    pub(super) fn find_deleting(&self, path: &str) -> Vec<usize> {
+        self.find(path, true)
+    }
+
+    fn find(&self, path: &str, deleting_only: bool) -> Vec<usize> {
         let path_owned = normalize_path_key(path);
         let path = path_owned.as_str();
         let mut positions = Vec::new();
+        let mut add = |listed: &Vec<Indexed>| {
+            positions.extend(
+                listed
+                    .iter()
+                    .filter(|e| !deleting_only || e.may_delete)
+                    .map(|e| e.pos),
+            );
+        };
 
         if path == "/" {
-            for p in self.index.values() {
-                positions.extend(p);
+            self.index.values().for_each(&mut add);
+        } else {
+            if let Some(listed) = self.index.get(path) {
+                add(listed);
             }
-            positions.sort_unstable();
-            return positions;
-        }
+            if let Some(listed) = self.index.get("/") {
+                add(listed);
+            }
+            let mut current = path;
+            while let Some(pos) = current.rfind('/') {
+                if pos == 0 {
+                    break;
+                }
+                current = &path[..pos];
+                if let Some(listed) = self.index.get(current) {
+                    add(listed);
+                }
+            }
 
-        if let Some(p) = self.index.get(path) {
-            positions.extend(p);
-        }
-        if let Some(p) = self.index.get("/") {
-            positions.extend(p);
-        }
-        let mut current = path;
-        while let Some(pos) = current.rfind('/') {
-            if pos == 0 {
-                break;
-            }
-            current = &path[..pos];
-            if let Some(p) = self.index.get(current) {
-                positions.extend(p);
-            }
-        }
-
-        use std::ops::Bound;
-        for (key, p) in self
-            .index
-            .range::<str, _>((Bound::Excluded(path), Bound::Unbounded))
-        {
-            if !(key.len() > path.len()
-                && key.starts_with(path)
-                && key.as_bytes()[path.len()] == b'/')
+            use std::ops::Bound;
+            for (key, listed) in self
+                .index
+                .range::<str, _>((Bound::Excluded(path), Bound::Unbounded))
             {
-                break;
+                if !(key.len() > path.len()
+                    && key.starts_with(path)
+                    && key.as_bytes()[path.len()] == b'/')
+                {
+                    break;
+                }
+                add(listed);
             }
-            positions.extend(p);
         }
 
+        // An update whose keys land on several of these paths is listed under
+        // each of them.
         positions.sort_unstable();
+        positions.dedup();
         positions
     }
 }
@@ -493,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn may_delete_matches_the_value() {
+    fn deletes_are_found_by_the_value() {
         let cases = [
             (WalOp::Delete, None, true),
             (WalOp::Set, None, true),
@@ -505,8 +561,62 @@ mod tests {
         ];
         for (op, value, expected) in cases {
             let held = held(&[entry(op.clone(), "/x", value.clone(), 1)]);
-            assert_eq!(held.may_delete_at(0), expected, "{op:?} {value:?}");
+            assert_eq!(
+                !held.find_deleting("/x").is_empty(),
+                expected,
+                "{op:?} {value:?}"
+            );
         }
+    }
+
+    #[test]
+    fn an_update_is_found_by_the_paths_its_keys_write() {
+        let held = held(&[
+            entry(
+                WalOp::Update,
+                "/",
+                Some(json!({
+                    "accounts/a/chars/c/level": 2,
+                    "chars/c/core": {"hp": 1},
+                    "chars/c/bag": {"items": {}},
+                })),
+                1,
+            ),
+            entry(WalOp::Set, "/other", Some(json!(1)), 1),
+            entry(WalOp::Update, "/chars", Some(json!({"d/core/hp": 3})), 1),
+        ]);
+        // At, above and below a key's path.
+        assert_eq!(held.find_affecting("/chars/c/core"), vec![0]);
+        assert_eq!(held.find_affecting("/chars/c/core/hp"), vec![0]);
+        assert_eq!(held.find_affecting("/accounts"), vec![0]);
+        // Listed once though two of its keys are below the path.
+        assert_eq!(held.find_affecting("/chars/c"), vec![0]);
+        assert_eq!(held.find_affecting("/chars"), vec![0, 2]);
+        // Paths no key writes to.
+        assert_eq!(held.find_affecting("/chars/d/name"), Vec::<usize>::new());
+        assert!(held.find_affecting("/chars/e").is_empty());
+        assert!(held.find_affecting("/accounts/b").is_empty());
+        assert_eq!(held.find_affecting("/other"), vec![1]);
+        assert_eq!(held.find_affecting("/"), vec![0, 1, 2]);
+
+        // Only the key that stores nothing deletes.
+        assert!(held.find_deleting("/chars/c/core").is_empty());
+        assert_eq!(held.find_deleting("/chars/c/bag/items"), vec![0]);
+        assert_eq!(held.find_deleting("/chars/c"), vec![0]);
+        assert!(held.find_deleting("/accounts").is_empty());
+    }
+
+    #[test]
+    fn trimming_keeps_an_update_listed_under_several_paths_right() {
+        let mut held = held(&[
+            entry(WalOp::Update, "/", Some(json!({"a/x": 1, "b/y": 2})), 1),
+            entry(WalOp::Update, "/", Some(json!({"a/x": 3, "b/y": 4})), 2),
+        ]);
+        assert_eq!(held.trim_through(1), 1);
+        assert_eq!(held.find_affecting("/a"), vec![1]);
+        assert_eq!(held.find_affecting("/b/y"), vec![1]);
+        assert_eq!(held.trim_through(2), 1);
+        assert!(held.find_affecting("/").is_empty());
     }
 
     #[test]
