@@ -505,3 +505,80 @@ fn test_large_value() {
         assert_eq!(value.as_str().unwrap().len(), 1024);
     });
 }
+
+// =============================================================================
+// Update keys with leading or trailing slashes
+// =============================================================================
+
+/// A multi-path update's key may start or end with a slash, as the Firebase
+/// SDK's own examples write them. `/a/b` names the same path as `a/b`, below
+/// the root as well as at it.
+#[test]
+fn test_update_keys_with_slashes_below_the_root() {
+    run_test(|| async {
+        let server = TestServer::new();
+        let mut client = server.client();
+        client.connect("slash-keys-db").await;
+
+        client
+            .update(
+                "/app",
+                json!({"/posts/p1": {"title": "Hi"}, "/user-posts/u1/p1/": true, "plain": 1}),
+            )
+            .await
+            .expect("update with slashed keys");
+        assert_eq!(
+            client.once("/app").await.unwrap(),
+            json!({
+                "posts": {"p1": {"title": "Hi"}},
+                "user-posts": {"u1": {"p1": true}},
+                "plain": 1
+            })
+        );
+
+        client
+            .transaction(vec![lark_server::protocol::TransactionOp {
+                op: "u".to_string(),
+                path: "/app".to_string(),
+                value: Some(json!({"/posts/p1/title": "Edited"})),
+                hash: None,
+            }])
+            .await
+            .expect("transaction update with slashed keys");
+        assert_eq!(
+            client.once("/app/posts/p1/title").await.unwrap(),
+            json!("Edited")
+        );
+
+        client
+            .on_disconnect_update("/app", json!({"/presence/u1": "offline"}))
+            .await
+            .expect("onDisconnect update with slashed keys");
+        client.disconnect().await;
+        glommio::timer::sleep(std::time::Duration::from_millis(100)).await;
+        let mut reader = server.client();
+        reader.connect("slash-keys-db").await;
+        assert_eq!(
+            reader.once("/app/presence/u1").await.unwrap(),
+            json!("offline")
+        );
+    });
+}
+
+/// Two keys that name the same path once their slashes are trimmed are
+/// refused, rather than one silently overwriting the other.
+#[test]
+fn test_update_keys_naming_the_same_path_are_refused() {
+    run_test(|| async {
+        let server = TestServer::new();
+        let mut client = server.client();
+        client.connect("slash-collision-db").await;
+
+        let err = client
+            .update("/app", json!({"a": 1, "/a": 2}))
+            .await
+            .expect_err("keys naming the same path");
+        assert!(err.contains("invalid"), "{err}");
+        assert_eq!(client.once("/app").await.unwrap(), Value::Null);
+    });
+}

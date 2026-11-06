@@ -451,7 +451,15 @@ impl Database {
         }
     }
 
-    async fn handle_protocol_message(&mut self, client_id: &str, msg: ClientMessage) {
+    async fn handle_protocol_message(&mut self, client_id: &str, mut msg: ClientMessage) {
+        if !trim_message_update_keys(&mut msg) {
+            let request_id = msg.request_id.as_deref().unwrap_or("").to_string();
+            if let Some(nack) = self.nack_invalid_key(client_id, &request_id) {
+                self.send_to_client(client_id, &nack, false, msg.path.as_deref())
+                    .await;
+            }
+            return;
+        }
         let response = match msg.op.as_str() {
             op::JOIN => self.handle_join(client_id, &msg),
             op::SET => self.handle_set(client_id, &msg).await,
@@ -494,4 +502,32 @@ impl Database {
                 .await;
         }
     }
+}
+
+/// Trims the keys of every multi-path update in `msg`: an update, an update
+/// operation in a transaction, and an onDisconnect update. See
+/// `trim_update_keys`. False if one has two keys that name the same path.
+fn trim_message_update_keys(msg: &mut ClientMessage) -> bool {
+    let is_update = msg.op == op::UPDATE
+        || (msg.op == op::ON_DISCONNECT
+            && msg.action.as_deref() == Some(crate::protocol::action::UPDATE));
+    if is_update
+        && let Some(Value::Object(updates)) = msg.value.as_mut()
+        && !crate::db::trim_update_keys(updates)
+    {
+        return false;
+    }
+    if msg.op == op::TRANSACTION
+        && let Some(ops) = msg.operations.as_mut()
+    {
+        for tx_op in ops {
+            if matches!(tx_op.op.as_str(), "u" | "update")
+                && let Some(Value::Object(updates)) = tx_op.value.as_mut()
+                && !crate::db::trim_update_keys(updates)
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
