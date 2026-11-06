@@ -11,7 +11,9 @@ use lark_server::server::{CoreHandler, CoreHandlerConfig};
 use lark_server::storage::StorageWorker;
 use lark_server::transport::proxy::ProxyListener;
 use std::rc::Rc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -27,6 +29,14 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Set by the signal thread on the first SIGTERM or SIGINT; each core polls it.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// How long shutdown waits for the coordinator to take this server out of
+/// routing. Runs alongside the database flush, inside SHUTDOWN_TIMEOUT.
+const DEREGISTRATION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The thread deregistering this server, started on the first SIGTERM or
+/// SIGINT. `main` waits for it before exiting so the request isn't cut off.
+static DEREGISTRATION: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
 /// Lark - Fast Multiplayer Database Server (Rust + Glommio)
 #[derive(Parser, Debug, Clone)]
@@ -335,7 +345,7 @@ fn main() {
         (false, _) => None,
     };
 
-    spawn_signal_thread(shutdown_signals);
+    spawn_signal_thread(shutdown_signals, args.clone());
 
     // Run the executor pool
     let pool = ExecutorPool::new(pool_config);
@@ -346,6 +356,10 @@ fn main() {
             run_core(core_id, nr_cores, config, args, metrics_tx).await;
         }
     });
+
+    if let Some(deregistration) = DEREGISTRATION.lock().unwrap().take() {
+        let _ = deregistration.join();
+    }
 
     tracing::info!("Server stopped");
 }
@@ -369,9 +383,10 @@ fn block_shutdown_signals() -> libc::sigset_t {
 }
 
 /// Wait for SIGTERM/SIGINT. The first starts a graceful shutdown: every core
-/// stops its databases, which flush their WALs before the process exits. A
-/// second signal exits immediately without waiting for the flush.
-fn spawn_signal_thread(set: libc::sigset_t) {
+/// stops its databases, which flush their WALs before the process exits, and
+/// the server deregisters from the coordinator so clients stop being routed to
+/// it. A second signal exits immediately without waiting for the flush.
+fn spawn_signal_thread(set: libc::sigset_t, args: Args) {
     std::thread::Builder::new()
         .name("lark-signals".to_string())
         .spawn(move || {
@@ -388,6 +403,12 @@ fn spawn_signal_thread(set: libc::sigset_t) {
                 SHUTDOWN_TIMEOUT
             );
             SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+            if let Ok(handle) = std::thread::Builder::new()
+                .name("lark-deregister".to_string())
+                .spawn(move || deregister_from_coordinator(&args))
+            {
+                *DEREGISTRATION.lock().unwrap() = Some(handle);
+            }
 
             // SAFETY: as above.
             if unsafe { libc::sigwait(&set, &mut sig) } == 0 {
@@ -491,6 +512,10 @@ fn register_with_coordinator(args: &Args, nr_cores: usize) {
                 return;
             }
             Err(e) => {
+                if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+                    tracing::warn!("Shutting down, giving up on coordinator registration: {e}");
+                    return;
+                }
                 let elapsed = started.elapsed();
                 if elapsed >= REGISTRATION_TOTAL_TIMEOUT {
                     tracing::error!(
@@ -511,6 +536,34 @@ fn register_with_coordinator(args: &Args, nr_cores: usize) {
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         }
+    }
+}
+
+/// Tell the coordinator this server is stopping, so the edge stops routing
+/// clients to it and reassigns its databases on their next connect. Makes one
+/// attempt, bounded by DEREGISTRATION_TIMEOUT: if it fails, the server drops
+/// out of routing once its heartbeat times out, as it would after a crash.
+fn deregister_from_coordinator(args: &Args) {
+    let Some(coordinator) = &args.coordinator else {
+        return;
+    };
+    if args.registration_address().is_none() {
+        return;
+    }
+
+    let url = format!("{}/internal/deregister", coordinator);
+    let result = ureq::AgentBuilder::new()
+        .timeout(DEREGISTRATION_TIMEOUT)
+        .build()
+        .post(&url)
+        .set("Authorization", &format!("Bearer {}", args.server_secret))
+        .send_json(ureq::json!({ "server_id": &args.id }));
+
+    match result {
+        Ok(_) => tracing::info!("Deregistered from coordinator"),
+        Err(e) => tracing::warn!(
+            "Coordinator deregistration failed, so clients are routed to this server until its heartbeat times out: {e}"
+        ),
     }
 }
 

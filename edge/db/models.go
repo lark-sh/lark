@@ -38,8 +38,12 @@ type Server struct {
 	DatabaseCount   int    `json:"database_count"`
 	ConnectionCount int    `json:"connection_count"`
 	Capacity        int    `json:"capacity"`
-	Status          string `json:"status"` // active, draining, offline, pending
+	Status          string `json:"status"` // active, draining, offline, pending, stopped
 }
+
+// ServerStatusStopped marks a server that deregistered on shutdown. Proxy
+// heartbeats don't make it active again; only its next registration does.
+const ServerStatusStopped = "stopped"
 
 // ProxyAddress returns the address for proxy connections (private_ip:proxy_port).
 func (s *Server) ProxyAddress() string {

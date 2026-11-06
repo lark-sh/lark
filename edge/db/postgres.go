@@ -763,11 +763,13 @@ func (db *PostgresDB) GetAllServersForDiscovery(ctx context.Context) ([]*Server,
 	return servers, rows.Err()
 }
 
+// UpdateServerHeartbeatFromProxy records a proxy's heartbeat for a server and
+// marks it active. A stopped server stays stopped until it registers again.
 func (db *PostgresDB) UpdateServerHeartbeatFromProxy(ctx context.Context, serverID string, load, clients, memMB int) error {
 	_, err := db.pool.Exec(ctx, `
 		UPDATE servers
 		SET last_heartbeat = $1, connection_count = $2, status = 'active'
-		WHERE id = $3
+		WHERE id = $3 AND status <> 'stopped'
 	`, NowMS(), clients, serverID)
 	return err
 }

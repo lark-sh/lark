@@ -120,6 +120,7 @@ func TestMaybeWriteHeartbeatToDBForce(t *testing.T) {
 	b := &Backend{
 		ServerID:    "s1",
 		pool:        pool,
+		coreConns:   [][]*Conn{{&Conn{}}},
 		coreMetrics: []CoreMetrics{{Clients: 1, LastSeen: time.Now()}},
 	}
 
@@ -140,6 +141,43 @@ func TestMaybeWriteHeartbeatToDBForce(t *testing.T) {
 	b.maybeWriteHeartbeatToDB(true)
 	if got := cp.count(); got != 2 {
 		t.Fatalf("forced write should bypass the 10s guard, got %d", got)
+	}
+}
+
+// Once every connection to a server is gone, its cores' last metrics are still
+// recent, but no heartbeat is written for it, so routing drops it when the
+// heartbeat times out.
+func TestMaybeWriteHeartbeatToDBSkipsWithoutLiveConnections(t *testing.T) {
+	cp := &recordingConfigProvider{}
+	pool := NewPool(2, "test-secret")
+	defer pool.Close()
+	pool.SetConfigProvider(cp)
+
+	conn := &Conn{}
+	b := &Backend{
+		ServerID:    "s1",
+		pool:        pool,
+		coreConns:   [][]*Conn{{conn, nil}},
+		coreMetrics: []CoreMetrics{{Clients: 1, LastSeen: time.Now()}},
+	}
+
+	b.maybeWriteHeartbeatToDB(true)
+	if got := cp.count(); got != 1 {
+		t.Fatalf("with an open connection: got %d heartbeat writes, want 1", got)
+	}
+
+	conn.closed.Store(true)
+	b.maybeWriteHeartbeatToDB(true)
+	if got := cp.count(); got != 1 {
+		t.Fatalf("with every connection closed: got %d heartbeat writes, want 1", got)
+	}
+
+	b.mu.Lock()
+	b.coreConns[0][0] = nil
+	b.mu.Unlock()
+	b.maybeWriteHeartbeatToDB(true)
+	if got := cp.count(); got != 1 {
+		t.Fatalf("with no connections: got %d heartbeat writes, want 1", got)
 	}
 }
 

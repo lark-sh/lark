@@ -1196,9 +1196,17 @@ func (b *Backend) sendHeartbeatAck(coreID int) {
 // force is set, it skips if the last write was under 10s ago to avoid hammering
 // the DB. force is used to re-assert the server's 'active' status immediately
 // after a registration resets the row to 'pending' (see discoverServers).
+//
+// Nothing is written while no connection to the server is open: the heartbeat
+// stops, so routing drops the server once it times out, instead of the metrics
+// its cores sent before it went away keeping it marked healthy.
 func (b *Backend) maybeWriteHeartbeatToDB(force bool) {
 	b.mu.Lock()
 	if !force && time.Since(b.lastDBHeartbeat) < 10*time.Second {
+		b.mu.Unlock()
+		return
+	}
+	if !b.hasLiveConnLocked() {
 		b.mu.Unlock()
 		return
 	}
@@ -1652,7 +1660,12 @@ func (p *Pool) GetHealthyBackendIDs() []string {
 func (b *Backend) hasHealthyConnections() bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
+	return b.hasLiveConnLocked()
+}
 
+// hasLiveConnLocked reports whether any connection to the backend is open.
+// Callers hold b.mu.
+func (b *Backend) hasLiveConnLocked() bool {
 	for _, conns := range b.coreConns {
 		for _, conn := range conns {
 			if conn != nil && !conn.IsClosed() {

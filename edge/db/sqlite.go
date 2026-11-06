@@ -755,11 +755,13 @@ func (db *SqliteDB) GetAllServersForDiscovery(ctx context.Context) ([]*Server, e
 	return scanServers(rows)
 }
 
+// UpdateServerHeartbeatFromProxy records a proxy's heartbeat for a server and
+// marks it active. A stopped server stays stopped until it registers again.
 func (db *SqliteDB) UpdateServerHeartbeatFromProxy(ctx context.Context, serverID string, load, clients, memMB int) error {
 	_, err := db.sql.ExecContext(ctx, `
 		UPDATE servers
 		SET last_heartbeat = ?, connection_count = ?, status = 'active'
-		WHERE id = ?
+		WHERE id = ? AND status <> 'stopped'
 	`, NowMS(), clients, serverID)
 	return err
 }

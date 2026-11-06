@@ -13,7 +13,7 @@ import (
 )
 
 // TestInternalEndpointsRequireServerSecret covers security audit finding #5:
-// /internal/* (server registration, metrics ingest) must reject callers that
+// /internal/* (server registration and deregistration, metrics ingest) must reject callers that
 // don't present Authorization: Bearer <SERVER_SECRET>. Otherwise anyone who can
 // reach the internal listener could register a rogue backend and hijack routing.
 func TestInternalEndpointsRequireServerSecret(t *testing.T) {
@@ -51,6 +51,17 @@ func TestInternalEndpointsRequireServerSecret(t *testing.T) {
 	}
 	if code := post("/internal/register", "Bearer "+secret); code == http.StatusUnauthorized {
 		t.Errorf("register, correct secret: got 401, want it to proceed")
+	}
+
+	// /internal/deregister
+	if code := post("/internal/deregister", ""); code != http.StatusUnauthorized {
+		t.Errorf("deregister, no auth: got %d, want 401", code)
+	}
+	if code := post("/internal/deregister", "Bearer wrong-secret"); code != http.StatusUnauthorized {
+		t.Errorf("deregister, wrong secret: got %d, want 401", code)
+	}
+	if code := post("/internal/deregister", "Bearer "+secret); code != http.StatusOK {
+		t.Errorf("deregister, correct secret: got %d, want 200", code)
 	}
 
 	// /internal/metrics is gated by the same middleware.
